@@ -1,0 +1,1 @@
+{"candidate_family":"deterministic_logistic_seed","epochs":64,"l2":0.001,"learning_rate":0.25,"logit_clip":40.0,"schema_version":1}

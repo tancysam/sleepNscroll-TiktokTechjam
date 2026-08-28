@@ -1,0 +1,31 @@
+schema_version = 2
+
+[benchmark]
+name = "kuairand-pure"
+data_dir = ".data/KuaiRand-Pure/data"
+starter_dir = "kuairand-starter-kit"
+target = "long_view"
+max_iterations = 12
+wall_clock_seconds = 4200
+epsilon = 0.002
+convergence_patience = 3
+
+[validation]
+outer_promotion_limit = 1
+confirmation_seeds = [0, 1, 2]
+inner_folds = ["20220416:20220418", "20220419:20220421"]
+
+[runner]
+device = "cpu"
+max_processes = 1
+threads = 2
+memory_mb = 4096
+disk_mb = 4096
+default_timeout_seconds = 120
+finalization_reserve_seconds = 3600
+
+[research]
+provider = "scripted"
+max_repairs_per_experiment = 1
+run_kind = "test"
+allow_scripted_demo = false

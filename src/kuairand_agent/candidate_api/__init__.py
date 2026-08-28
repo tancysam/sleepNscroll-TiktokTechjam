@@ -1,0 +1,43 @@
+"""Narrow trusted protocol for locally generated candidate processes."""
+
+from kuairand_agent.candidate_api.protocol import (
+    DEFAULT_SCORES_PATH,
+    PREDICTION_RESULT_FILENAME,
+    PROTOCOL_SCHEMA_VERSION,
+    SCORES_DTYPE,
+    TRAIN_RESULT_FILENAME,
+    ArtifactDeclaration,
+    CandidateProtocolError,
+    PredictionExpectation,
+    PredictionResultManifest,
+    TrainExpectation,
+    TrainResultManifest,
+    ValidatedArtifact,
+    ValidatedPredictionResult,
+    ValidatedTrainResult,
+    parse_prediction_result_json,
+    parse_train_result_json,
+    validate_prediction_outputs,
+    validate_train_outputs,
+)
+
+__all__ = [
+    "DEFAULT_SCORES_PATH",
+    "PREDICTION_RESULT_FILENAME",
+    "PROTOCOL_SCHEMA_VERSION",
+    "SCORES_DTYPE",
+    "TRAIN_RESULT_FILENAME",
+    "ArtifactDeclaration",
+    "CandidateProtocolError",
+    "PredictionExpectation",
+    "PredictionResultManifest",
+    "TrainExpectation",
+    "TrainResultManifest",
+    "ValidatedArtifact",
+    "ValidatedPredictionResult",
+    "ValidatedTrainResult",
+    "parse_prediction_result_json",
+    "parse_train_result_json",
+    "validate_prediction_outputs",
+    "validate_train_outputs",
+]

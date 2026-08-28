@@ -1,0 +1,47 @@
+schema_version = 2
+
+[benchmark]
+name = "kuairand-pure"
+data_dir = ".data/KuaiRand-Pure/data"
+starter_dir = "kuairand-starter-kit"
+target = "long_view"
+max_iterations = 50
+wall_clock_seconds = 21600
+epsilon = 0.002
+convergence_patience = 3
+
+[validation]
+outer_promotion_limit = 6
+confirmation_seeds = [0, 1, 2]
+inner_folds = ["20220416:20220418", "20220419:20220421"]
+
+[runner]
+device = "cpu"
+max_processes = 1
+threads = 4
+memory_mb = 16384
+disk_mb = 20480
+default_timeout_seconds = 1800
+finalization_reserve_seconds = 3600
+
+[research]
+provider = "openai"
+max_repairs_per_experiment = 2
+run_kind = "autonomous"
+allow_scripted_demo = false
+
+[research.openai]
+model = "gpt-5.6-sol"
+base_url = "https://api.openai.com/v1"
+reasoning_effort = "xhigh"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 300.0
+max_response_bytes = 8388608
+max_output_tokens = 65536
+max_malformed_retries = 1
+max_transport_retries = 2
+
+[research.openai.pricing]
+input_usd_per_million = "4.00"
+cached_input_usd_per_million = "0.40"
+output_usd_per_million = "20.00"

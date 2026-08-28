@@ -1,0 +1,2968 @@
+"""Restart-safe local composition for the bounded KuaiRand-Pure research campaign.
+
+The module is intentionally controller-owned.  Generated source receives only immutable numeric
+NPY capabilities; public labels remain closed over protected scorers and final outcomes have no
+representable input anywhere in this call graph.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import resource
+import stat
+import sys
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+from threading import Event
+from types import MappingProxyType
+from typing import Literal, Protocol, cast
+
+import numpy as np
+import numpy.typing as npt
+
+from kuairand_agent.baselines.artifacts import load_predictions
+from kuairand_agent.baselines.fold_control_runner import (
+    FoldFMControlExecutionRequest,
+    SupervisedFoldFMExecutionError,
+    SupervisedFoldFMRun,
+    SupervisedFoldFMRunner,
+)
+from kuairand_agent.baselines.fold_controls import (
+    FoldScoringContext,
+    build_fold_scoring_context,
+)
+from kuairand_agent.campaign.budgets import AdmissionReason, LaunchCategory, WorkPhase
+from kuairand_agent.campaign.candidate_journal import (
+    CampaignStoreCandidateJournal,
+    CandidateAdmissionError,
+    CandidateJournalPolicy,
+)
+from kuairand_agent.campaign.controller import (
+    CAMPAIGN_DATABASE_NAME,
+    CampaignCreateRequest,
+    CampaignEngine,
+    CampaignStatus,
+)
+from kuairand_agent.campaign.full_campaign import (
+    CampaignDataPlane,
+    FinalizationSelectionPlan,
+    FullCampaignCancelled,
+    FullCampaignError,
+    FullCampaignOutcome,
+    FullCampaignOutcomeRepository,
+    FullCampaignProgressLedger,
+    FullCampaignStage,
+    InnerFoldSelectionEvidence,
+    MatchedSeedSelectionEvidence,
+    ProductionFeatureBundle,
+    QualifiedFMMemberPlan,
+    build_finalization_candidate_inputs,
+    build_production_feature_bundle,
+    encode_numeric_user_groups,
+    load_full_campaign_outcome,
+    prepare_campaign_data_plane,
+)
+from kuairand_agent.campaign.generated_scientific_runner import (
+    DurableGeneratedScientificRunner,
+    FileScientificRunEvidenceRepository,
+    FoldBFusionSelector,
+    GeneratedScientificRunnerCancelledError,
+    GeneratedScientificRunRecord,
+    ProtectedScoreCallback,
+    ProtectedScoringCapability,
+    ScientificTierCapabilities,
+    TrustedFMRankFusion,
+)
+from kuairand_agent.campaign.models import CampaignState
+from kuairand_agent.campaign.provenance import (
+    capture_environment_identity,
+    hash_source_tree,
+)
+from kuairand_agent.campaign.qualification_evidence import (
+    OfficialFMQualificationEvidence,
+    OfficialFMSeedEvidence,
+    QualificationExpectations,
+    load_official_fm_qualification,
+)
+from kuairand_agent.campaign.scientific import (
+    CampaignStopReason,
+    ExecutableChangeEvidence,
+    OuterPromotionRequest,
+    ScientificCampaignCancelled,
+    ScientificCampaignConfig,
+    ScientificCampaignResult,
+    ScientificCandidate,
+    ScientificRunEvidence,
+    ScientificRunRequest,
+    ScientificTier,
+    run_scientific_campaign,
+)
+from kuairand_agent.campaign.scientific_store import (
+    DurableScientificLedgerAdapter,
+    TrustedOuterSeedEvidence,
+)
+from kuairand_agent.campaign.selector import (
+    GateEvidence,
+    IncumbentEvidence,
+    OrganizerMetrics,
+    SeedMetrics,
+)
+from kuairand_agent.campaign.store import (
+    ArtifactSpec,
+    CampaignStore,
+    OuterQueryLedger,
+)
+from kuairand_agent.config import ResearchConfig
+from kuairand_agent.contract import benchmark_digest, verify_starter_kit
+from kuairand_agent.data.canonical import (
+    CanonicalInputs,
+    ProtectedTargets,
+    load_canonical_dataset,
+)
+from kuairand_agent.data.capabilities import DataPhase, build_candidate_inputs
+from kuairand_agent.data.fields import (
+    STANDARD_LATE_MEMBER,
+    STANDARD_TRAIN_MEMBER,
+    VIDEO_BASIC_MEMBER,
+    FieldKey,
+)
+from kuairand_agent.execution.artifacts import (
+    ArtifactKind,
+    ArtifactRef,
+    ArtifactStore,
+)
+from kuairand_agent.execution.candidate_executor import (
+    CandidateAction,
+    GeneratedCandidateExecutor,
+    LocalCandidateLimits,
+    put_numpy_capability,
+)
+from kuairand_agent.execution.policy import WorkspacePolicy
+from kuairand_agent.execution.runner import ExecutionOutcome, active_python_interpreter
+from kuairand_agent.execution.workspace import WorkspaceMaterializer
+from kuairand_agent.research.context import (
+    AggregateRecord,
+    MetricSummary,
+    ResearchBudgetContext,
+    SafeResearchContext,
+    build_safe_research_context,
+)
+from kuairand_agent.research.factory import (
+    AvailableResearchProvider,
+    ProviderUnavailableDiagnostic,
+    select_research_provider,
+)
+from kuairand_agent.research.interface import ResearchModel
+from kuairand_agent.research.loop import CampaignStoreResearchLedger
+from kuairand_agent.research.materialize import snapshot_materialized_candidate
+from kuairand_agent.research.production import (
+    SCRIPTED_CANDIDATE_ID,
+    SCRIPTED_PARENT_ID,
+    LiveResearchLineage,
+    ScriptedLambdaRankLineage,
+    load_parent_snapshot,
+    prepare_or_rehydrate_live_lineage,
+    prepare_or_rehydrate_scripted_lambdarank_lineage,
+)
+from kuairand_agent.research.provider import OpenAIResponsesModel
+from kuairand_agent.research.schemas import (
+    ExperimentResultSummary,
+    Reflection,
+    ReflectionRequest,
+    ResearchOperation,
+    canonical_json_bytes,
+)
+from kuairand_agent.research.scripted import ScriptedResponse
+from kuairand_agent.scoring.protected import (
+    Alignment,
+    ProtectedScorer,
+    ScoreResult,
+    SplitIdentity,
+)
+
+_SCHEMA_VERSION = 1
+_PRODUCTION_DIR = "production"
+_PORTFOLIO_REASON = "bounded_high_value_lambdarank_branch_prioritized"
+_SAFE_FOLD_FAILURE_OUTCOMES = frozenset(
+    {
+        ExecutionOutcome.TIMED_OUT,
+        ExecutionOutcome.MEMORY_LIMIT,
+        ExecutionOutcome.DISK_LIMIT,
+        ExecutionOutcome.PROCESS_LIMIT,
+        ExecutionOutcome.SPAWN_FAILED,
+    }
+)
+_SAFE_FOLD_ADMISSION_REASONS = frozenset(
+    {
+        AdmissionReason.FINALIZATION_RESERVE,
+        AdmissionReason.HARD_DEADLINE,
+        AdmissionReason.HARD_LAUNCH_CAP,
+        AdmissionReason.CATEGORY_CAP,
+    }
+)
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def _digest(domain: bytes, value: object) -> str:
+    return hashlib.sha256(domain + b"\0" + _canonical_json(value)).hexdigest()
+
+
+def _resolve_directory(root: Path, value: Path, name: str) -> Path:
+    candidate = value if value.is_absolute() else root / value
+    try:
+        resolved = candidate.resolve(strict=True)
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise FullCampaignError(f"{name} is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise FullCampaignError(f"{name} must be a real directory")
+    return resolved
+
+
+def _check_cancel(cancel_event: Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise FullCampaignCancelled(
+            "campaign cancelled by request; durable state is resumable and no new launch "
+            "was admitted"
+        )
+
+
+def _rss_bytes() -> int:
+    observed = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return observed if sys.platform == "darwin" else observed * 1024
+
+
+class _MetricValue(Protocol):
+    @property
+    def gauc(self) -> float: ...
+
+    @property
+    def ndcg_at_5(self) -> float: ...
+
+
+def _metrics(value: _MetricValue) -> OrganizerMetrics:
+    try:
+        gauc = float(value.gauc)
+        ndcg = float(value.ndcg_at_5)
+    except (TypeError, ValueError) as exc:
+        raise FullCampaignError("trusted metric evidence is malformed") from exc
+    return OrganizerMetrics(gauc, ndcg)
+
+
+def _artifact_spec(reference: ArtifactRef) -> ArtifactSpec:
+    return ArtifactSpec(
+        digest=reference.sha256,
+        kind=reference.kind.value,
+        relative_path=reference.object_relative_path.as_posix(),
+        size_bytes=reference.size_bytes,
+    )
+
+
+def _qualified_member(
+    qualification: OfficialFMQualificationEvidence,
+    seed: OfficialFMSeedEvidence,
+) -> QualifiedFMMemberPlan:
+    return QualifiedFMMemberPlan(
+        seed=seed.seed,
+        checkpoint_sha256=seed.checkpoint_file_sha256,
+        checkpoint_digest=seed.checkpoint_digest,
+        encoding_sha256=seed.encoding_file_sha256,
+        encoding_digest=seed.encoding_digest,
+        config_digest=seed.config_digest,
+        starter_manifest_digest=qualification.starter_manifest_digest,
+        validation_prediction_digest=seed.validation_prediction_digest,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _FeatureArtifacts:
+    fold_a_train: ArtifactRef
+    fold_a_targets: ArtifactRef
+    fold_a_groups: ArtifactRef
+    fold_a_valid: ArtifactRef
+    fold_b_train: ArtifactRef
+    fold_b_targets: ArtifactRef
+    fold_b_groups: ArtifactRef
+    fold_b_valid: ArtifactRef
+    outer_train: ArtifactRef
+    outer_targets: ArtifactRef
+    outer_groups: ArtifactRef
+    outer_valid: ArtifactRef
+    final: ArtifactRef
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            name: cast(ArtifactRef, getattr(self, name)).manifest()
+            for name in self.__dataclass_fields__
+        }
+
+
+def _put_feature_artifacts(
+    store: ArtifactStore,
+    bundle: ProductionFeatureBundle,
+    *,
+    fold_a_targets: tuple[int, ...],
+    fold_a_users: Sequence[object],
+    fold_b_targets: tuple[int, ...],
+    fold_b_users: Sequence[object],
+    outer_targets: tuple[int, ...],
+    outer_users: Sequence[object],
+) -> _FeatureArtifacts:
+    return _FeatureArtifacts(
+        fold_a_train=put_numpy_capability(store, bundle.fold_a.prefix.values),
+        fold_a_targets=put_numpy_capability(store, np.asarray(fold_a_targets, dtype=np.int8)),
+        fold_a_groups=put_numpy_capability(store, encode_numeric_user_groups(fold_a_users)),
+        fold_a_valid=put_numpy_capability(store, bundle.fold_a.query.values),
+        fold_b_train=put_numpy_capability(store, bundle.fold_b.prefix.values),
+        fold_b_targets=put_numpy_capability(store, np.asarray(fold_b_targets, dtype=np.int8)),
+        fold_b_groups=put_numpy_capability(store, encode_numeric_user_groups(fold_b_users)),
+        fold_b_valid=put_numpy_capability(store, bundle.fold_b.query.values),
+        outer_train=put_numpy_capability(store, bundle.outer_and_final.prefix.values),
+        outer_targets=put_numpy_capability(store, np.asarray(outer_targets, dtype=np.int8)),
+        outer_groups=put_numpy_capability(store, encode_numeric_user_groups(outer_users)),
+        outer_valid=put_numpy_capability(store, bundle.outer_validation.values),
+        final=put_numpy_capability(store, bundle.final.values),
+    )
+
+
+def _limits(request: CampaignCreateRequest) -> LocalCandidateLimits:
+    runner = request.config.runner
+    memory = int(runner.memory_mb) * 1024**2
+    disk = int(runner.disk_mb) * 1024**2
+    return LocalCandidateLimits(
+        timeout_seconds=float(runner.default_timeout_seconds),
+        memory_limit_bytes=memory,
+        workspace_disk_limit_bytes=disk,
+        output_limit_bytes=min(disk, 512 * 1024**2),
+        temp_limit_bytes=min(disk, 512 * 1024**2),
+        threads=int(runner.threads),
+        device=str(runner.device),
+    )
+
+
+def _stage(
+    progress: FullCampaignProgressLedger,
+    *,
+    request_digest: str,
+    stage: FullCampaignStage,
+    evidence: Mapping[str, object],
+) -> Mapping[str, object]:
+    retained = next((item for item in progress.checkpoints() if item.stage is stage), None)
+    if retained is not None:
+        return retained.evidence
+    return progress.append(
+        request_digest=request_digest,
+        stage=stage,
+        evidence=evidence,
+    ).evidence
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedTierScorer:
+    split: SplitIdentity
+    alignment: Alignment
+    scorer: ProtectedScorer
+    labels: tuple[int, ...]
+
+    def score(self, scores: npt.NDArray[np.float64]) -> ScoreResult:
+        return self.scorer.score_with_encoded_labels(
+            alignment=self.alignment,
+            split=self.split,
+            labels=self.labels,
+            scores=scores,
+            expected_count=len(self.labels),
+        )
+
+
+def _outer_scorer(
+    *,
+    starter_dir: Path,
+    inputs: CanonicalInputs,
+    targets: ProtectedTargets,
+    split_token: str,
+) -> _ProtectedTierScorer:
+    split = SplitIdentity("outer_valid", split_token, len(inputs))
+    alignment = Alignment.from_ids(
+        split=split,
+        user_ids=inputs.user_id,
+        video_ids=inputs.video_id,
+    )
+    return _ProtectedTierScorer(
+        split=split,
+        alignment=alignment,
+        scorer=ProtectedScorer(starter_dir=starter_dir, trusted_alignment=alignment),
+        labels=targets.reveal_for_scorer(),
+    )
+
+
+def _journal(
+    *,
+    engine: CampaignEngine,
+    run_dir: Path,
+    store: CampaignStore,
+    artifacts: ArtifactStore,
+    family: str,
+    phase: WorkPhase,
+    category: LaunchCategory | None,
+    p95_seconds: float,
+    cleanup_seconds: float,
+    experiment_id: str | None,
+    scientific_iteration: int | None,
+    cancel_event: Event | None,
+) -> CampaignStoreCandidateJournal:
+    _check_cancel(cancel_event)
+    observation = engine.observe_deadline(run_dir)
+    _check_cancel(cancel_event)
+    return CampaignStoreCandidateJournal(
+        store=store,
+        artifact_store=artifacts,
+        deadline=observation,
+        policy=CandidateJournalPolicy(
+            family=family,
+            phase=phase,
+            category=category,
+            p95_runtime_seconds=p95_seconds,
+            cleanup_seconds=cleanup_seconds,
+            experiment_id=experiment_id,
+            scientific_iteration=scientific_iteration,
+        ),
+    )
+
+
+def _fold_control(
+    *,
+    fold_name: str,
+    fold_token: str,
+    prefix_inputs: CanonicalInputs,
+    prefix_labels: tuple[int, ...],
+    query_inputs: CanonicalInputs,
+    query_labels: tuple[int, ...],
+    engine: CampaignEngine,
+    run_dir: Path,
+    campaign_store: CampaignStore,
+    artifacts: ArtifactStore,
+    workspaces: WorkspaceMaterializer,
+    starter_dir: Path,
+    limits: LocalCandidateLimits,
+    cancel_event: Event | None,
+) -> SupervisedFoldFMRun:
+    if fold_name not in {"A", "B"}:
+        raise FullCampaignError("fold control must name A or B")
+    category = (
+        LaunchCategory.TEMPORAL_FOLD_CONFIRMATION
+        if fold_name == "A"
+        else LaunchCategory.DIVERSE_INNER_SCREEN
+    )
+    journal = _journal(
+        engine=engine,
+        run_dir=run_dir,
+        store=campaign_store,
+        artifacts=artifacts,
+        family="official_fm_fold_control",
+        phase=WorkPhase.RESEARCH,
+        category=category,
+        p95_seconds=float(limits.timeout_seconds),
+        cleanup_seconds=5.0,
+        experiment_id=None,
+        scientific_iteration=None,
+        cancel_event=cancel_event,
+    )
+    runner = SupervisedFoldFMRunner(
+        artifact_store=artifacts,
+        workspace_materializer=workspaces,
+        control_root=run_dir / _PRODUCTION_DIR / "fold-controls",
+        interpreter=active_python_interpreter(),
+        starter_dir=starter_dir,
+        limits=limits,
+    )
+    return runner.run(
+        FoldFMControlExecutionRequest(
+            execution_id=f"fold-fm-control-{fold_name}-seed-0",
+            fold_name=cast(Literal["A", "B"], fold_name),
+            fold_token=fold_token,
+            seed=0,
+            prefix_inputs=prefix_inputs,
+            prefix_labels=prefix_labels,
+            query_inputs=query_inputs,
+            query_labels=query_labels,
+        ),
+        journal=journal,
+        cancel_event=cancel_event,
+    )
+
+
+def _feature_cache_build(
+    *,
+    data: CampaignDataPlane,
+    builder_source_digest: str,
+    cache_dir: Path,
+    prior_stage: Mapping[str, object] | None,
+) -> tuple[ProductionFeatureBundle, Mapping[str, object]]:
+    cache_was_empty = not cache_dir.exists() or not any(cache_dir.iterdir())
+    before_rss = _rss_bytes()
+    started = time.perf_counter()
+    bundle = build_production_feature_bundle(
+        data,
+        builder_source_digest=builder_source_digest,
+        cache_dir=cache_dir,
+    )
+    initial_wall = time.perf_counter() - started
+    after_initial_rss = _rss_bytes()
+    started = time.perf_counter()
+    replay = build_production_feature_bundle(
+        data,
+        builder_source_digest=builder_source_digest,
+        cache_dir=cache_dir,
+    )
+    warm_wall = time.perf_counter() - started
+    after_warm_rss = _rss_bytes()
+    if replay.digest != bundle.digest:
+        raise FullCampaignError("warm causal-feature replay changed the feature identity")
+    if prior_stage is not None:
+        receipt = prior_stage.get("cache_performance")
+        if not isinstance(receipt, Mapping):
+            raise FullCampaignError("retained feature stage lacks cache performance evidence")
+        return bundle, receipt
+    return bundle, {
+        "schema_version": _SCHEMA_VERSION,
+        "cache_dir": str(cache_dir),
+        "initial_cache_state": "cold" if cache_was_empty else "warm",
+        "initial_wall_seconds": initial_wall,
+        "verified_warm_wall_seconds": warm_wall,
+        "rss_before_bytes": before_rss,
+        "rss_after_initial_bytes": after_initial_rss,
+        "rss_after_warm_bytes": after_warm_rss,
+        "bundle_identity_equal": True,
+    }
+
+
+def _fallback_receipt(
+    qualification: OfficialFMQualificationEvidence,
+    fold_a: SupervisedFoldFMRun,
+    fold_b: SupervisedFoldFMRun,
+) -> str:
+    return _digest(
+        b"kuairand-production-fallback-receipt-v1",
+        {
+            "qualification_manifest_digest": qualification.manifest_digest,
+            "fallback_manifest_digest": qualification.fallback.manifest_digest,
+            "fold_a_evidence_digest": fold_a.evidence.digest,
+            "fold_b_evidence_digest": fold_b.evidence.digest,
+            "outer_seeds": [item.seed for item in qualification.outer_runs],
+            "replayable": True,
+        },
+    )
+
+
+def _fallback_incumbent(
+    qualification: OfficialFMQualificationEvidence,
+    fold_a: SupervisedFoldFMRun,
+    fold_b: SupervisedFoldFMRun,
+    receipt_digest: str,
+) -> IncumbentEvidence:
+    return IncumbentEvidence(
+        candidate_id=SCRIPTED_PARENT_ID,
+        inner_by_fold=(
+            ("A", _metrics(fold_a.control.metrics)),
+            ("B", _metrics(fold_b.control.metrics)),
+        ),
+        outer_by_seed=tuple(
+            SeedMetrics(item.seed, _metrics(item.metrics)) for item in qualification.outer_runs
+        ),
+        evidence_receipt_digest=receipt_digest,
+        replayable=True,
+        eligible=True,
+        official_fm=True,
+    )
+
+
+def _safe_context(
+    *,
+    request: CampaignCreateRequest,
+    qualification: OfficialFMQualificationEvidence,
+    fold_a: SupervisedFoldFMRun,
+    fold_b: SupervisedFoldFMRun,
+    status: CampaignStatus,
+    campaign_records: Sequence[AggregateRecord] = (),
+    evidence: _ResearchContextEvidence | None = None,
+) -> SafeResearchContext:
+    remaining_seconds = max(0, int(status.deadline_remaining_seconds))
+    context_evidence = _ResearchContextEvidence() if evidence is None else evidence
+    return build_safe_research_context(
+        starter_manifest_sha256=qualification.starter_manifest_digest,
+        dataset_manifest_sha256=qualification.canonical_digest,
+        capability_manifests=context_evidence.capability_manifests,
+        budgets=ResearchBudgetContext(
+            remaining_attempts=status.launches_remaining,
+            remaining_wall_seconds=min(21_600, remaining_seconds),
+            remaining_outer_promotions=status.outer_queries_remaining,
+            intervention_count=0,
+        ),
+        inner_metrics=(
+            MetricSummary(
+                "official_fm_fold_A",
+                fold_a.control.metrics.gauc,
+                fold_a.control.metrics.ndcg_at_5,
+                fold_a.control.metrics.primary,
+                exact=True,
+            ),
+            MetricSummary(
+                "official_fm_fold_B",
+                fold_b.control.metrics.gauc,
+                fold_b.control.metrics.ndcg_at_5,
+                fold_b.control.metrics.primary,
+                exact=True,
+            ),
+        ),
+        outer_metrics=tuple(
+            MetricSummary(
+                f"official_fm_seed_{item.seed}",
+                item.metrics.gauc,
+                item.metrics.ndcg_at_5,
+                item.metrics.primary,
+            )
+            for item in qualification.outer_runs
+        ),
+        train_eda=context_evidence.train_eda,
+        validation_input_eda=context_evidence.validation_input_eda,
+        method_cards=context_evidence.method_cards,
+        campaign_records=campaign_records,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResearchContextEvidence:
+    capability_manifests: tuple[Mapping[str, object], ...] = ()
+    train_eda: tuple[AggregateRecord, ...] = ()
+    validation_input_eda: tuple[AggregateRecord, ...] = ()
+    method_cards: tuple[AggregateRecord, ...] = ()
+
+
+def _input_capability_manifest(
+    phase: DataPhase,
+    inputs: CanonicalInputs,
+) -> Mapping[str, object]:
+    member = (
+        STANDARD_LATE_MEMBER
+        if phase in {DataPhase.OUTER_VALID, DataPhase.FINAL}
+        else STANDARD_TRAIN_MEMBER
+    )
+    return build_candidate_inputs(
+        phase,
+        {
+            FieldKey(member, "user_id"): inputs.user_id,
+            FieldKey(member, "video_id"): inputs.video_id,
+            FieldKey(VIDEO_BASIC_MEMBER, "author_id"): inputs.author_id,
+            FieldKey(member, "tab"): inputs.tab,
+            FieldKey(member, "duration_ms"): inputs.duration_ms,
+        },
+    ).manifest()
+
+
+def _input_aggregate(name: str, inputs: CanonicalInputs) -> AggregateRecord:
+    durations = np.asarray(inputs.duration_ms, dtype=np.float64)
+    return AggregateRecord(
+        name=name,
+        values={
+            "row_count": len(inputs),
+            "unique_user_count": len(set(inputs.user_id)),
+            "unique_video_count": len(set(inputs.video_id)),
+            "unique_author_count": len(set(inputs.author_id)),
+            "date_min": min(inputs.date),
+            "date_max": max(inputs.date),
+            "tab_cardinality": len(set(inputs.tab)),
+            "duration_ms_mean": float(np.mean(durations)),
+            "duration_ms_p10": float(np.quantile(durations, 0.10)),
+            "duration_ms_p50": float(np.quantile(durations, 0.50)),
+            "duration_ms_p90": float(np.quantile(durations, 0.90)),
+        },
+    )
+
+
+def _research_context_evidence(
+    data: CampaignDataPlane,
+    features: ProductionFeatureBundle,
+) -> _ResearchContextEvidence:
+    train_positive_count = sum(data.outer_train_labels)
+    train_count = len(data.outer_train_labels)
+    return _ResearchContextEvidence(
+        capability_manifests=(
+            _input_capability_manifest(DataPhase.TRAIN, data.outer_train_inputs),
+            _input_capability_manifest(DataPhase.INNER_VALID, data.fold_b.query_inputs),
+            _input_capability_manifest(DataPhase.OUTER_VALID, data.outer_validation_inputs),
+            _input_capability_manifest(DataPhase.FINAL, data.final_inputs),
+        ),
+        train_eda=(
+            _input_aggregate("official_train_inputs", data.outer_train_inputs),
+            AggregateRecord(
+                "official_train_targets",
+                {
+                    "row_count": train_count,
+                    "long_view_positive_count": train_positive_count,
+                    "long_view_positive_rate": train_positive_count / train_count,
+                },
+            ),
+        ),
+        validation_input_eda=(
+            _input_aggregate("public_validation_inputs_only", data.outer_validation_inputs),
+            _input_aggregate("prediction_period_inputs_only", data.final_inputs),
+        ),
+        method_cards=(
+            AggregateRecord(
+                "controller_causal_feature_bundle",
+                {
+                    "feature_count": features.final.feature_count,
+                    "feature_names_csv": ",".join(features.final.feature_names),
+                    "feature_bundle_digest": features.digest,
+                    "fold_b_selected_fusion_only": True,
+                    "uses_public_labels_for_features": False,
+                    "uses_prediction_period_outcomes": False,
+                },
+            ),
+        ),
+    )
+
+
+def _generated_scientific_candidate(
+    *,
+    request: CampaignCreateRequest,
+    data: CampaignDataPlane,
+    features: ProductionFeatureBundle,
+    lineage: ScriptedLambdaRankLineage | LiveResearchLineage,
+    candidate_id: str,
+    candidate_limits: LocalCandidateLimits,
+    scientific_iteration: int,
+) -> ScientificCandidate:
+    executable_change = ExecutableChangeEvidence(
+        parent_source_digest=lineage.parent.digest,
+        candidate_source_digest=lineage.materialized.source_digest,
+        executable_diff_digest=lineage.materialized.diff_digest,
+        controller_attestation_digest=_digest(
+            b"kuairand-production-controller-attestation-v1",
+            {
+                "campaign_id": request.campaign_id,
+                "request_digest": request.digest,
+                "scientific_iteration": scientific_iteration,
+                "parent_source_digest": lineage.parent.digest,
+                "candidate_source_digest": lineage.materialized.source_digest,
+                "diff_digest": lineage.materialized.diff_digest,
+                "changed_symbols": list(lineage.material_change.changed_symbols),
+                "reachable_python_files": list(lineage.material_change.reachable_python_files),
+            },
+        ),
+        changed_symbols=lineage.material_change.changed_symbols,
+        reachable_python_files=lineage.material_change.reachable_python_files,
+    )
+    training_policy_digest = _digest(
+        b"kuairand-production-training-policy-v1",
+        {
+            "feature_bundle_digest": features.digest,
+            "config_digest": lineage.config_artifact.sha256,
+            "fold_a_digest": data.fold_a.fold.digest,
+            "fold_b_digest": data.fold_b.fold.digest,
+            "outer_training_inputs_digest": data.outer_train_inputs.digest,
+            "outer_training_uses_public_labels": False,
+            "fusion_selected_on": "fold_B_only",
+            "matched_seeds": [0, 1, 2],
+        },
+    )
+    return ScientificCandidate(
+        candidate_id=candidate_id,
+        parent_id=lineage.parent.candidate_id,
+        family=("lambdarank" if lineage.provider == "scripted" else "openai_generated"),
+        source_digest=lineage.materialized.source_digest,
+        parent_source_digest=lineage.parent.digest,
+        executable_change=executable_change,
+        config_digest=lineage.config_artifact.sha256,
+        training_policy_digest=training_policy_digest,
+        gates=GateEvidence(),
+        diversity_root=scientific_iteration == 1,
+        metric_specialist_for_blending=True,
+        sufficient_finalization_time=True,
+        p95_runtime_seconds=float(candidate_limits.timeout_seconds),
+        cleanup_seconds=30.0,
+    )
+
+
+@dataclass(slots=True)
+class _ScientificRuntime:
+    engine: CampaignEngine
+    run_dir: Path
+    campaign_store: CampaignStore
+    artifacts: ArtifactStore
+    executor: GeneratedCandidateExecutor
+    lineage: ScriptedLambdaRankLineage | LiveResearchLineage
+    candidate: ScientificCandidate
+    experiment_id: str
+    scientific_iteration: int
+    config: ScientificCampaignConfig
+    feature_artifacts: _FeatureArtifacts
+    features: ProductionFeatureBundle
+    fold_a: SupervisedFoldFMRun
+    fold_b: SupervisedFoldFMRun
+    fold_a_query_inputs: CanonicalInputs
+    fold_b_query_inputs: CanonicalInputs
+    fold_a_scorer: FoldScoringContext
+    fold_b_scorer: FoldScoringContext
+    outer_scorer: _ProtectedTierScorer
+    qualification: OfficialFMQualificationEvidence
+    repository: FileScientificRunEvidenceRepository
+    evidence_registry: dict[tuple[str, int], TrustedOuterSeedEvidence]
+    cancel_event: Event | None
+    records: dict[tuple[ScientificTier, int], GeneratedScientificRunRecord]
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise ScientificCampaignCancelled(
+                "trusted controller requested scientific campaign cancellation"
+            )
+
+    def _journal_factory(
+        self,
+        *,
+        request: ScientificRunRequest,
+        action: CandidateAction,
+        execution_id: str,
+    ) -> CampaignStoreCandidateJournal:
+        del execution_id
+        category: LaunchCategory | None = None
+        phase = (
+            WorkPhase.REQUIRED_CONFIRMATION
+            if request.tier is ScientificTier.OUTER_MATCHED_SEED
+            else WorkPhase.RESEARCH
+        )
+        if action is CandidateAction.TRAIN:
+            if request.tier is ScientificTier.FOLD_B_SCREEN:
+                category = LaunchCategory.DIVERSE_INNER_SCREEN
+            elif request.tier is ScientificTier.FOLD_A_CONFIRMATION:
+                category = LaunchCategory.TEMPORAL_FOLD_CONFIRMATION
+            elif request.seed == 0:
+                category = LaunchCategory.DISTINCT_OUTER_PROMOTION
+            else:
+                category = LaunchCategory.MATCHED_SEED_CONFIRMATION
+        return _journal(
+            engine=self.engine,
+            run_dir=self.run_dir,
+            store=self.campaign_store,
+            artifacts=self.artifacts,
+            family=self.candidate.family,
+            phase=phase,
+            category=category,
+            p95_seconds=self.candidate.p95_runtime_seconds,
+            cleanup_seconds=self.candidate.cleanup_seconds,
+            experiment_id=self.experiment_id,
+            scientific_iteration=self.scientific_iteration,
+            cancel_event=self.cancel_event,
+        )
+
+    def _frozen_weights(self) -> tuple[float, float]:
+        record = self.records.get((ScientificTier.FOLD_B_SCREEN, 0))
+        if record is None:
+            raise FullCampaignError("Fold B record is absent before fixed fusion reuse")
+        weights = record.frozen_fusion_weights
+        if weights is None:
+            raise FullCampaignError("Fold B record did not freeze a fusion policy")
+        return weights
+
+    def _capability(self, request: ScientificRunRequest) -> ScientificTierCapabilities:
+        if request.tier is ScientificTier.FOLD_B_SCREEN:
+            return ScientificTierCapabilities(
+                tier=request.tier,
+                fold_id="B",
+                scientific_data_digest=request.data_digest,
+                training_data_digest=self.features.fold_b.prefix.logical_digest,
+                prediction_data_digest=self.features.fold_b.query.logical_digest,
+                training_split_token=self.features.fold_b.prefix.logical_digest,
+                prediction_split_token=self.features.fold_b.query.logical_digest,
+                training_features=self.feature_artifacts.fold_b_train,
+                training_targets=self.feature_artifacts.fold_b_targets,
+                training_user_groups=self.feature_artifacts.fold_b_groups,
+                prediction_features=self.feature_artifacts.fold_b_valid,
+                prediction_row_count=self.features.fold_b.query.row_count,
+                fusion=FoldBFusionSelector(
+                    user_ids=self.fold_b_query_inputs.user_id,
+                    video_ids=self.fold_b_query_inputs.video_id,
+                    control_scores=self.fold_b.control.predictions.scores,
+                ),
+            )
+        if request.tier is ScientificTier.FOLD_A_CONFIRMATION:
+            return ScientificTierCapabilities(
+                tier=request.tier,
+                fold_id="A",
+                scientific_data_digest=request.data_digest,
+                training_data_digest=self.features.fold_a.prefix.logical_digest,
+                prediction_data_digest=self.features.fold_a.query.logical_digest,
+                training_split_token=self.features.fold_a.prefix.logical_digest,
+                prediction_split_token=self.features.fold_a.query.logical_digest,
+                training_features=self.feature_artifacts.fold_a_train,
+                training_targets=self.feature_artifacts.fold_a_targets,
+                training_user_groups=self.feature_artifacts.fold_a_groups,
+                prediction_features=self.feature_artifacts.fold_a_valid,
+                prediction_row_count=self.features.fold_a.query.row_count,
+                fusion=TrustedFMRankFusion(
+                    phase=DataPhase.INNER_VALID,
+                    weights=self._frozen_weights(),
+                    user_ids=self.fold_a_query_inputs.user_id,
+                    video_ids=self.fold_a_query_inputs.video_id,
+                    control_scores=self.fold_a.control.predictions.scores,
+                ),
+            )
+        qualified = self.qualification.outer_seed(request.seed)
+        control = load_predictions(
+            qualified.validation_predictions_path,
+            expected_file_sha256=qualified.validation_predictions_file_sha256,
+            expected_prediction_digest=qualified.validation_prediction_digest,
+            expected_row_count=self.qualification.validation_row_count,
+        )
+        return ScientificTierCapabilities(
+            tier=request.tier,
+            fold_id=None,
+            scientific_data_digest=request.data_digest,
+            training_data_digest=self.features.outer_and_final.prefix.logical_digest,
+            prediction_data_digest=self.features.outer_validation.logical_digest,
+            training_split_token=self.features.outer_and_final.prefix.logical_digest,
+            prediction_split_token=self.features.outer_validation.logical_digest,
+            training_features=self.feature_artifacts.outer_train,
+            training_targets=self.feature_artifacts.outer_targets,
+            training_user_groups=self.feature_artifacts.outer_groups,
+            prediction_features=self.feature_artifacts.outer_valid,
+            prediction_row_count=self.features.outer_validation.row_count,
+            fusion=TrustedFMRankFusion(
+                phase=DataPhase.OUTER_VALID,
+                weights=self._frozen_weights(),
+                user_ids=self.outer_scorer.alignment.user_ids,
+                video_ids=self.outer_scorer.alignment.video_ids,
+                control_scores=control.scores,
+            ),
+        )
+
+    def _scoring(self, request: ScientificRunRequest) -> ProtectedScoringCapability:
+        callback: ProtectedScoreCallback
+        if request.tier is ScientificTier.FOLD_B_SCREEN:
+            context = self.fold_b_scorer
+            callback = cast(ProtectedScoreCallback, context.score_with_encoded_labels)
+            alignment_digest = context.query_alignment_digest
+            rows = context.row_count
+        elif request.tier is ScientificTier.FOLD_A_CONFIRMATION:
+            context = self.fold_a_scorer
+            callback = cast(ProtectedScoreCallback, context.score_with_encoded_labels)
+            alignment_digest = context.query_alignment_digest
+            rows = context.row_count
+        else:
+            callback = cast(ProtectedScoreCallback, self.outer_scorer.score)
+            alignment_digest = self.outer_scorer.alignment.digest
+            rows = len(self.outer_scorer.labels)
+        return ProtectedScoringCapability(
+            tier=request.tier,
+            fold_id=request.fold_id,
+            scientific_data_digest=request.data_digest,
+            scorer_digest=request.scorer_digest,
+            alignment_digest=alignment_digest,
+            row_count=rows,
+            callback=callback,
+        )
+
+    def __call__(self, request: ScientificRunRequest) -> ScientificRunEvidence:
+        self._raise_if_cancelled()
+        capability = self._capability(request)
+        scoring = self._scoring(request)
+        runner = DurableGeneratedScientificRunner(
+            executor=self.executor,
+            artifact_store=self.artifacts,
+            identity=self.lineage.identity,
+            capabilities={request.tier: capability},
+            scoring_callbacks={request.tier: scoring},
+            journal_factory=self._journal_factory,
+            evidence_repository=self.repository,
+            cancel_event=self.cancel_event,
+        )
+        try:
+            evidence = runner(request)
+        except GeneratedScientificRunnerCancelledError as exc:
+            raise ScientificCampaignCancelled(
+                "generated scientific execution was cancelled by the trusted controller"
+            ) from exc
+        except Exception as exc:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise ScientificCampaignCancelled(
+                    "generated scientific execution stopped after controller cancellation"
+                ) from exc
+            raise
+        self._raise_if_cancelled()
+        record = runner.load_record(request.digest)
+        if record is None:
+            raise FullCampaignError("generated scientific record was not durably committed")
+        self.records[(request.tier, request.seed)] = record
+        if request.tier is ScientificTier.OUTER_MATCHED_SEED:
+            promotion = OuterPromotionRequest(
+                campaign_digest=self.config.campaign_digest,
+                candidate_id=self.candidate.candidate_id,
+                candidate_fingerprint=self.candidate.fingerprint,
+                source_digest=self.candidate.source_digest,
+                parent_source_digest=self.candidate.parent_source_digest,
+                executable_diff_digest=self.candidate.executable_change.executable_diff_digest,
+                material_change_digest=self.candidate.executable_change.digest,
+                controller_attestation_digest=(
+                    self.candidate.executable_change.controller_attestation_digest
+                ),
+                benchmark_digest=self.config.benchmark_digest,
+                dataset_digest=self.config.dataset_digest,
+                scorer_digest=self.config.scorer_digest,
+                training_policy_digest=self.candidate.training_policy_digest,
+            )
+            if evidence.metrics is None:
+                raise FullCampaignError("outer generated run lacks protected aggregate metrics")
+            trusted = TrustedOuterSeedEvidence(
+                request_digest=promotion.digest,
+                seed=request.seed,
+                metrics=evidence.metrics,
+                prediction_digest=record.scored_prediction_digest,
+                score_evidence_digest=evidence.digest,
+            )
+            key = (promotion.digest, request.seed)
+            prior = self.evidence_registry.get(key)
+            if prior is not None and prior != trusted:
+                raise FullCampaignError("outer trusted evidence retry is contradictory")
+            self.evidence_registry[key] = trusted
+        return evidence
+
+
+def _candidate_selection(
+    *,
+    experiment_id: str,
+    result: ScientificCampaignResult,
+    runtime: _ScientificRuntime,
+    qualification: OfficialFMQualificationEvidence,
+    features: ProductionFeatureBundle,
+    feature_artifacts: _FeatureArtifacts,
+    dataset_digest: str,
+    validation_inputs: CanonicalInputs,
+    final_inputs: CanonicalInputs,
+    limits: LocalCandidateLimits,
+) -> FinalizationSelectionPlan | None:
+    if result.incumbent.candidate_id != runtime.candidate.candidate_id:
+        return None
+    candidate_result = next(
+        (
+            item
+            for item in result.candidates
+            if item.candidate.candidate_id == runtime.candidate.candidate_id
+        ),
+        None,
+    )
+    if candidate_result is None or candidate_result.selection is None:
+        raise FullCampaignError("generated incumbent lacks trusted selector evidence")
+    records = runtime.records
+    fold_a_record = records.get((ScientificTier.FOLD_A_CONFIRMATION, 0))
+    fold_b_record = records.get((ScientificTier.FOLD_B_SCREEN, 0))
+    if fold_a_record is None or fold_b_record is None:
+        raise FullCampaignError("generated incumbent lacks both train-derived fold records")
+    weights = fold_b_record.frozen_fusion_weights
+    if weights is None:
+        raise FullCampaignError("generated incumbent lacks a frozen Fold B fusion policy")
+    fallback_folds = dict(result.fallback.inner_by_fold)
+    incumbent_folds = dict(result.incumbent.inner_by_fold)
+
+    def disk_bytes(record: GeneratedScientificRunRecord) -> int:
+        refs = (
+            record.train_artifacts.entries
+            + record.prediction_artifacts.entries
+            + record.replay_artifacts.entries
+        )
+        return sum(reference.size_bytes for _, reference in refs)
+
+    def parent_disk(control: SupervisedFoldFMRun) -> int:
+        return sum(
+            reference.size_bytes for _, reference in control.evidence.journal_artifacts.entries
+        )
+
+    inner = (
+        InnerFoldSelectionEvidence(
+            fold_id="A",
+            candidate=incumbent_folds["A"],
+            parent=fallback_folds["A"],
+            reference=fallback_folds["A"],
+            candidate_wall_seconds=fold_a_record.evidence.resources.wall_seconds,
+            candidate_peak_rss_bytes=fold_a_record.evidence.resources.peak_rss_bytes,
+            candidate_disk_bytes=disk_bytes(fold_a_record),
+            parent_wall_seconds=runtime.fold_a.control.resources.wall_seconds,
+            parent_peak_rss_bytes=(runtime.fold_a.control.resources.max_observed_rss_bytes),
+            parent_disk_bytes=parent_disk(runtime.fold_a),
+        ),
+        InnerFoldSelectionEvidence(
+            fold_id="B",
+            candidate=incumbent_folds["B"],
+            parent=fallback_folds["B"],
+            reference=fallback_folds["B"],
+            candidate_wall_seconds=fold_b_record.evidence.resources.wall_seconds,
+            candidate_peak_rss_bytes=fold_b_record.evidence.resources.peak_rss_bytes,
+            candidate_disk_bytes=disk_bytes(fold_b_record),
+            parent_wall_seconds=runtime.fold_b.control.resources.wall_seconds,
+            parent_peak_rss_bytes=(runtime.fold_b.control.resources.max_observed_rss_bytes),
+            parent_disk_bytes=parent_disk(runtime.fold_b),
+        ),
+    )
+    matched: list[MatchedSeedSelectionEvidence] = []
+    for seed in (0, 1, 2):
+        record = records.get((ScientificTier.OUTER_MATCHED_SEED, seed))
+        if record is None or record.evidence.metrics is None:
+            raise FullCampaignError(f"generated incumbent lacks matched seed {seed} evidence")
+        qualified = qualification.outer_seed(seed)
+        fm_prediction = runtime.artifacts.put_file(
+            qualified.validation_predictions_path,
+            kind=ArtifactKind.PREDICTION,
+        )
+        matched.append(
+            MatchedSeedSelectionEvidence(
+                seed=seed,
+                scientific_request_digest=record.request_digest,
+                scientific_record_digest=record.digest,
+                checkpoint=record.checkpoint,
+                candidate_validation_prediction=record.scored_prediction,
+                fm_validation_prediction=fm_prediction,
+                candidate_metrics=record.evidence.metrics,
+                fm_metrics=_metrics(qualified.metrics),
+                candidate_wall_seconds=record.evidence.resources.wall_seconds,
+                candidate_peak_rss_bytes=record.evidence.resources.peak_rss_bytes,
+                candidate_disk_bytes=disk_bytes(record),
+                fm_wall_seconds=qualified.resources.wall_seconds,
+                fm_peak_rss_bytes=qualified.resources.peak_rss_bytes,
+                fm_disk_bytes=qualified.resources.disk_bytes,
+                fm_member=_qualified_member(qualification, qualified),
+            )
+        )
+    representative = matched[0]
+    validation_capability = build_finalization_candidate_inputs(
+        DataPhase.OUTER_VALID,
+        validation_inputs,
+    )
+    final_capability = build_finalization_candidate_inputs(
+        DataPhase.FINAL,
+        final_inputs,
+    )
+    return FinalizationSelectionPlan(
+        experiment_id=experiment_id,
+        candidate_id=runtime.candidate.candidate_id,
+        candidate_fingerprint=runtime.candidate.fingerprint,
+        source_digest=runtime.candidate.source_digest,
+        parent_source_digest=runtime.candidate.parent_source_digest,
+        executable_change_digest=runtime.candidate.executable_change.digest,
+        config_digest=runtime.candidate.config_digest,
+        training_policy_digest=runtime.candidate.training_policy_digest,
+        evidence_receipt_digest=result.incumbent.evidence_receipt_digest,
+        source_snapshot=runtime.lineage.source_snapshot,
+        training_features=feature_artifacts.outer_train,
+        training_targets=feature_artifacts.outer_targets,
+        training_user_groups=feature_artifacts.outer_groups,
+        validation_features=feature_artifacts.outer_valid,
+        final_features=feature_artifacts.final,
+        feature_bundle_digest=features.digest,
+        feature_count=features.final.feature_count,
+        dataset_digest=dataset_digest,
+        validation_inputs_digest=validation_capability.digest,
+        final_inputs_digest=final_capability.digest,
+        frozen_fusion_weights=weights,
+        representative_seed=0,
+        selected_outer_request_digest=representative.scientific_request_digest,
+        scientific_record_digest=representative.scientific_record_digest,
+        tree_checkpoint=representative.checkpoint,
+        validation_prediction=representative.candidate_validation_prediction,
+        fm_member=representative.fm_member,
+        inner_folds=inner,
+        matched_seeds=tuple(matched),
+        timeout_seconds=int(limits.timeout_seconds),
+        memory_limit_bytes=limits.memory_limit_bytes,
+        threads=limits.threads,
+    )
+
+
+def _ensure_lineage_ledger(
+    *,
+    campaign_store: CampaignStore,
+    lineage: ScriptedLambdaRankLineage | LiveResearchLineage,
+    candidate_id: str,
+    scientific_iteration: int,
+) -> tuple[CampaignStoreResearchLedger, str]:
+    ledger = CampaignStoreResearchLedger(
+        campaign_store,
+        provider_name=lineage.provider,
+        fallback_candidate_id=SCRIPTED_PARENT_ID,
+    )
+    experiment_id = f"iteration-{scientific_iteration:02d}"
+    snapshot_id = f"{candidate_id}-source"
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is None:
+        ledger.create_iteration(experiment_id, scientific_iteration, lineage.proposal)
+        experiment = campaign_store.experiment(experiment_id)
+    if experiment is None:
+        raise FullCampaignError("research experiment was not durably created")
+    if campaign_store.proposal(lineage.proposal.proposal_id) is None:
+        ledger.record_proposal(
+            experiment_id,
+            lineage.proposal_request.digest,
+            lineage.proposal,
+            _artifact_spec(lineage.transcript_artifact),
+        )
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is None:
+        raise FullCampaignError("research experiment disappeared")
+    if experiment.status == "PLANNED":
+        ledger.transition(
+            experiment_id,
+            "PLANNED",
+            "PROPOSED",
+            operation=ResearchOperation.PROPOSE.value,
+            reason="persist scripted typed proposal and complete transcript",
+        )
+    if campaign_store.source_snapshot(snapshot_id) is None:
+        ledger.record_source(
+            snapshot_id=snapshot_id,
+            experiment_id=experiment_id,
+            candidate=lineage.materialized,
+            parent_digest=lineage.parent.digest,
+            source_manifest=_artifact_spec(lineage.source_snapshot.manifest_artifact),
+            diff=_artifact_spec(lineage.diff_artifact),
+            transcript_role="implementation_transcript",
+            transcript=_artifact_spec(lineage.transcript_artifact),
+        )
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is None:
+        raise FullCampaignError("research experiment disappeared after source persistence")
+    if experiment.status == "PROPOSED":
+        ledger.transition(
+            experiment_id,
+            "PROPOSED",
+            "MATERIALIZED",
+            operation=ResearchOperation.IMPLEMENT.value,
+            reason="persist material generated source and executable-change evidence",
+        )
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is not None and experiment.status == "MATERIALIZED":
+        ledger.transition(
+            experiment_id,
+            "MATERIALIZED",
+            "RUNNING",
+            operation="run",
+            reason="start protected scientific evaluation of generated source",
+        )
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is None:
+        raise FullCampaignError("research experiment disappeared after lineage admission")
+    return ledger, experiment.experiment_id
+
+
+def _reflect(
+    *,
+    campaign_store: CampaignStore,
+    research_ledger: CampaignStoreResearchLedger,
+    lineage: ScriptedLambdaRankLineage | LiveResearchLineage,
+    candidate_id: str,
+    scientific_iteration: int,
+    result: ScientificCampaignResult,
+    safe_context: SafeResearchContext,
+    research_config: ResearchConfig,
+    artifacts: ArtifactStore,
+    research_model: ResearchModel | None = None,
+) -> tuple[str, str, ArtifactRef, Reflection]:
+    candidate_result = result.candidates[0] if result.candidates else None
+    run = None
+    if candidate_result is not None and candidate_result.runs:
+        outer = [item for item in candidate_result.runs if item.metrics is not None]
+        run = outer[-1] if outer else None
+    metrics = (
+        _metrics(result.fallback.outer_by_seed[0].metrics)
+        if run is None or run.metrics is None
+        else run.metrics
+    )
+    promoted = result.incumbent.candidate_id == candidate_id
+    summary = ExperimentResultSummary(
+        tier="outer" if promoted else "inner",
+        status="promoted" if promoted else "rejected",
+        gauc=metrics.gauc,
+        ndcg_at_5=metrics.ndcg_at_5,
+        primary=metrics.primary,
+        runtime_seconds=0.0 if run is None else run.resources.wall_seconds,
+        peak_memory_mb=(0.0 if run is None else run.resources.peak_rss_bytes / float(1024**2)),
+    )
+    request = ReflectionRequest.create(
+        request_id=f"iteration-{scientific_iteration:02d}-reflect",
+        proposal_id=lineage.proposal.proposal_id,
+        candidate_id=candidate_id,
+        source_digest=lineage.materialized.source_digest,
+        diff_digest=lineage.materialized.diff_digest,
+        result=summary,
+        safe_context=safe_context.to_wire(),
+    )
+    scripted = Reflection(
+        response_id="generated-causal-lambdarank-v1-reflection",
+        summary=(
+            "The bounded generated LambdaRank branch completed protected fold and matched-seed "
+            "evaluation while preserving the qualified official-FM fallback."
+        ),
+        recommendation="close_branch",
+        lessons=(
+            "Use only train-derived folds for fusion selection and keep matched-seed evidence.",
+            "Retain the immutable FM fallback until clean final replay succeeds.",
+        ),
+    )
+    if research_model is None:
+        selected = select_research_provider(
+            research_config,
+            scripted_responses=(ScriptedResponse(ResearchOperation.REFLECT, scripted),),
+        )
+        if isinstance(selected, ProviderUnavailableDiagnostic):
+            raise FullCampaignError(
+                f"research provider unavailable during reflection: {selected.code.value}"
+            )
+        if not isinstance(selected, AvailableResearchProvider):
+            raise FullCampaignError("research provider factory returned an unsupported result")
+        reflection_model = selected.model
+        reflection_provider = selected.provider
+        reflection_live = selected.live_provider_used
+    else:
+        reflection_model = research_model
+        reflection_provider = lineage.provider
+        reflection_live = lineage.live_provider_used
+    reflection = reflection_model.reflect(request)
+    transcript = artifacts.put_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "operation": ResearchOperation.REFLECT.value,
+                "provider": reflection_provider,
+                "live_provider_used": reflection_live,
+                "request": request.to_wire(),
+                "response": reflection.to_wire(),
+                "manual_source_edits": 0,
+                "manual_interventions": 0,
+            }
+        ),
+        kind=ArtifactKind.LOG,
+    )
+    experiment_id = f"iteration-{scientific_iteration:02d}"
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is None:
+        raise FullCampaignError("research experiment is absent during reflection")
+    if experiment.status == "RUNNING":
+        research_ledger.transition(
+            experiment_id,
+            "RUNNING",
+            "EVALUATED",
+            operation="evaluate",
+            reason="persist complete protected scientific campaign result",
+            metadata={"scientific_result_digest": result.digest},
+        )
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is not None and experiment.status == "EVALUATED":
+        research_ledger.transition(
+            experiment_id,
+            "EVALUATED",
+            "REFLECTED",
+            operation=ResearchOperation.REFLECT.value,
+            reason="persist exact typed reflection transcript",
+            artifacts=(("reflection_transcript", _artifact_spec(transcript)),),
+            metadata={"reflection_digest": reflection.digest},
+        )
+    experiment = campaign_store.experiment(experiment_id)
+    if experiment is not None and experiment.status == "REFLECTED":
+        research_ledger.transition(
+            experiment_id,
+            "REFLECTED",
+            "CLOSED",
+            operation="selection",
+            reason="complete the bounded scientific iteration after reflection",
+            metadata={"scientific_iteration": scientific_iteration},
+        )
+    return request.digest, reflection.digest, transcript, reflection
+
+
+@dataclass(frozen=True, slots=True)
+class _AutonomousFollowupResult:
+    result: ScientificCampaignResult
+    selection: FinalizationSelectionPlan | None
+    reflection_request_digest: str
+    reflection_response_digest: str
+    reflection_transcript: ArtifactRef
+    iterations_completed: int
+
+
+def _iteration_record(
+    result: ScientificCampaignResult,
+    reflection: Reflection,
+    *,
+    scientific_iteration: int,
+) -> AggregateRecord:
+    candidate_result = result.candidates[-1] if result.candidates else None
+    return AggregateRecord(
+        name=f"scientific_iteration_{scientific_iteration:02d}",
+        values={
+            "scientific_iteration": scientific_iteration,
+            "candidate_id": (
+                None if candidate_result is None else candidate_result.candidate.candidate_id
+            ),
+            "candidate_outcome": (
+                None if candidate_result is None else candidate_result.outcome.value
+            ),
+            "candidate_reason": None if candidate_result is None else candidate_result.reason,
+            "incumbent_candidate_id": result.incumbent.candidate_id,
+            "launches_used": result.launches_used,
+            "elapsed_seconds": round(result.elapsed_seconds, 3),
+            "stop_reason": result.stop_reason.value,
+            "reflection_recommendation": reflection.recommendation,
+            "reflection_summary": reflection.summary,
+        },
+    )
+
+
+def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
+    if not isinstance(model, OpenAIResponsesModel):
+        return None
+    usage = model.total_usage
+    return {
+        "model": model.config.model,
+        "input_tokens": usage.input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "total_tokens": usage.total_tokens,
+        "estimated_cost_usd": usage.estimated_cost_usd,
+        "unaccounted_attempts": usage.unaccounted_attempts,
+        "transcript_count": len(model.transcripts),
+        "provider_wall_seconds": round(sum(item.latency_seconds for item in model.transcripts), 6),
+    }
+
+
+def _run_autonomous_followups(
+    *,
+    request: CampaignCreateRequest,
+    data: CampaignDataPlane,
+    runtime_template: _ScientificRuntime,
+    scientific_config: ScientificCampaignConfig,
+    fallback: IncumbentEvidence,
+    outer_ledger_path: Path,
+    candidate_limits: LocalCandidateLimits,
+    dataset_digest: str,
+    context_evidence: _ResearchContextEvidence,
+    validation_inputs: CanonicalInputs,
+    final_inputs: CanonicalInputs,
+    research_model: ResearchModel,
+    first_lineage: LiveResearchLineage,
+    first_result: ScientificCampaignResult,
+    first_selection: FinalizationSelectionPlan | None,
+    first_reflection: Reflection,
+    first_reflection_evidence: tuple[str, str, ArtifactRef],
+) -> _AutonomousFollowupResult:
+    """Continue propose→implement→evaluate→reflect until an exact terminal condition."""
+
+    result = first_result
+    selection = first_selection
+    lineage = first_lineage
+    reflection = first_reflection
+    reflection_request, reflection_response, reflection_transcript = first_reflection_evidence
+    parent = (
+        snapshot_materialized_candidate(
+            lineage.materialized,
+            candidate_id=runtime_template.candidate.candidate_id,
+        )
+        if result.incumbent.candidate_id == runtime_template.candidate.candidate_id
+        else lineage.parent
+    )
+    candidates = list(result.candidates)
+    feedback = list(result.public_feedback)
+    records = [_iteration_record(result, reflection, scientific_iteration=1)]
+    iteration = 1
+    terminal = result.stop_reason
+
+    while True:
+        if result.convergence.should_stop:
+            terminal = CampaignStopReason.CONVERGED
+            break
+        if result.convergence.completed_iterations >= scientific_config.max_scientific_iterations:
+            terminal = CampaignStopReason.ITERATION_CAP
+            break
+        if result.launches_used >= scientific_config.max_launches:
+            terminal = CampaignStopReason.LAUNCH_CAP
+            break
+        if result.stop_reason in {
+            CampaignStopReason.LAUNCH_CAP,
+            CampaignStopReason.FINALIZATION_RESERVE,
+            CampaignStopReason.HARD_DEADLINE,
+        }:
+            terminal = result.stop_reason
+            break
+        status = runtime_template.engine.status(runtime_template.run_dir)
+        if status.outer_queries_remaining <= 0:
+            terminal = CampaignStopReason.OUTER_PROMOTION_LIMIT
+            break
+
+        iteration += 1
+        safe_context = _safe_context(
+            request=request,
+            qualification=runtime_template.qualification,
+            fold_a=runtime_template.fold_a,
+            fold_b=runtime_template.fold_b,
+            status=status,
+            campaign_records=tuple(records),
+            evidence=context_evidence,
+        )
+        lineage = prepare_or_rehydrate_live_lineage(
+            campaign_id=request.campaign_id,
+            scientific_iteration=iteration,
+            parent=parent,
+            generated_root=runtime_template.run_dir / _PRODUCTION_DIR / "generated-source",
+            artifact_store=runtime_template.artifacts,
+            safe_context=safe_context,
+            model=research_model,
+            provider="openai",
+        )
+        candidate_id = lineage.candidate_id
+        research_ledger, experiment_id = _ensure_lineage_ledger(
+            campaign_store=runtime_template.campaign_store,
+            lineage=lineage,
+            candidate_id=candidate_id,
+            scientific_iteration=iteration,
+        )
+        candidate = _generated_scientific_candidate(
+            request=request,
+            data=data,
+            features=runtime_template.features,
+            lineage=lineage,
+            candidate_id=candidate_id,
+            candidate_limits=candidate_limits,
+            scientific_iteration=iteration,
+        )
+        iteration_runtime = replace(
+            runtime_template,
+            lineage=lineage,
+            candidate=candidate,
+            experiment_id=experiment_id,
+            scientific_iteration=iteration,
+            records={},
+        )
+        with _open_outer_ledger(
+            outer_ledger_path,
+            maximum=request.config.validation.outer_promotion_limit,
+        ) as project_ledger:
+            adapter = DurableScientificLedgerAdapter(
+                runtime_template.campaign_store,
+                project_ledger,
+                scorer_digest=runtime_template.outer_scorer.scorer.scorer_digest,
+                evidence_registry=iteration_runtime.evidence_registry,
+                representative_seed=0,
+            )
+            result = run_scientific_campaign(
+                config=scientific_config,
+                fallback=fallback,
+                candidates=(candidate,),
+                runner=iteration_runtime,
+                outer_ledger=adapter,
+                initial_incumbent=result.incumbent,
+                initial_convergence=result.convergence,
+                initial_launches_used=result.launches_used,
+                initial_elapsed_seconds=result.elapsed_seconds,
+            )
+        candidates.extend(result.candidates)
+        feedback.extend(result.public_feedback)
+        runtime_template.campaign_store.set_convergence_state(
+            result.convergence.manifest(),
+            expected_revision=runtime_template.campaign_store.snapshot().revision,
+            reason=f"persist autonomous scientific convergence cursor after iteration {iteration}",
+        )
+        promoted_selection = _candidate_selection(
+            experiment_id=experiment_id,
+            result=result,
+            runtime=iteration_runtime,
+            qualification=runtime_template.qualification,
+            features=runtime_template.features,
+            feature_artifacts=runtime_template.feature_artifacts,
+            dataset_digest=dataset_digest,
+            validation_inputs=validation_inputs,
+            final_inputs=final_inputs,
+            limits=candidate_limits,
+        )
+        if promoted_selection is not None:
+            selection = promoted_selection
+        (
+            reflection_request,
+            reflection_response,
+            reflection_transcript,
+            reflection,
+        ) = _reflect(
+            campaign_store=runtime_template.campaign_store,
+            research_ledger=research_ledger,
+            lineage=lineage,
+            candidate_id=candidate_id,
+            scientific_iteration=iteration,
+            result=result,
+            safe_context=safe_context,
+            research_config=request.config.research,
+            artifacts=runtime_template.artifacts,
+            research_model=research_model,
+        )
+        records.append(_iteration_record(result, reflection, scientific_iteration=iteration))
+        if result.incumbent.candidate_id == candidate_id:
+            parent = snapshot_materialized_candidate(
+                lineage.materialized,
+                candidate_id=candidate_id,
+            )
+        terminal = result.stop_reason
+
+    aggregate = ScientificCampaignResult(
+        config_digest=scientific_config.digest,
+        fallback=fallback,
+        incumbent=result.incumbent,
+        candidates=tuple(candidates),
+        public_feedback=tuple(feedback),
+        convergence=result.convergence,
+        launches_used=result.launches_used,
+        elapsed_seconds=result.elapsed_seconds,
+        stop_reason=terminal,
+    )
+    return _AutonomousFollowupResult(
+        result=aggregate,
+        selection=selection,
+        reflection_request_digest=reflection_request,
+        reflection_response_digest=reflection_response,
+        reflection_transcript=reflection_transcript,
+        iterations_completed=iteration,
+    )
+
+
+def _ensure_finalization_required(store: CampaignStore) -> None:
+    snapshot = store.snapshot()
+    if snapshot.status == CampaignState.FINALIZATION_REQUIRED.value:
+        return
+    if snapshot.status not in {
+        CampaignState.CREATED.value,
+        CampaignState.RUNNING.value,
+        CampaignState.PAUSED.value,
+    }:
+        raise FullCampaignError(
+            f"research campaign cannot enter finalization from {snapshot.status!r}"
+        )
+    store.set_campaign_phase(
+        phase="finalization_required",
+        status=CampaignState.FINALIZATION_REQUIRED.value,
+        expected_revision=snapshot.revision,
+        reason="bounded provider-free research portfolio is closed and evidence is retained",
+    )
+
+
+def _commit_outcome(
+    *,
+    run_dir: Path,
+    request: CampaignCreateRequest,
+    engine: CampaignEngine,
+    campaign_store: CampaignStore,
+    artifacts: ArtifactStore,
+    progress: FullCampaignProgressLedger,
+    qualification: OfficialFMQualificationEvidence,
+    scorer_digest: str,
+    fallback_receipt_digest: str,
+    scientific_result_digest: str | None,
+    reflection_request_digest: str | None,
+    reflection_response_digest: str | None,
+    reflection_transcript: ArtifactRef | None,
+    selection: FinalizationSelectionPlan | None,
+) -> FullCampaignOutcome:
+    checkpoints = progress.checkpoints()
+    if not checkpoints or checkpoints[-1].stage is not FullCampaignStage.REFLECTED:
+        raise FullCampaignError("outcome requires a durable reflected research checkpoint")
+    _ensure_finalization_required(campaign_store)
+    snapshot = campaign_store.snapshot()
+    if (
+        snapshot.incumbent is None
+        or snapshot.incumbent.incumbent_id != SCRIPTED_PARENT_ID
+        or not snapshot.incumbent.is_fallback
+        or not snapshot.incumbent.replay_verified
+    ):
+        raise FullCampaignError("qualified official-FM fallback was not preserved")
+    outcome = FullCampaignOutcome(
+        run_dir=run_dir,
+        campaign_id=request.campaign_id,
+        request_digest=request.digest,
+        progress_predecessor_digest=checkpoints[-1].digest,
+        fallback_candidate_id=SCRIPTED_PARENT_ID,
+        fallback_receipt_digest=fallback_receipt_digest,
+        qualification_manifest_digest=qualification.manifest_digest,
+        dataset_digest=qualification.canonical_digest,
+        scorer_digest=scorer_digest,
+        validation_row_count=qualification.validation_row_count,
+        final_row_count=qualification.final_row_count,
+        scientific_result_digest=scientific_result_digest,
+        reflection_request_digest=reflection_request_digest,
+        reflection_response_digest=reflection_response_digest,
+        reflection_transcript=reflection_transcript,
+        selection=selection,
+        launches_used=snapshot.launches_used,
+        outer_queries_used=snapshot.outer_queries_used,
+        manual_interventions=0,
+    )
+    committed = FullCampaignOutcomeRepository(
+        run_dir=run_dir,
+        artifact_store=artifacts,
+        progress=progress,
+    ).commit(outcome)
+    reloaded = load_full_campaign_outcome(run_dir, engine=engine)
+    if reloaded != committed:
+        raise FullCampaignError("strict outcome reload differs from the committed outcome")
+    return reloaded
+
+
+def _provider_unavailable_outcome(
+    *,
+    diagnostic: ProviderUnavailableDiagnostic,
+    run_dir: Path,
+    request: CampaignCreateRequest,
+    engine: CampaignEngine,
+    campaign_store: CampaignStore,
+    artifacts: ArtifactStore,
+    progress: FullCampaignProgressLedger,
+    qualification: OfficialFMQualificationEvidence,
+    scorer_digest: str,
+    fallback_receipt_digest: str,
+) -> FullCampaignOutcome:
+    receipt = artifacts.put_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "diagnostic": diagnostic.to_wire(),
+                "fallback_preserved": True,
+                "manual_interventions": 0,
+            }
+        ),
+        kind=ArtifactKind.LOG,
+    )
+    evidence = {
+        "provider_diagnostic": diagnostic.to_wire(),
+        "diagnostic_artifact": receipt.manifest(),
+        "fallback_receipt_digest": fallback_receipt_digest,
+        "fallback_preserved": True,
+    }
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.LINEAGE_READY,
+        evidence=evidence,
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.SCIENCE_COMPLETE,
+        evidence=evidence | {"scientific_result_digest": None},
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.REFLECTED,
+        evidence=evidence
+        | {
+            "reflection_request_digest": None,
+            "reflection_response_digest": None,
+            "portfolio_count": 0,
+            "portfolio_cap_reason": "configured_provider_unavailable",
+        },
+    )
+    return _commit_outcome(
+        run_dir=run_dir,
+        request=request,
+        engine=engine,
+        campaign_store=campaign_store,
+        artifacts=artifacts,
+        progress=progress,
+        qualification=qualification,
+        scorer_digest=scorer_digest,
+        fallback_receipt_digest=fallback_receipt_digest,
+        scientific_result_digest=None,
+        reflection_request_digest=None,
+        reflection_response_digest=None,
+        reflection_transcript=None,
+        selection=None,
+    )
+
+
+def _qualification_fallback_receipt(
+    qualification: OfficialFMQualificationEvidence,
+    *,
+    reason: str,
+) -> str:
+    return _digest(
+        b"kuairand-production-qualification-only-fallback-receipt-v1",
+        {
+            "qualification_manifest_digest": qualification.manifest_digest,
+            "fallback_manifest_digest": qualification.fallback.manifest_digest,
+            "reason": reason,
+            "replayable": True,
+            "final_outcomes_scored": 0,
+        },
+    )
+
+
+def _fold_branch_failure_details(
+    error: CandidateAdmissionError | SupervisedFoldFMExecutionError,
+    *,
+    artifacts: ArtifactStore,
+) -> Mapping[str, object]:
+    """Classify one narrowly recoverable fold failure from trusted immutable evidence."""
+
+    if isinstance(error, CandidateAdmissionError):
+        if error.reason not in _SAFE_FOLD_ADMISSION_REASONS:
+            raise error
+        return {
+            "error_type": type(error).__name__,
+            "admission_reason": error.reason.value,
+            "execution_outcome": None,
+            "journal_closure_digest": None,
+            "candidate_released": False,
+            "cleanup_verified": True,
+            "launch_charged": False,
+        }
+    closure = error.artifacts
+    if closure is None:
+        raise error
+    manifest_ref = closure.artifact("execution_manifest")
+    payload = artifacts.read_bytes(manifest_ref, max_bytes=manifest_ref.size_bytes)
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise FullCampaignError("fold failure execution manifest is not JSON") from exc
+    expected_fields = {
+        "schema_version",
+        "execution_id",
+        "outcome",
+        "process",
+        "candidate_released",
+        "exit_code",
+        "terminating_signal",
+        "started_at_utc",
+        "ended_at_utc",
+        "wall_seconds",
+        "peak_tree_rss_bytes",
+        "peak_workspace_bytes",
+        "peak_process_count",
+        "stdout",
+        "stderr",
+        "cleanup_verified",
+        "device",
+        "threads",
+        "detail",
+        "candidate_metrics_accepted",
+    }
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != expected_fields
+        or payload != _canonical_json(decoded)
+    ):
+        raise FullCampaignError("fold failure execution manifest is not exact canonical JSON")
+    result = error.result
+    if result is not None and payload != _canonical_json(result.manifest()):
+        raise FullCampaignError("fold failure result differs from its immutable manifest")
+    try:
+        outcome = ExecutionOutcome(decoded["outcome"])
+    except (TypeError, ValueError) as exc:
+        raise FullCampaignError("fold failure execution outcome is invalid") from exc
+    released = decoded["candidate_released"]
+    cleanup_verified = decoded["cleanup_verified"]
+    if type(released) is not bool or type(cleanup_verified) is not bool:
+        raise FullCampaignError("fold failure release or cleanup evidence is malformed")
+    if decoded["candidate_metrics_accepted"] is not False:
+        raise FullCampaignError("failed fold execution accepted candidate metrics")
+    if outcome is ExecutionOutcome.CANCELLED:
+        raise FullCampaignCancelled(
+            "campaign cancelled by supervised fold runner; durable state is resumable"
+        ) from error
+    if (
+        outcome not in _SAFE_FOLD_FAILURE_OUTCOMES
+        or cleanup_verified is not True
+        or (result is not None and result.succeeded)
+    ):
+        raise error
+    return {
+        "error_type": type(error).__name__,
+        "admission_reason": None,
+        "execution_outcome": outcome.value,
+        "journal_closure_digest": closure.closure_digest,
+        "candidate_released": released,
+        "cleanup_verified": cleanup_verified,
+        "launch_charged": True,
+    }
+
+
+def _research_admission_closed_outcome(
+    *,
+    reason: str,
+    run_dir: Path,
+    request: CampaignCreateRequest,
+    engine: CampaignEngine,
+    campaign_store: CampaignStore,
+    artifacts: ArtifactStore,
+    progress: FullCampaignProgressLedger,
+    qualification: OfficialFMQualificationEvidence,
+    scorer_digest: str,
+    fold_b: SupervisedFoldFMRun | None = None,
+    fallback_receipt_digest: str | None = None,
+    diagnostic_category: str = "research_admission_closed",
+    fold_a_status: str = "not_started",
+    fold_b_status: str | None = None,
+    diagnostic_details: Mapping[str, object] | None = None,
+) -> FullCampaignOutcome:
+    fallback_receipt = (
+        _qualification_fallback_receipt(qualification, reason=reason)
+        if fallback_receipt_digest is None
+        else fallback_receipt_digest
+    )
+    diagnostic = artifacts.put_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "category": diagnostic_category,
+                "reason": reason,
+                "fallback_receipt_digest": fallback_receipt,
+                "fallback_preserved": True,
+                "final_outcomes_scored": 0,
+                "details": {} if diagnostic_details is None else dict(diagnostic_details),
+            }
+        ),
+        kind=ArtifactKind.LOG,
+    )
+    common = {
+        "admission_closed": True,
+        "reason": reason,
+        "diagnostic_artifact": diagnostic.manifest(),
+        "fallback_receipt_digest": fallback_receipt,
+        "fallback_preserved": True,
+    }
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.FOLD_CONTROLS_READY,
+        evidence=common
+        | {
+            "fold_a_status": fold_a_status,
+            "fold_b_status": ("not_started" if fold_b is None else "completed")
+            if fold_b_status is None
+            else fold_b_status,
+            "fold_b_evidence_digest": None if fold_b is None else fold_b.evidence.digest,
+            "new_research_launches_after_closure": 0,
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.FEATURES_READY,
+        evidence=common
+        | {
+            "feature_build_status": "not_required_for_qualified_fallback",
+            "final_target_capability": None,
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.LINEAGE_READY,
+        evidence=common
+        | {
+            "generated_lineage_status": "not_started",
+            "manual_source_edits": 0,
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.SCIENCE_COMPLETE,
+        evidence=common
+        | {
+            "scientific_result_digest": None,
+            "portfolio_count": 0,
+            "portfolio_cap_reason": reason,
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.REFLECTED,
+        evidence=common
+        | {
+            "reflection_request_digest": None,
+            "reflection_response_digest": None,
+            "manual_interventions": 0,
+        },
+    )
+    return _commit_outcome(
+        run_dir=run_dir,
+        request=request,
+        engine=engine,
+        campaign_store=campaign_store,
+        artifacts=artifacts,
+        progress=progress,
+        qualification=qualification,
+        scorer_digest=scorer_digest,
+        fallback_receipt_digest=fallback_receipt,
+        scientific_result_digest=None,
+        reflection_request_digest=None,
+        reflection_response_digest=None,
+        reflection_transcript=None,
+        selection=None,
+    )
+
+
+def _open_outer_ledger(path: Path, *, maximum: int) -> OuterQueryLedger:
+    if maximum <= 0:
+        raise FullCampaignError("a scientific campaign requires at least one outer slot")
+    try:
+        if path.exists() or path.is_symlink():
+            return OuterQueryLedger.open(path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent = path.parent.lstat()
+        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+            raise FullCampaignError("outer-query ledger parent must be a real directory")
+        return OuterQueryLedger.create(path, max_queries=maximum)
+    except OSError as exc:
+        raise FullCampaignError("outer-query ledger is unavailable") from exc
+
+
+def _outer_ledger_location(
+    *,
+    run_dir: Path,
+    project_root: Path,
+    configured_path: Path | None,
+) -> Path:
+    return (
+        run_dir.parent / "outer-query-ledger.sqlite3"
+        if configured_path is None
+        else configured_path
+        if configured_path.is_absolute()
+        else project_root / configured_path
+    ).absolute()
+
+
+@dataclass(frozen=True, slots=True)
+class _OuterResumeAuthorization:
+    request_digest: str
+    missing_seeds: tuple[int, ...]
+
+
+def _outer_resume_authorization(
+    *,
+    ledger_path: Path,
+    request: CampaignCreateRequest,
+    scorer_digest: str,
+    campaign_store: CampaignStore,
+) -> _OuterResumeAuthorization | None:
+    """Verify whether a durable public reservation authorizes matched-seed completion."""
+
+    local_used = campaign_store.snapshot().outer_queries_used
+    if not ledger_path.exists() and not ledger_path.is_symlink():
+        if local_used != 0:
+            raise FullCampaignError(
+                "campaign records an outer query but its project ledger is absent"
+            )
+        return None
+    if ledger_path.is_symlink() or not ledger_path.is_file():
+        raise FullCampaignError("outer-query ledger must be a real regular file")
+    with OuterQueryLedger.open(ledger_path, read_only=True) as ledger:
+        projection = ledger.projection()
+    if projection.max_queries != request.config.validation.outer_promotion_limit:
+        raise FullCampaignError("outer-query ledger limit differs from the campaign request")
+    matches = tuple(item for item in projection.queries if item.campaign_id == request.campaign_id)
+    if len(matches) > 1 or local_used > 1:
+        raise FullCampaignError("provider-free campaign has multiple public outer reservations")
+    if not matches:
+        if local_used != 0:
+            raise FullCampaignError(
+                "campaign-local outer reservation disappeared from project ledger"
+            )
+        return None
+    item = matches[0]
+    metadata = item.reservation_metadata
+    expected_metadata_fields = {
+        "schema_version",
+        "kind",
+        "request_digest",
+        "request",
+        "candidate_id",
+        "candidate_fingerprint",
+        "source_digest",
+        "parent_source_digest",
+        "executable_diff_digest",
+        "material_change_digest",
+        "controller_attestation_digest",
+        "consumes_slot",
+    }
+    request_manifest = metadata.get("request")
+    if (
+        set(metadata) != expected_metadata_fields
+        or metadata.get("schema_version") != 1
+        or metadata.get("kind") != "scientific_outer_promotion_reservation"
+        or not isinstance(request_manifest, Mapping)
+    ):
+        raise FullCampaignError("outer reservation metadata is not the scientific contract")
+    manifest_fields = set(OuterPromotionRequest.__dataclass_fields__) - {"digest"}
+    if set(request_manifest) != manifest_fields | {"schema_version"}:
+        raise FullCampaignError("outer promotion request manifest fields are not exact")
+    if request_manifest.get("schema_version") != 1:
+        raise FullCampaignError("outer promotion request schema is unsupported")
+    try:
+        promotion = OuterPromotionRequest(
+            **{name: request_manifest[name] for name in manifest_fields}
+        )
+    except (TypeError, ValueError) as exc:
+        raise FullCampaignError("outer promotion request manifest is invalid") from exc
+    identity = campaign_store.identity()
+    if (
+        metadata.get("request_digest") != promotion.digest
+        or promotion.campaign_digest != identity.config_digest
+        or promotion.candidate_id != metadata.get("candidate_id")
+        or promotion.candidate_fingerprint != item.candidate_fingerprint
+        or promotion.benchmark_digest != request.benchmark_digest
+        or promotion.dataset_digest != request.dataset_manifest_digest
+        or promotion.scorer_digest != scorer_digest
+        or item.benchmark_digest != request.benchmark_digest
+        or item.dataset_digest != request.dataset_manifest_digest
+        or item.scorer_digest != scorer_digest
+        or item.state not in {"RESERVED", "COMPLETED"}
+    ):
+        raise FullCampaignError("outer reservation identity differs from the campaign")
+    for name in (
+        "candidate_fingerprint",
+        "source_digest",
+        "parent_source_digest",
+        "executable_diff_digest",
+        "material_change_digest",
+        "controller_attestation_digest",
+    ):
+        if metadata.get(name) != getattr(promotion, name):
+            raise FullCampaignError(f"outer reservation {name} differs from its request")
+    outer_train = tuple(
+        execution
+        for execution in campaign_store.executions()
+        if execution.kind == "generated_candidate_train"
+        and execution.tier == "train"
+        and execution.source_digest == promotion.source_digest
+    )
+    if any(execution.seed not in {0, 1, 2} for execution in outer_train):
+        raise FullCampaignError("outer matched-seed execution has an unexpected seed")
+    if len({execution.seed for execution in outer_train}) != len(outer_train):
+        raise FullCampaignError("outer matched-seed execution identity is duplicated")
+    observed_seeds = {cast(int, execution.seed) for execution in outer_train}
+    return _OuterResumeAuthorization(
+        request_digest=promotion.digest,
+        missing_seeds=tuple(seed for seed in (0, 1, 2) if seed not in observed_seeds),
+    )
+
+
+def _validate_locked_runtime(
+    project_root: Path,
+    request: CampaignCreateRequest,
+) -> None:
+    if benchmark_digest() != request.benchmark_digest:
+        raise FullCampaignError("frozen benchmark contract differs from the campaign request")
+    environment = capture_environment_identity(project_root)
+    if environment.digest != request.environment_digest:
+        raise FullCampaignError("locked runtime environment differs from campaign creation")
+    source = hash_source_tree(project_root)
+    if source.digest != request.source_digest:
+        raise FullCampaignError("trusted source tree differs from campaign creation")
+
+
+def run_provider_free_campaign(
+    run_dir: Path,
+    *,
+    project_root: Path,
+    engine: CampaignEngine | None = None,
+    outer_ledger_path: Path | None = None,
+    cancel_event: Event | None = None,
+) -> FullCampaignOutcome:
+    """Run or restart the bounded local campaign through a strict finalization handoff.
+
+    The function never constructs a final-outcome capability.  Its only final-period value is the
+    canonical label-free input table, which is transformed alongside public validation by one
+    train-frozen causal feature build.  Every train/evaluate child crosses a journal immediately
+    after a fresh chained deadline observation.
+    """
+
+    if not isinstance(run_dir, Path) or not isinstance(project_root, Path):
+        raise FullCampaignError("run_dir and project_root must be pathlib.Path values")
+    if cancel_event is not None and not isinstance(cancel_event, Event):
+        raise FullCampaignError("cancel_event must be threading.Event or None")
+    _check_cancel(cancel_event)
+    selected_engine = CampaignEngine() if engine is None else engine
+    if not isinstance(selected_engine, CampaignEngine):
+        raise FullCampaignError("engine must be a CampaignEngine")
+    try:
+        root = project_root.resolve(strict=True)
+        run = run_dir.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise FullCampaignError("project or campaign run directory is unavailable") from exc
+    if root.is_symlink() or not root.is_dir() or run.is_symlink() or not run.is_dir():
+        raise FullCampaignError("project and campaign run roots must be real directories")
+
+    request = selected_engine.load_request(run)
+    if request.run_dir != run:
+        raise FullCampaignError("campaign request run directory differs from the selected run")
+    progress = FullCampaignProgressLedger(run / _PRODUCTION_DIR / "progress")
+    checkpoints = progress.checkpoints()
+    if checkpoints and checkpoints[-1].stage is FullCampaignStage.FINALIZATION_REQUIRED:
+        return load_full_campaign_outcome(run, engine=selected_engine)
+
+    _check_cancel(cancel_event)
+    _validate_locked_runtime(root, request)
+    status = selected_engine.resume(run)
+    if status.status in {CampaignState.COMPLETED.value, CampaignState.INCOMPLETE.value}:
+        raise FullCampaignError(f"campaign is terminal and cannot run research: {status.status}")
+    _check_cancel(cancel_event)
+
+    data_dir = _resolve_directory(root, request.config.benchmark.data_dir, "official data")
+    starter_dir = _resolve_directory(
+        root,
+        request.config.benchmark.starter_dir,
+        "organizer starter kit",
+    )
+    starter = verify_starter_kit(starter_dir)
+    if starter.manifest_sha256 != request.starter_manifest_digest:
+        raise FullCampaignError("organizer starter identity differs from campaign creation")
+
+    dataset = load_canonical_dataset(data_dir)
+    data = prepare_campaign_data_plane(
+        dataset,
+        expected_dataset_digest=request.dataset_manifest_digest,
+    )
+    valid_targets = dataset.valid.targets
+    if not isinstance(valid_targets, ProtectedTargets):
+        raise FullCampaignError("public validation targets are not protected")
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.DATA_PREPARED,
+        evidence={
+            "data_plane_digest": data.digest,
+            "dataset_digest": dataset.digest,
+            "train_rows": len(data.outer_train_inputs),
+            "validation_rows": len(data.outer_validation_inputs),
+            "final_rows": len(data.final_inputs),
+            "final_target_capability": None,
+            "final_outcome_parsed_fields": list(dataset.final.outcome_trace.parsed_fields),
+            "final_outcome_parsed_cell_count": (dataset.final.outcome_trace.parsed_cell_count),
+        },
+    )
+
+    outer_scorer = _outer_scorer(
+        starter_dir=starter_dir,
+        inputs=data.outer_validation_inputs,
+        targets=valid_targets,
+        split_token=data.outer_validation_inputs.digest,
+    )
+    scorer_digest = outer_scorer.scorer.scorer_digest
+    qualification = load_official_fm_qualification(
+        request.qualification_run_dir,
+        expectations=QualificationExpectations(
+            canonical_digest=dataset.digest,
+            starter_manifest_digest=starter.manifest_sha256,
+            scorer_digest=scorer_digest,
+            validation_row_count=len(data.outer_validation_inputs),
+            final_row_count=len(data.final_inputs),
+        ),
+    )
+    if (
+        qualification.manifest_digest != request.qualification_manifest_digest
+        or qualification.benchmark_digest != request.benchmark_digest
+    ):
+        raise FullCampaignError("official FM qualification differs from campaign creation")
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.QUALIFICATION_VERIFIED,
+        evidence={
+            "qualification_manifest_digest": qualification.manifest_digest,
+            "qualification_input_digest": qualification.qualification_input_digest,
+            "audit_digest": qualification.audit_digest,
+            "scorer_digest": scorer_digest,
+            "outer_seeds": [item.seed for item in qualification.outer_runs],
+            "fallback_manifest_digest": qualification.fallback.manifest_digest,
+            "final_outcomes_scored": 0,
+        },
+    )
+
+    artifacts = ArtifactStore(run / "artifacts")
+    production = run / _PRODUCTION_DIR
+    production.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fold_control_root = production / "fold-controls"
+    candidate_control_root = production / "candidate-control"
+    fold_control_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    candidate_control_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    workspaces = WorkspaceMaterializer(
+        production / "workspaces",
+        artifact_store=artifacts,
+        policy=WorkspacePolicy(),
+    )
+    candidate_limits = _limits(request)
+    fold_limits = replace(candidate_limits, device="cpu")
+    ledger_path = _outer_ledger_location(
+        run_dir=run,
+        project_root=root,
+        configured_path=outer_ledger_path,
+    )
+
+    with CampaignStore.open(
+        run / CAMPAIGN_DATABASE_NAME,
+        campaign_id=request.campaign_id,
+    ) as campaign_store:
+        identity = campaign_store.identity()
+        if (
+            identity.config_digest != request.config.digest
+            or identity.benchmark_digest != request.benchmark_digest
+            or identity.dataset_manifest_digest != dataset.digest
+            or identity.environment_digest != request.environment_digest
+        ):
+            raise FullCampaignError("campaign database identity differs from the request")
+
+        retained_checkpoints = progress.checkpoints()
+        retained_lineage = next(
+            (
+                checkpoint
+                for checkpoint in retained_checkpoints
+                if checkpoint.stage is FullCampaignStage.LINEAGE_READY
+            ),
+            None,
+        )
+        retained_fold = next(
+            (
+                checkpoint
+                for checkpoint in retained_checkpoints
+                if checkpoint.stage is FullCampaignStage.FOLD_CONTROLS_READY
+            ),
+            None,
+        )
+        closure_receipt = None
+        if retained_fold is not None:
+            value = retained_fold.evidence.get("fallback_receipt_digest")
+            if type(value) is not str or len(value) != 64:
+                raise FullCampaignError("retained fold stage lacks its fallback receipt")
+            closure_receipt = value
+        outer_resume = _outer_resume_authorization(
+            ledger_path=ledger_path,
+            request=request,
+            scorer_digest=scorer_digest,
+            campaign_store=campaign_store,
+        )
+        if retained_lineage is not None:
+            retained_start = retained_lineage.evidence.get("scientific_start")
+            if not isinstance(retained_start, Mapping):
+                raise FullCampaignError("retained lineage lacks its scientific start cursor")
+            start_launches = retained_start.get("launches_already_used")
+            current_launches = campaign_store.snapshot().launches_used
+            if type(start_launches) is not int or not 0 <= start_launches <= current_launches:
+                raise FullCampaignError("retained scientific launch cursor moved backwards")
+        current_deadline = selected_engine.inspect_deadline(run)
+        if (
+            status.finalization_required or current_deadline.finalization_reserve_active
+        ) and outer_resume is None:
+            return _research_admission_closed_outcome(
+                reason="finalization_reserve_active_before_fold_B",
+                run_dir=run,
+                request=request,
+                engine=selected_engine,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                progress=progress,
+                qualification=qualification,
+                scorer_digest=scorer_digest,
+                fallback_receipt_digest=closure_receipt,
+            )
+
+        _check_cancel(cancel_event)
+        try:
+            fold_b = _fold_control(
+                fold_name="B",
+                fold_token=data.fold_b.fold.digest,
+                prefix_inputs=data.fold_b.prefix_inputs,
+                prefix_labels=data.fold_b.prefix_labels,
+                query_inputs=data.fold_b.query_inputs,
+                query_labels=data.fold_b.query_labels,
+                engine=selected_engine,
+                run_dir=run,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                workspaces=workspaces,
+                starter_dir=starter_dir,
+                limits=fold_limits,
+                cancel_event=cancel_event,
+            )
+        except (CandidateAdmissionError, SupervisedFoldFMExecutionError) as exc:
+            _check_cancel(cancel_event)
+            return _research_admission_closed_outcome(
+                reason="fold_B_control_branch_failed",
+                run_dir=run,
+                request=request,
+                engine=selected_engine,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                progress=progress,
+                qualification=qualification,
+                scorer_digest=scorer_digest,
+                fallback_receipt_digest=closure_receipt,
+                diagnostic_category="fold_control_failed",
+                fold_b_status="failed",
+                diagnostic_details=_fold_branch_failure_details(exc, artifacts=artifacts),
+            )
+        if (
+            selected_engine.inspect_deadline(run).finalization_reserve_active
+            and outer_resume is None
+        ):
+            return _research_admission_closed_outcome(
+                reason="finalization_reserve_active_between_fold_B_and_fold_A",
+                run_dir=run,
+                request=request,
+                engine=selected_engine,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                progress=progress,
+                qualification=qualification,
+                scorer_digest=scorer_digest,
+                fold_b=fold_b,
+                fallback_receipt_digest=closure_receipt,
+            )
+        _check_cancel(cancel_event)
+        try:
+            fold_a = _fold_control(
+                fold_name="A",
+                fold_token=data.fold_a.fold.digest,
+                prefix_inputs=data.fold_a.prefix_inputs,
+                prefix_labels=data.fold_a.prefix_labels,
+                query_inputs=data.fold_a.query_inputs,
+                query_labels=data.fold_a.query_labels,
+                engine=selected_engine,
+                run_dir=run,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                workspaces=workspaces,
+                starter_dir=starter_dir,
+                limits=fold_limits,
+                cancel_event=cancel_event,
+            )
+        except (CandidateAdmissionError, SupervisedFoldFMExecutionError) as exc:
+            _check_cancel(cancel_event)
+            return _research_admission_closed_outcome(
+                reason="fold_A_control_branch_failed",
+                run_dir=run,
+                request=request,
+                engine=selected_engine,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                progress=progress,
+                qualification=qualification,
+                scorer_digest=scorer_digest,
+                fold_b=fold_b,
+                fallback_receipt_digest=closure_receipt,
+                diagnostic_category="fold_control_failed",
+                fold_a_status="failed",
+                diagnostic_details=_fold_branch_failure_details(exc, artifacts=artifacts),
+            )
+        fallback_receipt = _fallback_receipt(qualification, fold_a, fold_b)
+        _stage(
+            progress,
+            request_digest=request.digest,
+            stage=FullCampaignStage.FOLD_CONTROLS_READY,
+            evidence={
+                "fold_a_evidence_digest": fold_a.evidence.digest,
+                "fold_b_evidence_digest": fold_b.evidence.digest,
+                "fold_a_metrics": {
+                    "GAUC": fold_a.control.metrics.gauc,
+                    "nDCG@5": fold_a.control.metrics.ndcg_at_5,
+                    "primary": fold_a.control.metrics.primary,
+                },
+                "fold_b_metrics": {
+                    "GAUC": fold_b.control.metrics.gauc,
+                    "nDCG@5": fold_b.control.metrics.ndcg_at_5,
+                    "primary": fold_b.control.metrics.primary,
+                },
+                "fallback_receipt_digest": fallback_receipt,
+                "official_fm_cpu_controls": True,
+            },
+        )
+        if (
+            selected_engine.inspect_deadline(run).finalization_reserve_active
+            and outer_resume is None
+        ):
+            return _research_admission_closed_outcome(
+                reason="finalization_reserve_active_before_generated_research",
+                run_dir=run,
+                request=request,
+                engine=selected_engine,
+                campaign_store=campaign_store,
+                artifacts=artifacts,
+                progress=progress,
+                qualification=qualification,
+                scorer_digest=scorer_digest,
+                fold_b=fold_b,
+                fallback_receipt_digest=fallback_receipt,
+            )
+
+        prior_feature_stage = next(
+            (
+                checkpoint.evidence
+                for checkpoint in progress.checkpoints()
+                if checkpoint.stage is FullCampaignStage.FEATURES_READY
+            ),
+            None,
+        )
+        cache_key = _digest(
+            b"kuairand-production-feature-cache-key-v1",
+            {
+                "data_plane_digest": data.digest,
+                "builder_source_digest": request.source_digest,
+            },
+        )
+        cache_dir = production / "feature-cache" / cache_key
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if cache_dir.is_symlink() or not cache_dir.is_dir():
+            raise FullCampaignError("causal feature cache must be a real run-local directory")
+        features, cache_receipt = _feature_cache_build(
+            data=data,
+            builder_source_digest=request.source_digest,
+            cache_dir=cache_dir,
+            prior_stage=prior_feature_stage,
+        )
+        feature_artifacts = _put_feature_artifacts(
+            artifacts,
+            features,
+            fold_a_targets=data.fold_a.prefix_labels,
+            fold_a_users=data.fold_a.prefix_inputs.user_id,
+            fold_b_targets=data.fold_b.prefix_labels,
+            fold_b_users=data.fold_b.prefix_inputs.user_id,
+            outer_targets=data.outer_train_labels,
+            outer_users=data.outer_train_inputs.user_id,
+        )
+        _stage(
+            progress,
+            request_digest=request.digest,
+            stage=FullCampaignStage.FEATURES_READY,
+            evidence={
+                "feature_bundle_digest": features.digest,
+                "feature_artifacts": feature_artifacts.manifest(),
+                "feature_count": features.final.feature_count,
+                "cache_key": cache_key,
+                "cache_performance": dict(cache_receipt),
+                "final_target_capability": None,
+            },
+        )
+
+        status = selected_engine.status(run)
+        context_evidence = _research_context_evidence(data, features)
+        if retained_lineage is None:
+            safe_context = _safe_context(
+                request=request,
+                qualification=qualification,
+                fold_a=fold_a,
+                fold_b=fold_b,
+                status=status,
+                evidence=context_evidence,
+            )
+        else:
+            retained_context = retained_lineage.evidence.get("safe_context")
+            retained_context_digest = retained_lineage.evidence.get("safe_context_digest")
+            if (
+                not isinstance(retained_context, Mapping)
+                or type(retained_context_digest) is not str
+            ):
+                raise FullCampaignError("retained lineage lacks its frozen safe research context")
+            context_copy = json.loads(_canonical_json(dict(retained_context)))
+            if not isinstance(context_copy, dict):
+                raise FullCampaignError("retained safe research context is malformed")
+            safe_context = SafeResearchContext(
+                MappingProxyType(context_copy),
+                retained_context_digest,
+            )
+
+        _check_cancel(cancel_event)
+        research_model: ResearchModel | None = None
+        if request.config.research.provider == "scripted":
+            template_dir = _resolve_directory(
+                root,
+                Path("candidate_templates/lambdarank"),
+                "generated LambdaRank template",
+            )
+            lineage: ScriptedLambdaRankLineage | LiveResearchLineage = (
+                prepare_or_rehydrate_scripted_lambdarank_lineage(
+                    campaign_id=request.campaign_id,
+                    scientific_iteration=1,
+                    template_dir=template_dir,
+                    generated_root=production / "generated-source",
+                    artifact_store=artifacts,
+                    safe_context=safe_context,
+                )
+            )
+            candidate_id = SCRIPTED_CANDIDATE_ID
+        else:
+            selected_provider = select_research_provider(request.config.research)
+            if isinstance(selected_provider, ProviderUnavailableDiagnostic):
+                return _provider_unavailable_outcome(
+                    diagnostic=selected_provider,
+                    run_dir=run,
+                    request=request,
+                    engine=selected_engine,
+                    campaign_store=campaign_store,
+                    artifacts=artifacts,
+                    progress=progress,
+                    qualification=qualification,
+                    scorer_digest=scorer_digest,
+                    fallback_receipt_digest=fallback_receipt,
+                )
+            if not isinstance(selected_provider, AvailableResearchProvider):
+                raise FullCampaignError("research provider selection is malformed")
+            if not selected_provider.live_provider_used:
+                raise FullCampaignError("autonomous campaign requires a live research provider")
+            research_model = selected_provider.model
+            parent = load_parent_snapshot(
+                _resolve_directory(root, Path("candidate_seed"), "candidate seed"),
+                candidate_id=SCRIPTED_PARENT_ID,
+            )
+            lineage = prepare_or_rehydrate_live_lineage(
+                campaign_id=request.campaign_id,
+                scientific_iteration=1,
+                parent=parent,
+                generated_root=production / "generated-source",
+                artifact_store=artifacts,
+                safe_context=safe_context,
+                model=research_model,
+                provider=selected_provider.provider,
+            )
+            candidate_id = lineage.candidate_id
+        research_ledger, experiment_id = _ensure_lineage_ledger(
+            campaign_store=campaign_store,
+            lineage=lineage,
+            candidate_id=candidate_id,
+            scientific_iteration=1,
+        )
+        observed_start = selected_engine.inspect_deadline(run)
+        lineage_stage = _stage(
+            progress,
+            request_digest=request.digest,
+            stage=FullCampaignStage.LINEAGE_READY,
+            evidence={
+                "lineage": lineage.manifest(),
+                "source_snapshot": lineage.source_snapshot.manifest(),
+                "material_generated_source": True,
+                "manual_source_edits": 0,
+                "provider": lineage.provider,
+                "live_provider_used": lineage.live_provider_used,
+                "safe_context": safe_context.to_wire(),
+                "safe_context_digest": safe_context.digest,
+                "scientific_start": {
+                    "launches_already_used": campaign_store.snapshot().launches_used,
+                    "elapsed_seconds_at_start": observed_start.elapsed_seconds,
+                    "wall_clock_seconds": request.config.benchmark.wall_clock_seconds,
+                    "finalization_reserve_seconds": (
+                        request.config.runner.finalization_reserve_seconds
+                    ),
+                },
+            },
+        )
+        scientific_start = lineage_stage.get("scientific_start")
+        if not isinstance(scientific_start, Mapping) or set(scientific_start) != {
+            "launches_already_used",
+            "elapsed_seconds_at_start",
+            "wall_clock_seconds",
+            "finalization_reserve_seconds",
+        }:
+            raise FullCampaignError("retained lineage lacks an exact scientific start cursor")
+        launches_at_start = scientific_start["launches_already_used"]
+        elapsed_at_start = scientific_start["elapsed_seconds_at_start"]
+        if type(launches_at_start) is not int or not 0 <= launches_at_start <= 50:
+            raise FullCampaignError("retained scientific launch cursor is invalid")
+        if (
+            isinstance(elapsed_at_start, bool)
+            or not isinstance(elapsed_at_start, (int, float))
+            or not np.isfinite(float(elapsed_at_start))
+            or not 0.0 <= float(elapsed_at_start) <= request.config.benchmark.wall_clock_seconds
+        ):
+            raise FullCampaignError("retained scientific deadline cursor is invalid")
+        if (
+            scientific_start["wall_clock_seconds"] != request.config.benchmark.wall_clock_seconds
+            or scientific_start["finalization_reserve_seconds"]
+            != request.config.runner.finalization_reserve_seconds
+        ):
+            raise FullCampaignError("retained scientific budget differs from the request")
+
+        candidate = _generated_scientific_candidate(
+            request=request,
+            data=data,
+            features=features,
+            lineage=lineage,
+            candidate_id=candidate_id,
+            candidate_limits=candidate_limits,
+            scientific_iteration=1,
+        )
+        fold_a_data_digest = _digest(
+            b"kuairand-production-fold-A-science-v1",
+            {
+                "fold_digest": data.fold_a.fold.digest,
+                "feature_pair_digest": features.fold_a.digest,
+                "fm_control_digest": fold_a.evidence.digest,
+            },
+        )
+        fold_b_data_digest = _digest(
+            b"kuairand-production-fold-B-science-v1",
+            {
+                "fold_digest": data.fold_b.fold.digest,
+                "feature_pair_digest": features.fold_b.digest,
+                "fm_control_digest": fold_b.evidence.digest,
+            },
+        )
+        outer_data_digest = _digest(
+            b"kuairand-production-outer-science-v1",
+            {
+                "training_inputs_digest": data.outer_train_inputs.digest,
+                "validation_inputs_digest": data.outer_validation_inputs.digest,
+                "feature_pair_digest": features.outer_and_final.digest,
+                "scorer_digest": scorer_digest,
+            },
+        )
+        scientific_config = ScientificCampaignConfig(
+            benchmark_digest=request.benchmark_digest,
+            dataset_digest=dataset.digest,
+            scorer_digest=scorer_digest,
+            fold_a_data_digest=fold_a_data_digest,
+            fold_b_data_digest=fold_b_data_digest,
+            outer_data_digest=outer_data_digest,
+            environment_digest=request.environment_digest,
+            campaign_digest=identity.config_digest,
+            qualified_fallback_receipt_digest=fallback_receipt,
+            max_scientific_iterations=request.config.benchmark.max_iterations,
+            launches_already_used=launches_at_start,
+            screen_margin=0.0,
+            elapsed_seconds_at_start=float(elapsed_at_start),
+            wall_clock_seconds=request.config.benchmark.wall_clock_seconds,
+            finalization_reserve_seconds=(request.config.runner.finalization_reserve_seconds),
+        )
+        executor = GeneratedCandidateExecutor(
+            artifact_store=artifacts,
+            workspace_materializer=workspaces,
+            control_root=candidate_control_root,
+            interpreter=active_python_interpreter(),
+            limits=candidate_limits,
+        )
+        runtime = _ScientificRuntime(
+            engine=selected_engine,
+            run_dir=run,
+            campaign_store=campaign_store,
+            artifacts=artifacts,
+            executor=executor,
+            lineage=lineage,
+            candidate=candidate,
+            experiment_id=experiment_id,
+            scientific_iteration=1,
+            config=scientific_config,
+            feature_artifacts=feature_artifacts,
+            features=features,
+            fold_a=fold_a,
+            fold_b=fold_b,
+            fold_a_query_inputs=data.fold_a.query_inputs,
+            fold_b_query_inputs=data.fold_b.query_inputs,
+            fold_a_scorer=build_fold_scoring_context(
+                starter_dir,
+                "A",
+                data.fold_a.fold.digest,
+                data.fold_a.query_inputs,
+                data.fold_a.query_labels,
+            ),
+            fold_b_scorer=build_fold_scoring_context(
+                starter_dir,
+                "B",
+                data.fold_b.fold.digest,
+                data.fold_b.query_inputs,
+                data.fold_b.query_labels,
+            ),
+            outer_scorer=outer_scorer,
+            qualification=qualification,
+            repository=FileScientificRunEvidenceRepository(production / "scientific-records"),
+            evidence_registry={},
+            cancel_event=cancel_event,
+            records={},
+        )
+        fallback_incumbent = _fallback_incumbent(
+            qualification,
+            fold_a,
+            fold_b,
+            fallback_receipt,
+        )
+        with _open_outer_ledger(
+            ledger_path,
+            maximum=request.config.validation.outer_promotion_limit,
+        ) as project_ledger:
+            adapter = DurableScientificLedgerAdapter(
+                campaign_store,
+                project_ledger,
+                scorer_digest=scorer_digest,
+                evidence_registry=runtime.evidence_registry,
+                representative_seed=0,
+            )
+            try:
+                result = run_scientific_campaign(
+                    config=scientific_config,
+                    fallback=fallback_incumbent,
+                    candidates=(candidate,),
+                    runner=runtime,
+                    outer_ledger=adapter,
+                )
+            except ScientificCampaignCancelled as exc:
+                raise FullCampaignCancelled(
+                    "campaign cancelled during scientific execution; durable child evidence "
+                    "is resumable and no scientific success was published"
+                ) from exc
+
+        # Candidate callbacks deliberately contain ordinary branch failures inside the
+        # scientific loop.  Cancellation is controller intent, however, and the shared Event
+        # remains the authoritative cross-process signal even if a callback boundary reports a
+        # contained failure.  Check it before publishing any scientific-success closure.
+        _check_cancel(cancel_event)
+        observed_launches = campaign_store.snapshot().launches_used
+        if observed_launches != result.launches_used:
+            raise FullCampaignError(
+                "scientific launch cursor differs from authoritative campaign accounting"
+            )
+        campaign_store.set_convergence_state(
+            result.convergence.manifest(),
+            expected_revision=campaign_store.snapshot().revision,
+            reason="persist provider-free scientific convergence cursor",
+        )
+        _check_cancel(cancel_event)
+        selection = _candidate_selection(
+            experiment_id=experiment_id,
+            result=result,
+            runtime=runtime,
+            qualification=qualification,
+            features=features,
+            feature_artifacts=feature_artifacts,
+            dataset_digest=dataset.digest,
+            validation_inputs=data.outer_validation_inputs,
+            final_inputs=data.final_inputs,
+            limits=candidate_limits,
+        )
+        _check_cancel(cancel_event)
+        reflection_request, reflection_response, reflection_transcript, reflection = _reflect(
+            campaign_store=campaign_store,
+            research_ledger=research_ledger,
+            lineage=lineage,
+            result=result,
+            safe_context=safe_context,
+            research_config=request.config.research,
+            artifacts=artifacts,
+            research_model=research_model,
+            candidate_id=candidate_id,
+            scientific_iteration=1,
+        )
+        _check_cancel(cancel_event)
+        iterations_completed = 1
+        if isinstance(lineage, LiveResearchLineage):
+            if research_model is None:
+                raise FullCampaignError("live lineage lost its research model")
+            followup = _run_autonomous_followups(
+                request=request,
+                data=data,
+                runtime_template=runtime,
+                scientific_config=scientific_config,
+                fallback=fallback_incumbent,
+                outer_ledger_path=ledger_path,
+                candidate_limits=candidate_limits,
+                dataset_digest=dataset.digest,
+                context_evidence=context_evidence,
+                validation_inputs=data.outer_validation_inputs,
+                final_inputs=data.final_inputs,
+                research_model=research_model,
+                first_lineage=lineage,
+                first_result=result,
+                first_selection=selection,
+                first_reflection=reflection,
+                first_reflection_evidence=(
+                    reflection_request,
+                    reflection_response,
+                    reflection_transcript,
+                ),
+            )
+            result = followup.result
+            selection = followup.selection
+            reflection_request = followup.reflection_request_digest
+            reflection_response = followup.reflection_response_digest
+            reflection_transcript = followup.reflection_transcript
+            iterations_completed = followup.iterations_completed
+        observed_launches = campaign_store.snapshot().launches_used
+        if observed_launches != result.launches_used:
+            raise FullCampaignError(
+                "final scientific launch cursor differs from authoritative campaign accounting"
+            )
+        result_artifact = artifacts.put_bytes(
+            _canonical_json(result.manifest() | {"digest": result.digest}),
+            kind=ArtifactKind.MANIFEST,
+        )
+        _check_cancel(cancel_event)
+        _stage(
+            progress,
+            request_digest=request.digest,
+            stage=FullCampaignStage.SCIENCE_COMPLETE,
+            evidence={
+                "scientific_result_digest": result.digest,
+                "scientific_result_artifact": result_artifact.manifest(),
+                "incumbent_candidate_id": result.incumbent.candidate_id,
+                "fallback_candidate_id": result.fallback.candidate_id,
+                "fallback_preserved": True,
+                "launches_used": result.launches_used,
+                "stop_reason": result.stop_reason.value,
+                "portfolio_count": iterations_completed,
+                "portfolio_cap": request.config.benchmark.max_iterations,
+                "iterations_completed": iterations_completed,
+                "autonomous_loop_completed": isinstance(lineage, LiveResearchLineage),
+                "provider_usage": _provider_usage(research_model),
+            },
+        )
+        _check_cancel(cancel_event)
+        _stage(
+            progress,
+            request_digest=request.digest,
+            stage=FullCampaignStage.REFLECTED,
+            evidence={
+                "reflection_request_digest": reflection_request,
+                "reflection_response_digest": reflection_response,
+                "reflection_transcript": reflection_transcript.manifest(),
+                "scientific_result_digest": result.digest,
+                "selected_candidate_id": (None if selection is None else selection.candidate_id),
+                "selection_digest": None if selection is None else selection.digest,
+                "portfolio_count": iterations_completed,
+                "portfolio_cap_reason": "exact_terminal_condition_reached",
+                "manual_source_edits": 0,
+                "manual_interventions": 0,
+                "provider_usage": _provider_usage(research_model),
+            },
+        )
+        _check_cancel(cancel_event)
+        return _commit_outcome(
+            run_dir=run,
+            request=request,
+            engine=selected_engine,
+            campaign_store=campaign_store,
+            artifacts=artifacts,
+            progress=progress,
+            qualification=qualification,
+            scorer_digest=scorer_digest,
+            fallback_receipt_digest=fallback_receipt,
+            scientific_result_digest=result.digest,
+            reflection_request_digest=reflection_request,
+            reflection_response_digest=reflection_response,
+            reflection_transcript=reflection_transcript,
+            selection=selection,
+        )
+
+
+__all__ = ["run_provider_free_campaign"]

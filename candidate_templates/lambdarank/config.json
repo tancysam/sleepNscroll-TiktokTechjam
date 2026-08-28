@@ -1,0 +1,1 @@
+{"candidate_family":"deterministic_lambdarank","learning_rate":0.05,"min_data_in_leaf":20,"num_boost_round":300,"num_leaves":31,"num_threads":4,"schema_version":1,"seed_policy":"controller_request_uint32","tree_count_policy":"frozen_train_derived"}
