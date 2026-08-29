@@ -18,6 +18,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final, Self, cast
 
+from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.research.source_policy import (
     DEFAULT_CANDIDATE_SOURCE_POLICY,
     CandidateSourcePolicy,
@@ -876,6 +877,15 @@ def _source_policy_from_wire(value: object, digest: object, location: str) -> Ca
     return _request_source_policy(policy, digest, location)
 
 
+def _runtime_contract_from_wire(value: object, digest: object, location: str) -> None:
+    supplied = _mapping(value, f"{location}.runtime_contract")
+    expected = CANDIDATE_RUNTIME_CONTRACT.to_wire()
+    if dict(supplied) != expected:
+        raise SchemaValidationError(f"{location} runtime contract is not the frozen default")
+    if digest != CANDIDATE_RUNTIME_CONTRACT.digest:
+        raise SchemaValidationError(f"{location} runtime contract digest mismatch")
+
+
 @dataclass(frozen=True, slots=True)
 class ProposalRequest:
     request_id: str
@@ -942,6 +952,8 @@ class ProposalRequest:
             "safe_context_digest": self.safe_context_digest,
             "source_policy": self.source_policy.to_wire(),
             "source_policy_digest": self.source_policy_digest,
+            "runtime_contract": CANDIDATE_RUNTIME_CONTRACT.to_wire(),
+            "runtime_contract_digest": CANDIDATE_RUNTIME_CONTRACT.digest,
         }
 
     @classmethod
@@ -958,11 +970,16 @@ class ProposalRequest:
                 "safe_context_digest",
                 "source_policy",
                 "source_policy_digest",
+                "runtime_contract",
+                "runtime_contract_digest",
             },
             "proposal_request",
         )
         policy = _source_policy_from_wire(
             raw["source_policy"], raw["source_policy_digest"], "proposal_request"
+        )
+        _runtime_contract_from_wire(
+            raw["runtime_contract"], raw["runtime_contract_digest"], "proposal_request"
         )
         return cls(
             schema_version=_schema_version(raw["schema_version"], "proposal_request"),
@@ -1062,6 +1079,8 @@ class ImplementationRequest:
             "safe_context_digest": self.safe_context_digest,
             "source_policy": self.source_policy.to_wire(),
             "source_policy_digest": self.source_policy_digest,
+            "runtime_contract": CANDIDATE_RUNTIME_CONTRACT.to_wire(),
+            "runtime_contract_digest": CANDIDATE_RUNTIME_CONTRACT.digest,
             "limits": {
                 "max_changed_files": self.max_changed_files,
                 "max_total_utf8_bytes": self.max_total_utf8_bytes,
@@ -1082,12 +1101,19 @@ class ImplementationRequest:
                 "safe_context_digest",
                 "source_policy",
                 "source_policy_digest",
+                "runtime_contract",
+                "runtime_contract_digest",
                 "limits",
             },
             "implementation_request",
         )
         policy = _source_policy_from_wire(
             raw["source_policy"], raw["source_policy_digest"], "implementation_request"
+        )
+        _runtime_contract_from_wire(
+            raw["runtime_contract"],
+            raw["runtime_contract_digest"],
+            "implementation_request",
         )
         limits = _mapping(raw["limits"], "implementation_request.limits")
         _exact_fields(
@@ -1341,6 +1367,8 @@ class RepairRequest:
             ),
             "source_policy": self.source_policy.to_wire(),
             "source_policy_digest": self.source_policy_digest,
+            "runtime_contract": CANDIDATE_RUNTIME_CONTRACT.to_wire(),
+            "runtime_contract_digest": CANDIDATE_RUNTIME_CONTRACT.digest,
         }
 
     @classmethod
@@ -1361,6 +1389,8 @@ class RepairRequest:
                 "rejected_package",
                 "source_policy",
                 "source_policy_digest",
+                "runtime_contract",
+                "runtime_contract_digest",
             },
             "repair_request",
         )
@@ -1369,6 +1399,9 @@ class RepairRequest:
             raise SchemaValidationError("repair_request.rejected_package must be an object or null")
         policy = _source_policy_from_wire(
             raw["source_policy"], raw["source_policy_digest"], "repair_request"
+        )
+        _runtime_contract_from_wire(
+            raw["runtime_contract"], raw["runtime_contract_digest"], "repair_request"
         )
         return cls(
             schema_version=_schema_version(raw["schema_version"], "repair_request"),

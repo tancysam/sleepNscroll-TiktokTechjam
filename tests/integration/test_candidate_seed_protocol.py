@@ -94,7 +94,8 @@ def test_seed_is_a_material_generated_source_candidate(tmp_path: Path) -> None:
         files=(
             ParentSourceFile.create(
                 "candidate.py",
-                "def train_model(features, targets, config):\n    return None\n\n"
+                "def train_model(features, targets, user_groups, config, seed):\n"
+                "    return None\n\n"
                 "def predict_scores(features, checkpoint):\n    return []\n",
             ),
             ParentSourceFile.create("config.json", config),
@@ -141,8 +142,10 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
     inputs.mkdir()
     train_features = np.array([[-2.0, 0.0], [2.0, 0.0], [-1.0, 1.0], [1.0, 1.0]], dtype="<f8")
     train_targets = np.array([0.0, 1.0, 0.0, 1.0], dtype="<f8")
+    train_user_groups = np.array([10, 10, 20, 20], dtype="<i8")
     _write_npy(inputs / "train-features.npy", train_features)
     _write_npy(inputs / "train-targets.npy", train_targets)
+    _write_npy(inputs / "train-user-groups.npy", train_user_groups)
     config_digest = _sha256(SEED / "config.json")
     train_request = tmp_path / "train-request.json"
     _write_request(
@@ -150,6 +153,7 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
         approved=(
             ("features", "inputs/train-features.npy"),
             ("targets", "inputs/train-targets.npy"),
+            ("user_groups", "inputs/train-user-groups.npy"),
         ),
         split_role="train",
         request={
@@ -158,13 +162,16 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
             "config_digest": config_digest,
             "data_digest": TRAIN_DATA,
             "split_token": "train-seed-fold",
+            "seed": 7,
             "features_handle": "features",
             "targets_handle": "targets",
+            "user_groups_handle": "user_groups",
         },
     )
 
     first_train = tmp_path / "train-a"
     second_train = tmp_path / "train-b"
+    first_train.mkdir()
     _run("train", "--request", str(train_request), "--output", str(first_train), cwd=tmp_path)
     _run("train", "--request", str(train_request), "--output", str(second_train), cwd=tmp_path)
 
@@ -173,7 +180,7 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
         config_digest=config_digest,
         data_digest=TRAIN_DATA,
         split_token="train-seed-fold",
-        checkpoint_path="checkpoint/model.npz",
+        checkpoint_path="checkpoint/model.txt",
     )
     first = validate_train_outputs(first_train, expected_train)
     second = validate_train_outputs(second_train, expected_train)
@@ -201,6 +208,7 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
     )
     first_prediction = tmp_path / "prediction-a"
     second_prediction = tmp_path / "prediction-b"
+    first_prediction.mkdir()
     for output in (first_prediction, second_prediction):
         _run(
             "predict",

@@ -50,14 +50,19 @@ def _metrics(gauc: float, ndcg: float) -> dict[str, float]:
     return {"GAUC": gauc, "nDCG@5": ndcg, "primary": (gauc + ndcg) / 2.0}
 
 
-def _fallback_resource_evidence(bundle_digest: str) -> MappingProxyType[str, object]:
+def _fallback_resource_evidence(
+    bundle_digest: str,
+    *,
+    hard_wall_seconds: int = 21_600,
+    finalization_reserve_seconds: int = 3_600,
+) -> MappingProxyType[str, object]:
     return MappingProxyType(
         {
             "schema_version": 1,
             "clock_basis": "durable_max_of_monotonic_and_utc_elapsed",
             "campaign_elapsed_seconds": 20.0,
-            "hard_wall_seconds": 21_600,
-            "finalization_reserve_seconds": 3_600,
+            "hard_wall_seconds": hard_wall_seconds,
+            "finalization_reserve_seconds": finalization_reserve_seconds,
             "finalization_started_elapsed_seconds": 10.0,
             "finalization_elapsed_seconds": 10.0,
             "coverage": list(production._FINALIZATION_COVERAGE),
@@ -619,6 +624,59 @@ def test_production_outcome_round_trip_is_signed_and_tamper_evident(tmp_path: Pa
     tampered = json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode("ascii")
     with pytest.raises(ProductionFinalizationError, match="digest mismatch"):
         ProductionFinalizationOutcome.from_bytes(tampered)
+
+
+def test_production_outcome_accepts_one_hour_sprint_resource_limits(tmp_path: Path) -> None:
+    outcome = ProductionFinalizationOutcome(
+        run_dir=(tmp_path / "run").absolute(),
+        campaign_id="campaign",
+        research_outcome_digest=_digest("a"),
+        selected_candidate_id="official-fm-fallback-seed-4",
+        selected_status=FinalStatus.BASELINE_REPRODUCED,
+        fallback_count=0,
+        failures=(),
+        training_replay=MappingProxyType({"required": False, "completed": True}),
+        resource_evidence=_fallback_resource_evidence(
+            _digest("b"),
+            hard_wall_seconds=3_600,
+            finalization_reserve_seconds=600,
+        ),
+        bundle_root=(tmp_path / "run" / "final").absolute(),
+        bundle_manifest_sha256=_digest("b"),
+        submission_sha256=_digest("c"),
+        replay_evidence_sha256=_digest("d"),
+        organizer_verification_sha256=_digest("e"),
+        campaign_revision=42,
+    )
+
+    assert outcome.resource_evidence["hard_wall_seconds"] == 3_600
+    assert outcome.resource_evidence["finalization_reserve_seconds"] == 600
+    assert ProductionFinalizationOutcome.from_bytes(outcome.canonical_bytes) == outcome
+
+
+def test_production_outcome_rejects_invalid_dynamic_resource_limits(tmp_path: Path) -> None:
+    with pytest.raises(ProductionFinalizationError, match="finalization reserve is invalid"):
+        ProductionFinalizationOutcome(
+            run_dir=(tmp_path / "run").absolute(),
+            campaign_id="campaign",
+            research_outcome_digest=_digest("a"),
+            selected_candidate_id="official-fm-fallback-seed-4",
+            selected_status=FinalStatus.BASELINE_REPRODUCED,
+            fallback_count=0,
+            failures=(),
+            training_replay=MappingProxyType({"required": False, "completed": True}),
+            resource_evidence=_fallback_resource_evidence(
+                _digest("b"),
+                hard_wall_seconds=3_600,
+                finalization_reserve_seconds=3_600,
+            ),
+            bundle_root=(tmp_path / "run" / "final").absolute(),
+            bundle_manifest_sha256=_digest("b"),
+            submission_sha256=_digest("c"),
+            replay_evidence_sha256=_digest("d"),
+            organizer_verification_sha256=_digest("e"),
+            campaign_revision=42,
+        )
 
 
 def test_final_training_resources_bind_tree_file_not_model_directory_identity(
@@ -1891,6 +1949,11 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
     usage.update(
         {
             "base_url": "https://fallback.example/v1",
+            "context_limits": {
+                "context_length": 1_050_000,
+                "max_completion_tokens": 128_000,
+                "source": "openrouter-model-metadata",
+            },
             "active_slot": "fallback",
             "failover_count": 1,
             "failover_events": [
@@ -1913,6 +1976,7 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
                     "model": "gpt-5.6-sol",
                     "base_url": "https://main.example/v1",
                     "credential_env": "INFERENCE_MAIN_API_KEY",
+                    "context_limits": None,
                     "input_tokens": 1000,
                     "cached_input_tokens": 100,
                     "output_tokens": 300,
@@ -1927,6 +1991,11 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
                     "model": "fallback-model",
                     "base_url": "https://fallback.example/v1",
                     "credential_env": "INFERENCE_FALLBACK_API_KEY",
+                    "context_limits": {
+                        "context_length": 1_050_000,
+                        "max_completion_tokens": 128_000,
+                        "source": "openrouter-model-metadata",
+                    },
                     "input_tokens": 200,
                     "cached_input_tokens": 100,
                     "output_tokens": 200,
@@ -1953,6 +2022,17 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
     retry_facts = production._judge_progress_facts(outcome)
 
     assert "retry wait seconds=3.5" in retry_facts.provider_usage
+
+    usage["context_limits"] = {
+        "context_length": 128_000,
+        "max_completion_tokens": 1_050_000,
+        "source": "invalid",
+    }
+    with pytest.raises(
+        production.ProductionFinalizationError,
+        match="live provider usage evidence is malformed",
+    ):
+        production._judge_progress_facts(outcome)
 
 
 def test_fallback_report_includes_research_admission_and_rejection_evidence(

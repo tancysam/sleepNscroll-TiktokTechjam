@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import re
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -18,14 +20,19 @@ from model_impl import predict_scores, train_model, training_diagnostics, valida
 SCHEMA_VERSION = 1
 SCORES_DTYPE = "<f8"
 MAX_JSON_BYTES = 256 * 1024
+MAX_CHECKPOINT_ARRAYS = 64
+MAX_CHECKPOINT_BYTES = 512 * 1024 * 1024
+CHECKPOINT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 TRAIN_KEYS = {
     "config_digest",
     "data_digest",
     "features_handle",
     "protocol_schema_version",
+    "seed",
     "source_digest",
     "split_token",
     "targets_handle",
+    "user_groups_handle",
 }
 PREDICT_KEYS = {
     "checkpoint_digest",
@@ -87,6 +94,12 @@ def _require_token(value: object) -> str:
     return value
 
 
+def _require_uint32(value: object, name: str) -> int:
+    if type(value) is not int or not 0 <= value <= 2**32 - 1:
+        raise CandidateInputError(f"{name} must be a uint32-compatible integer")
+    return value
+
+
 def _relative_path(value: object) -> PurePosixPath:
     if type(value) is not str or not value or "\\" in value or "\x00" in value:
         raise CandidateInputError("capability path must be a relative POSIX path")
@@ -129,6 +142,30 @@ def _load_numeric_array(path: Path, name: str) -> np.ndarray:
     return np.ascontiguousarray(value, dtype=np.dtype(SCORES_DTYPE))
 
 
+def _load_user_groups(path: Path, expected: int) -> np.ndarray:
+    try:
+        value = np.load(path, allow_pickle=False)
+    except (OSError, ValueError, TypeError) as exc:
+        raise CandidateInputError("training user groups must be one safe NumPy array") from exc
+    if not isinstance(value, np.ndarray):
+        if hasattr(value, "close"):
+            value.close()
+        raise CandidateInputError("training user groups must contain one NumPy array")
+    if value.shape != (expected,):
+        raise CandidateInputError(f"training user groups must have shape ({expected},)")
+    if value.dtype.kind not in "iuf":
+        raise CandidateInputError("training user groups must use a non-boolean numeric dtype")
+    try:
+        finite = bool(np.isfinite(value).all())
+    except TypeError as exc:
+        raise CandidateInputError(
+            "training user groups must contain finite numeric values"
+        ) from exc
+    if not finite:
+        raise CandidateInputError("training user groups must contain finite numeric values")
+    return np.ascontiguousarray(value)
+
+
 def _load_config(expected_digest: str) -> dict[str, object]:
     path = Path(__file__).with_name("config.json")
     if _sha256(path) != expected_digest:
@@ -150,6 +187,71 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
         handle.write(payload)
 
 
+def _prepare_output(path: Path) -> None:
+    if path.exists():
+        if path.is_symlink() or not path.is_dir():
+            raise CandidateInputError("output must be a real directory")
+        if tuple(path.iterdir()):
+            raise CandidateInputError("output directory must be empty")
+        return
+    path.mkdir(parents=True, exist_ok=False)
+
+
+def _validate_checkpoint(value: object) -> dict[str, np.ndarray]:
+    if type(value) is not dict or not 1 <= len(value) <= MAX_CHECKPOINT_ARRAYS:
+        raise CandidateInputError(
+            f"model checkpoint must be a dict containing 1..{MAX_CHECKPOINT_ARRAYS} arrays"
+        )
+    result: dict[str, np.ndarray] = {}
+    total_bytes = 0
+    for name, raw_array in value.items():
+        if type(name) is not str or CHECKPOINT_NAME.fullmatch(name) is None:
+            raise CandidateInputError("checkpoint names must be bare ASCII Python identifiers")
+        if not isinstance(raw_array, np.ndarray):
+            raise CandidateInputError(f"checkpoint entry {name!r} must be a NumPy array")
+        array = np.array(raw_array, copy=True, order="C", subok=False)
+        if array.dtype.kind not in "biuf":
+            raise CandidateInputError(f"checkpoint entry {name!r} must use a safe numeric dtype")
+        try:
+            finite = bool(np.isfinite(array).all())
+        except TypeError as exc:
+            raise CandidateInputError(
+                f"checkpoint entry {name!r} must contain finite numeric values"
+            ) from exc
+        if not finite:
+            raise CandidateInputError(
+                f"checkpoint entry {name!r} must contain finite numeric values"
+            )
+        total_bytes += int(array.nbytes)
+        if total_bytes > MAX_CHECKPOINT_BYTES:
+            raise CandidateInputError(
+                f"model checkpoint exceeds the {MAX_CHECKPOINT_BYTES}-byte limit"
+            )
+        result[name] = array
+    return result
+
+
+def _validate_diagnostics(value: object) -> dict[str, int | float]:
+    if type(value) is not dict or len(value) > 64:
+        raise CandidateInputError("training diagnostics must be a dict with at most 64 entries")
+    result: dict[str, int | float] = {}
+    for name, raw in value.items():
+        if type(name) is not str or CHECKPOINT_NAME.fullmatch(name) is None:
+            raise CandidateInputError("training diagnostic names must be ASCII identifiers")
+        if type(raw) not in {int, float} or not math.isfinite(float(raw)):
+            raise CandidateInputError("training diagnostic values must be finite numbers")
+        result[name] = raw
+    return result
+
+
+def _validate_scores(value: object, expected_count: int) -> np.ndarray:
+    if not isinstance(value, np.ndarray) or value.shape != (expected_count,):
+        raise CandidateInputError(f"model scores must have shape ({expected_count},)")
+    if value.dtype.kind not in "biuf" or not bool(np.isfinite(value).all()):
+        raise CandidateInputError("model scores must contain finite numeric values")
+    return np.ascontiguousarray(value, dtype=np.dtype(SCORES_DTYPE))
+
+
 def _train(request_path: Path, output: Path) -> None:
     request, capabilities = _workspace_request(request_path)
     _require_exact_keys(request, TRAIN_KEYS, "training request")
@@ -159,33 +261,39 @@ def _train(request_path: Path, output: Path) -> None:
     config_digest = _require_digest(request["config_digest"], "config_digest")
     data_digest = _require_digest(request["data_digest"], "data_digest")
     split_token = _require_token(request["split_token"])
+    seed = _require_uint32(request["seed"], "seed")
     features_handle = request["features_handle"]
     targets_handle = request["targets_handle"]
-    if type(features_handle) is not str or type(targets_handle) is not str:
+    user_groups_handle = request["user_groups_handle"]
+    if (
+        type(features_handle) is not str
+        or type(targets_handle) is not str
+        or type(user_groups_handle) is not str
+    ):
         raise CandidateInputError("training capability handles must be strings")
+    if len({features_handle, targets_handle, user_groups_handle}) != 3:
+        raise CandidateInputError("training capability handles must be distinct")
     try:
         feature_path = capabilities[features_handle]
         target_path = capabilities[targets_handle]
+        user_group_path = capabilities[user_groups_handle]
     except KeyError as exc:
         raise CandidateInputError("training capability handle is not approved") from exc
     features = _load_numeric_array(feature_path, "training features")
     targets = _load_numeric_array(target_path, "training targets")
+    user_groups = _load_user_groups(user_group_path, features.shape[0])
     config = _load_config(config_digest)
-    checkpoint = train_model(features, targets, config)
+    checkpoint = _validate_checkpoint(
+        train_model(features, targets, user_groups, config, seed)
+    )
+    diagnostics = _validate_diagnostics(training_diagnostics(config, checkpoint))
 
-    output.mkdir(parents=True, exist_ok=False)
+    _prepare_output(output)
     checkpoint_dir = output / "checkpoint"
     checkpoint_dir.mkdir()
-    checkpoint_path = checkpoint_dir / "model.npz"
+    checkpoint_path = checkpoint_dir / "model.txt"
     with checkpoint_path.open("xb") as handle:
-        np.savez(
-            handle,
-            bias=checkpoint["bias"],
-            feature_mean=checkpoint["feature_mean"],
-            feature_scale=checkpoint["feature_scale"],
-            final_objective=checkpoint["final_objective"],
-            weights=checkpoint["weights"],
-        )
+        np.savez(handle, **checkpoint)
     checkpoint_digest = _sha256(checkpoint_path)
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -197,13 +305,13 @@ def _train(request_path: Path, output: Path) -> None:
         "checkpoint_digest": checkpoint_digest,
         "artifacts": [
             {
-                "path": "checkpoint/model.npz",
+                "path": "checkpoint/model.txt",
                 "sha256": checkpoint_digest,
                 "size_bytes": checkpoint_path.stat().st_size,
             }
         ],
         "diagnostics": {
-            **training_diagnostics(config, checkpoint),
+            **diagnostics,
             "feature_count": int(features.shape[1]),
             "row_count": int(features.shape[0]),
         },
@@ -215,7 +323,8 @@ def _load_checkpoint(path: Path, expected_digest: str) -> dict[str, np.ndarray]:
     if _sha256(path) != expected_digest:
         raise CandidateInputError("checkpoint_digest does not identify checkpoint bytes")
     with np.load(path, allow_pickle=False) as archive:
-        return {name: np.array(archive[name], copy=True) for name in archive.files}
+        checkpoint = {name: np.array(archive[name], copy=True) for name in archive.files}
+    return _validate_checkpoint(checkpoint)
 
 
 def _predict(request_path: Path, checkpoint_path: Path, output: Path) -> None:
@@ -239,9 +348,9 @@ def _predict(request_path: Path, checkpoint_path: Path, output: Path) -> None:
     if features.ndim != 2 or features.shape[0] != expected_count:
         raise CandidateInputError("prediction features do not match expected_count")
     checkpoint = _load_checkpoint(checkpoint_path, checkpoint_digest)
-    scores = predict_scores(features, checkpoint)
+    scores = _validate_scores(predict_scores(features, checkpoint), expected_count)
 
-    output.mkdir(parents=True, exist_ok=False)
+    _prepare_output(output)
     scores_path = output / "scores.npy"
     with scores_path.open("xb") as handle:
         np.save(handle, scores, allow_pickle=False)

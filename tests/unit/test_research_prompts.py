@@ -16,7 +16,7 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
 ) -> None:
     instructions = instructions_for(operation)
 
-    assert PROMPT_VERSION == 5
+    assert PROMPT_VERSION == 6
     assert DEFAULT_CANDIDATE_SOURCE_POLICY.digest in instructions
     assert "candidate.py" in instructions
     assert "baseline.py" in instructions
@@ -25,6 +25,10 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
     assert "complete-file overlay" in instructions
     assert "pairwise_fm.py" in instructions
     assert "provider JSON acceptance is not candidate admission" in instructions
+    assert "Candidate runtime contract digest" in instructions
+    assert "finite float64 (N,D)" in instructions
+    assert "feature_names_csv" in instructions
+    assert "never assume features[:,0:5]" in instructions
 
 
 @pytest.mark.parametrize("operation", (ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR))
@@ -47,9 +51,24 @@ def test_source_generation_prompts_define_overlay_and_material_symbol_semantics(
     assert "double-quoted property names" in instructions
     assert "complete JSON object as the file content string" in instructions
     assert "executable definition responsible" in instructions
-    assert "Return only files whose content differs" in instructions
-    assert "Do not regenerate stable protocol" in instructions
+    if operation is ResearchOperation.IMPLEMENT:
+        assert "Return only files whose content differs" in instructions
+    else:
+        assert "complete generated overlay relative to the trusted" in instructions
+        assert "unmentioned rejected-overlay files are not implicitly retained" in instructions
+    assert "Never return or replace" in instructions
+    assert "protected_paths" in instructions
     assert "model_impl.py" in instructions
+
+
+def test_model_generation_prompt_defines_one_general_model_interface() -> None:
+    instructions = instructions_for(ResearchOperation.IMPLEMENT)
+
+    assert "train_model(features, targets, user_groups, config, seed)" in instructions
+    assert "predict_scores(features, checkpoint)" in instructions
+    assert "1..64 named finite numeric NumPy arrays" in instructions
+    assert "checkpoint keys may be model-specific" in instructions
+    assert "The protected wrapper owns them" in instructions
 
 
 def test_proposal_prompt_requires_a_legal_final_manifest() -> None:

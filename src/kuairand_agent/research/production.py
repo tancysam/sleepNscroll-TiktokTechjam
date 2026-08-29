@@ -38,6 +38,7 @@ from kuairand_agent.research.materialize import (
     require_material_executable_change,
     snapshot_materialized_candidate,
     validate_candidate_static,
+    validate_model_generated_overlay,
 )
 from kuairand_agent.research.schemas import (
     FailureCategory,
@@ -1190,6 +1191,12 @@ def prepare_or_rehydrate_live_lineage(
     candidate: MaterializedCandidate
     if rehydrating:
         destination = generated_root / candidate_id
+        try:
+            validate_model_generated_overlay(package)
+        except CandidateMaterializationError as exc:
+            raise ProductionResearchError(
+                "persisted live package violates the runtime contract"
+            ) from exc
         candidate = _describe_expected_candidate(parent, package, destination)
         _verify_exact_generated_tree(candidate)
         validate_candidate_static(candidate)
@@ -1202,6 +1209,7 @@ def prepare_or_rehydrate_live_lineage(
             destination = generated_root / candidate_id
             attempted_candidate: MaterializedCandidate | None = None
             try:
+                validate_model_generated_overlay(package)
                 attempted_candidate = materialize_candidate(parent, package, destination)
                 candidate = attempted_candidate
                 validate_candidate_static(candidate)

@@ -66,7 +66,9 @@ def _sigmoid(logits: np.ndarray, clip: float) -> np.ndarray:
 def train_model(
     features: np.ndarray,
     targets: np.ndarray,
+    user_groups: np.ndarray,
     config: dict[str, object],
+    seed: int,
 ) -> dict[str, np.ndarray]:
     """Fit a fixed-step standardized logistic model with deterministic full-batch updates."""
 
@@ -74,6 +76,10 @@ def train_model(
         raise CandidateModelError("training features must have non-empty shape (N, D)")
     if targets.shape != (features.shape[0],):
         raise CandidateModelError("training targets must have shape (N,)")
+    if user_groups.shape != (features.shape[0],):
+        raise CandidateModelError("training user groups must have shape (N,)")
+    if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
+        raise CandidateModelError("seed must be a uint32-compatible integer")
     if not bool(np.logical_or(targets == 0.0, targets == 1.0).all()):
         raise CandidateModelError("training targets must be binary")
     mean = features.mean(axis=0, dtype=np.float64)

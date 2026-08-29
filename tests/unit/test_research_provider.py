@@ -248,11 +248,25 @@ def test_gateway_payload_uses_gateway_reasoning_contract(
     assert "reasoning_effort" not in payload
     assert payload["reasoning"] == {"effort": "low", "exclude": True}
     if base_url.startswith("https://openrouter.ai/"):
+        assert payload["max_tokens"] == 4096
+        assert "max_completion_tokens" not in payload
+        assert "n" not in payload
+        assert "store" not in payload
+        assert "stream" not in payload
+        assert "parallel_tool_calls" not in payload
+        assert payload["tools"] == []
+        assert payload["tool_choice"] == "none"
         assert payload["provider"] == {
             "allow_fallbacks": True,
             "require_parameters": True,
         }
     else:
+        assert payload["max_completion_tokens"] == 4096
+        assert "max_tokens" not in payload
+        assert payload["n"] == 1
+        assert payload["store"] is False
+        assert payload["stream"] is False
+        assert payload["parallel_tool_calls"] is False
         assert "provider" not in payload
 
 

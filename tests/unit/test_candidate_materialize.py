@@ -12,6 +12,7 @@ from kuairand_agent.research.materialize import (
     materialize_candidate,
     require_material_executable_change,
     validate_candidate_static,
+    validate_model_generated_overlay,
 )
 from kuairand_agent.research.schemas import (
     GeneratedFile,
@@ -103,6 +104,15 @@ def test_materialization_is_disposable_reproducible_and_parent_preserving(
     assert validate_candidate_static(first).python_files == ("candidate.py",)
     material = require_material_executable_change(parent, first)
     assert material.changed_symbols == ("candidate.py:score",)
+
+
+def test_live_model_overlay_cannot_replace_stable_candidate_wrapper() -> None:
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(package("candidate.py", CHANGED_SOURCE))
+
+    validate_model_generated_overlay(
+        package("model_impl.py", "def score(value):\n    return value + 1\n")
+    )
 
 
 def test_json_equivalent_python_literal_from_provider_is_canonicalized(

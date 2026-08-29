@@ -808,6 +808,14 @@ class OpenAIChatCompletionsModel:
             else:
                 payload["reasoning_effort"] = self.config.reasoning_effort
         if hostname == "openrouter.ai":
+            if "max_completion_tokens" in payload:
+                payload["max_tokens"] = payload.pop("max_completion_tokens")
+            # OpenRouter's ``require_parameters`` filter compares every supplied optional
+            # parameter with endpoint capability metadata.  These four fields are merely their
+            # Chat Completions defaults and are not advertised by otherwise compatible strict-
+            # schema endpoints, so sending them can incorrectly eliminate every route.
+            for defaulted_parameter in ("n", "store", "stream", "parallel_tool_calls"):
+                payload.pop(defaulted_parameter, None)
             payload["provider"] = {
                 "allow_fallbacks": True,
                 "require_parameters": True,
