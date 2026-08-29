@@ -71,6 +71,39 @@ _CAPABILITY_PHASES: Final = {
 }
 
 
+def _provider_field_policy_manifest() -> dict[str, object]:
+    """Compact the frozen policy for inference without changing its authority or digest."""
+
+    full = field_policy_manifest()
+    raw_fields = full["fields"]
+    if not isinstance(raw_fields, list):
+        raise SafeContextError("trusted field policy fields must be a list")
+    enabled: list[dict[str, object]] = []
+    disabled_by_member: dict[str, list[str]] = {}
+    for index, raw_field in enumerate(raw_fields):
+        if not isinstance(raw_field, dict):
+            raise SafeContextError(f"trusted field policy field {index} must be an object")
+        if raw_field.get("enabled") is True:
+            enabled.append(dict(raw_field))
+            continue
+        member = raw_field.get("member")
+        column = raw_field.get("column")
+        if type(member) is not str or type(column) is not str:
+            raise SafeContextError(f"trusted field policy field {index} has invalid identity")
+        disabled_by_member.setdefault(member, []).append(column)
+    return {
+        "schema_version": full["schema_version"],
+        "policy_semantics": (
+            "fields contains every enabled source-qualified field with complete enforcement "
+            "metadata; disabled_columns_by_member is exhaustive; every unspecified field is "
+            "forbidden"
+        ),
+        "fields": enabled,
+        "disabled_columns_by_member": disabled_by_member,
+        "role_counts": full["role_counts"],
+    }
+
+
 class SafeContextError(ValueError):
     """A proposed research-context value could expose protected or row-level data."""
 
@@ -343,7 +376,7 @@ def build_safe_research_context(
         "benchmark_digest": benchmark_digest(),
         "starter_manifest_sha256": _digest(starter_manifest_sha256, "starter_manifest_sha256"),
         "dataset_manifest_sha256": _digest(dataset_manifest_sha256, "dataset_manifest_sha256"),
-        "field_policy": field_policy_manifest(),
+        "field_policy": _provider_field_policy_manifest(),
         "field_policy_digest": field_policy_digest(),
         "capabilities": [_capability_manifest(value) for value in capability_manifests],
         "train_eda": [value.to_wire() for value in train_eda],

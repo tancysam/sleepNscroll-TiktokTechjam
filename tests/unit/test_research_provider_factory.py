@@ -165,18 +165,18 @@ def test_schema_v4_resolves_two_dedicated_environment_profiles() -> None:
     research = load_config(Path(__file__).parents[2] / "configs" / "full-pure.toml").research
     values = {
         "INFERENCE_MAIN_BASE_URL": "https://main.example/v1",
-        "INFERENCE_MAIN_MODEL": "main-model",
+        "INFERENCE_MAIN_MODEL": "z-ai/glm-5.3-free",
         "INFERENCE_FALLBACK_BASE_URL": "https://fallback.example/v1",
-        "INFERENCE_FALLBACK_MODEL": "fallback-model",
+        "INFERENCE_FALLBACK_MODEL": "deepseek/deepseek-v4-pro-0813",
     }
 
     configs = openai_chat_completions_configs(research, setting_lookup=values.get)
 
     assert configs is not None
     assert [(item.model, item.base_url, item.api_key_env) for item in configs] == [
-        ("main-model", "https://main.example/v1", "INFERENCE_MAIN_API_KEY"),
+        ("z-ai/glm-5.3-free", "https://main.example/v1", "INFERENCE_MAIN_API_KEY"),
         (
-            "fallback-model",
+            "deepseek/deepseek-v4-pro-0813",
             "https://fallback.example/v1",
             "INFERENCE_FALLBACK_API_KEY",
         ),

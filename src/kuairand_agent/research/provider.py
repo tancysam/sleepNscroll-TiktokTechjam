@@ -45,7 +45,9 @@ from kuairand_agent.research.source_policy import (
     CandidateManifestPolicyError,
 )
 
-_MODEL_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_MODEL_RE: Final = re.compile(
+    r"(?=.{1,128}\Z)[A-Za-z0-9][A-Za-z0-9._:-]*(?:/[A-Za-z0-9][A-Za-z0-9._:-]*)?\Z"
+)
 _ENV_RE: Final = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
 _PRICE_RE: Final = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?\Z")
 _REASONING_EFFORTS: Final = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
