@@ -118,7 +118,7 @@ def _text(
     if len(value) > maximum:
         raise SchemaValidationError(f"{location} exceeds the {maximum}-character limit")
     if identifier and _IDENTIFIER_RE.fullmatch(value) is None:
-        raise SchemaValidationError(f"{location} is not a portable identifier")
+        raise SchemaValidationError(f"{location} is not a portable identifier: {value!r}")
     return value
 
 

@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -403,7 +404,9 @@ class UrllibResponsesTransport:
             headers=dict(request.headers),
             method="POST",
         )
+        previous_timeout = socket.getdefaulttimeout()
         try:
+            socket.setdefaulttimeout(request.timeout_seconds)
             with urllib.request.urlopen(raw_request, timeout=request.timeout_seconds) as response:
                 return TransportResponse(
                     status_code=int(response.status),
@@ -420,6 +423,8 @@ class UrllibResponsesTransport:
             raise
         except (TimeoutError, OSError, urllib.error.URLError) as exc:
             raise ResponsesTransportError(type(exc).__name__) from exc
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,7 +624,7 @@ class OpenAIChatCompletionsModel:
             "parallel_tool_calls": False,
         }
         payload[self.config.max_tokens_parameter] = self.config.max_output_tokens
-        if self.config.send_reasoning_effort:
+        if self.config.send_reasoning_effort and self.config.reasoning_effort != "none":
             payload["reasoning_effort"] = self.config.reasoning_effort
         return payload
 

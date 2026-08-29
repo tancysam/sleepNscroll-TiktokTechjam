@@ -34,9 +34,13 @@ from kuairand_agent.research.materialize import (
     CandidateStaticError,
     MaterialChangeEvidence,
     MaterializedCandidate,
+    _normalized_tree,
+    _reachable_python_files,
+    _top_level_symbols,
     materialize_candidate,
     require_material_executable_change,
     snapshot_materialized_candidate,
+    sanitize_generated_package,
     validate_candidate_static,
 )
 from kuairand_agent.research.schemas import (
@@ -52,6 +56,7 @@ from kuairand_agent.research.schemas import (
     RepairRequest,
     RequiredField,
     ResearchOperation,
+    SchemaValidationError,
     canonical_digest,
     canonical_json_bytes,
     parse_json_object,
@@ -1301,6 +1306,7 @@ def prepare_or_rehydrate_live_lineage(
             }
         )
         _write_live_record(record_path, pending_record_payload)
+
     source_snapshot = artifact_store.put_directory(destination, kind=ArtifactKind.SOURCE)
     by_path = {entry.path: entry.artifact for entry in source_snapshot.entries}
     config_artifact = by_path.get("config.json")

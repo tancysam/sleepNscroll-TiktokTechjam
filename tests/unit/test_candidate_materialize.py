@@ -10,6 +10,7 @@ from kuairand_agent.research.materialize import (
     CandidateStaticError,
     materialize_candidate,
     require_material_executable_change,
+    sanitize_generated_package,
     validate_candidate_static,
 )
 from kuairand_agent.research.schemas import (
@@ -17,6 +18,7 @@ from kuairand_agent.research.schemas import (
     GeneratedPackage,
     ParentSnapshot,
     ParentSourceFile,
+    SchemaValidationError,
 )
 from kuairand_agent.research.source_policy import (
     DEFAULT_CANDIDATE_SOURCE_POLICY,
@@ -205,3 +207,96 @@ def test_network_process_and_trusted_controller_imports_are_rejected(
 
     with pytest.raises(CandidateStaticError, match="forbidden import"):
         validate_candidate_static(child)
+
+
+# ---- Guardrail tests ----
+
+
+def test_sanitize_drops_forbidden_basename_files() -> None:
+    """Guardrail 1: Files with forbidden basenames (baseline.py, data.py) are silently dropped."""
+    parent = parent_snapshot()
+    pkg = GeneratedPackage(
+        request_id="implement-with-baseline",
+        response_id="scripted-implement-baseline",
+        files=(
+            GeneratedFile("candidate.py", CHANGED_SOURCE),
+            GeneratedFile("baseline.py", "# forbidden\n"),
+        ),
+        material_change_summary="Add baseline.py alongside candidate.py changes.",
+        material_symbols=("score", "baseline"),
+    )
+    sanitized = sanitize_generated_package(parent, pkg)
+    paths = [f.path for f in sanitized.files]
+    assert "baseline.py" not in paths
+    assert "candidate.py" in paths
+
+
+def test_sanitize_restores_frozen_protocol_constants() -> None:
+    """Guardrail 2: If model modifies a frozen symbol (e.g. TRAIN_KEYS), parent's version is restored."""
+    parent_source = """\
+TRAIN_KEYS = {"a", "b"}
+def score(value: float) -> float:
+    return value
+"""
+    changed_source = """\
+TRAIN_KEYS = {"a", "b", "c"}
+def score(value: float) -> float:
+    tab_bias = 0.125
+    return value + tab_bias
+"""
+    parent = ParentSnapshot(
+        candidate_id="fm-seed",
+        files=(
+            ParentSourceFile.create("candidate.py", parent_source),
+            ParentSourceFile.create("config.json", '{"seed":0}\n'),
+        ),
+    )
+    pkg = GeneratedPackage(
+        request_id="implement-train-keys-bug",
+        response_id="scripted-implement-bug",
+        files=(GeneratedFile("candidate.py", changed_source),),
+        material_change_summary="Modified TRAIN_KEYS and score.",
+        material_symbols=("TRAIN_KEYS", "score"),
+    )
+    sanitized = sanitize_generated_package(parent, pkg)
+    candidate_file = next(f for f in sanitized.files if f.path == "candidate.py")
+    # TRAIN_KEYS should be restored to parent's version
+    assert 'TRAIN_KEYS = {"a", "b"}' in candidate_file.content
+    assert '{"a", "b", "c"}' not in candidate_file.content
+    # score should still be modified
+    assert "tab_bias" in candidate_file.content
+    # material_symbols should only contain actually-changed symbols
+    assert "TRAIN_KEYS" not in sanitized.material_symbols
+    assert "score" in sanitized.material_symbols
+
+
+def test_sanitize_raises_on_noop_candidate() -> None:
+    """Guardrail 3: If candidate source is identical to parent after sanitization, raise error."""
+    parent = parent_snapshot()
+    pkg = GeneratedPackage(
+        request_id="implement-noop",
+        response_id="scripted-implement-noop",
+        files=(GeneratedFile("candidate.py", BASE_SOURCE),),
+        material_change_summary="No real changes.",
+        material_symbols=("score",),
+    )
+    with pytest.raises(SchemaValidationError, match="identical to parent"):
+        sanitize_generated_package(parent, pkg)
+
+
+def test_sanitize_fixes_material_symbols_when_model_lists_wrong_ones() -> None:
+    """material_symbols are recomputed from actual AST diff, not trusted from the model."""
+    parent = parent_snapshot()
+    pkg = GeneratedPackage(
+        request_id="implement-wrong-symbols",
+        response_id="scripted-implement-wrong",
+        files=(GeneratedFile("candidate.py", CHANGED_SOURCE),),
+        material_change_summary="Claims CONFIG_KEYS changed but only score did.",
+        material_symbols=("CONFIG_KEYS", "TRAIN_KEYS", "score"),
+    )
+    sanitized = sanitize_generated_package(parent, pkg)
+    # Only score actually changed
+    assert "score" in sanitized.material_symbols
+    # CONFIG_KEYS and TRAIN_KEYS don't exist in this baseline, so they shouldn't appear
+    assert "CONFIG_KEYS" not in sanitized.material_symbols
+    assert "TRAIN_KEYS" not in sanitized.material_symbols

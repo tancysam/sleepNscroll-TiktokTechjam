@@ -12,6 +12,7 @@ import ast
 import difflib
 import hashlib
 import os
+import re
 import shutil
 import stat
 from collections.abc import Iterable, Mapping
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from kuairand_agent.research.schemas import (
+    GeneratedFile,
     GeneratedPackage,
     ParentSnapshot,
     ParentSourceFile,
@@ -31,6 +33,65 @@ from kuairand_agent.research.source_policy import (
     DEFAULT_CANDIDATE_SOURCE_POLICY,
     CandidateManifestPolicyError,
 )
+ALLOWED_SUFFIXES: Final = frozenset({".py", ".json", ".md"})
+_FORBIDDEN_BASENAMES: Final = frozenset(
+    {
+        "data.py",
+        "evaluate.py",
+        "baseline.py",
+        "submit.py",
+        "sitecustomize.py",
+        "usercustomize.py",
+        "conftest.py",
+        "pyproject.toml",
+    }
+)
+_FORBIDDEN_IMPORT_ROOTS: Final = frozenset(
+    {
+        "kuairand_agent",
+        "subprocess",
+        "socket",
+        "urllib",
+        "http",
+        "requests",
+        "httpx",
+        "aiohttp",
+        "ftplib",
+        "os",
+        "sys",
+        "shutil",
+        "glob",
+        "tempfile",
+        "ctypes",
+        "importlib",
+        "multiprocessing",
+        "pickle",
+        "marshal",
+        "builtins",
+        "webbrowser",
+    }
+)
+_FORBIDDEN_CALLS: Final = frozenset({"eval", "exec", "compile", "__import__", "breakpoint"})
+_FROZEN_PROTOCOL_SYMBOLS: Final = frozenset(
+    {
+        "SCHEMA_VERSION",
+        "SCORES_DTYPE",
+        "MAX_JSON_BYTES",
+        "CONFIG_KEYS",
+        "TRAIN_KEYS",
+        "PREDICT_KEYS",
+        "CandidateInputError",
+        "_sha256",
+        "_read_json",
+        "_require_exact_keys",
+        "_require_digest",
+        "_write_json",
+        "_write_scores",
+        "_read_capability",
+        "main",
+    }
+)
+_PORTABLE_PATH_RE: Final = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\Z")
 
 
 class CandidateMaterializationError(ValueError):
@@ -187,6 +248,7 @@ def materialize_candidate(
     destination: Path | str,
 ) -> MaterializedCandidate:
     """Create one new read-only child tree after validating the complete response mapping."""
+
 
     _validate_package(parent, package)
     destination_path = Path(destination)
@@ -374,6 +436,13 @@ def _top_level_symbols(tree: ast.Module) -> dict[str, str]:
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             result[node.name] = ast.dump(node, annotate_fields=True, include_attributes=False)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    result[target.id] = ast.dump(node, annotate_fields=True, include_attributes=False)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                result[node.target.id] = ast.dump(node, annotate_fields=True, include_attributes=False)
     return result
 
 
@@ -404,6 +473,161 @@ def _reachable_python_files(files: Mapping[str, str]) -> tuple[str, ...]:
                     if candidate in files and candidate not in reached:
                         pending.append(candidate)
     return tuple(sorted(reached))
+
+
+def _extract_symbol_source(
+    source: str, symbol_name: str, tree: ast.Module,
+) -> str | None:
+    """Extract the exact source lines for a top-level symbol from source text."""
+    lines = source.splitlines(keepends=True)
+    for node in tree.body:
+        name: str | None = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == symbol_name:
+                    name = symbol_name
+                    break
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+        if name == symbol_name and hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+            start = node.lineno - 1
+            end = node.end_lineno if node.end_lineno is not None else start + 1
+            return "".join(lines[start:end])
+    return None
+
+
+def _restore_protocol_constants(
+    parent: ParentSnapshot, candidate_content: str,
+) -> str:
+    """Restore frozen protocol symbols in candidate.py from the parent if the model changed them.
+
+    Returns the (possibly corrected) source text for candidate.py.
+    """
+    parent_file = None
+    for f in parent.files:
+        if f.path == "candidate.py":
+            parent_file = f
+            break
+    if parent_file is None:
+        return candidate_content
+
+    try:
+        parent_tree = ast.parse(parent_file.content, filename="candidate.py")
+        child_tree = ast.parse(candidate_content, filename="candidate.py")
+    except SyntaxError:
+        return candidate_content
+
+    parent_symbols = _top_level_symbols(parent_tree)
+    child_symbols = _top_level_symbols(child_tree)
+
+    result = candidate_content
+    for symbol_name in _FROZEN_PROTOCOL_SYMBOLS:
+        if symbol_name not in parent_symbols:
+            continue
+        parent_dump = parent_symbols.get(symbol_name)
+        child_dump = child_symbols.get(symbol_name)
+        if parent_dump == child_dump:
+            continue
+        # The model changed a frozen symbol — restore the parent's version
+        parent_source = _extract_symbol_source(parent_file.content, symbol_name, parent_tree)
+        if parent_source is None:
+            continue
+        if child_dump is not None:
+            # Symbol exists in child but was modified — replace it
+            child_source = _extract_symbol_source(result, symbol_name, ast.parse(result))
+            if child_source is not None:
+                result = result.replace(child_source, parent_source, 1)
+        else:
+            # Symbol was deleted by the model — re-insert it before the first function/class
+            lines = result.splitlines(keepends=True)
+            insert_line = len(lines)
+            current_tree = ast.parse(result)
+            for node in current_tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    insert_line = node.lineno - 1
+                    break
+            lines.insert(insert_line, parent_source + "\n")
+            result = "".join(lines)
+
+    return result
+
+
+def sanitize_generated_package(
+    parent: ParentSnapshot,
+    package: GeneratedPackage,
+) -> GeneratedPackage:
+    """Apply deterministic guardrails to fix common LLM code-generation mistakes.
+
+    1. Drop files with forbidden basenames (e.g. baseline.py, data.py).
+    2. Restore frozen protocol constants in candidate.py from the parent.
+    3. Recompute material_symbols based on actual AST differences.
+    """
+    # Step 1: Drop forbidden-basename files
+    cleaned_files: list[GeneratedFile] = []
+    for f in package.files:
+        p = PurePosixPath(f.path)
+        if p.name in _FORBIDDEN_BASENAMES:
+            continue
+        if p.suffix not in ALLOWED_SUFFIXES:
+            continue
+        cleaned_files.append(f)
+
+    # Step 2: Restore protocol constants in candidate.py
+    final_files: list[GeneratedFile] = []
+    for f in cleaned_files:
+        if f.path == "candidate.py":
+            restored = _restore_protocol_constants(parent, f.content)
+            final_files.append(GeneratedFile(path=f.path, content=restored))
+        else:
+            final_files.append(f)
+
+    if not final_files:
+        raise CandidateMaterializationError(
+            "sanitization removed all generated files — candidate is empty"
+        )
+
+    # Step 3: Recompute material_symbols from actual AST diff
+    parent_files = {v.path: v.content for v in parent.files if v.path.endswith(".py")}
+    child_files = dict(parent_files)
+    child_files.update({f.path: f.content for f in final_files if f.path.endswith(".py")})
+    actual_changed: list[str] = []
+    for path in sorted(child_files):
+        if not path.endswith(".py"):
+            continue
+        try:
+            child_tree = _normalized_tree(path, child_files[path])
+            child_syms = _top_level_symbols(child_tree)
+        except CandidateStaticError:
+            continue
+        if path in parent_files:
+            try:
+                parent_tree = _normalized_tree(path, parent_files[path])
+                parent_syms = _top_level_symbols(parent_tree)
+            except CandidateStaticError:
+                parent_syms = {}
+        else:
+            parent_syms = {}
+        for name, dump in child_syms.items():
+            if name.startswith("_"):
+                continue  # schemas.py forbids material_symbols starting with _
+            if parent_syms.get(name) != dump and name not in actual_changed:
+                actual_changed.append(name)
+
+    if not actual_changed:
+        raise SchemaValidationError(
+            "sanitized candidate is identical to parent — returning unmodified source is forbidden"
+        )
+
+    return GeneratedPackage(
+        schema_version=package.schema_version,
+        request_id=package.request_id,
+        response_id=package.response_id,
+        files=tuple(final_files),
+        material_change_summary=package.material_change_summary,
+        material_symbols=tuple(sorted(actual_changed)),
+    )
 
 
 def require_material_executable_change(
