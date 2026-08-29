@@ -180,3 +180,36 @@ def test_instructions_reject_a_non_boolean_retry_flag() -> None:
 def test_instructions_reject_a_foreign_source_policy() -> None:
     with pytest.raises(ValueError, match="source_policy must be CandidateSourcePolicy"):
         instructions_for(ResearchOperation.IMPLEMENT, source_policy=object())  # type: ignore[arg-type]
+
+
+def test_propose_never_asks_for_a_protected_path() -> None:
+    """PROPOSE and IMPLEMENT must not contradict each other about candidate.py.
+
+    A live campaign lost its first branch to exactly this. PROPOSE said files_expected "must
+    include candidate.py"; IMPLEMENT forbids returning any protected path, and candidate.py is
+    one. The model obeyed PROPOSE, implemented the manifest it had just proposed, and was
+    rejected at materialization after burning both repair attempts:
+
+        "generated package cannot replace protected runtime file(s): candidate.py"
+
+    Nothing validates files_expected, so only this test stops the wording drifting back.
+    """
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert "must include candidate.py" not in rendered
+    assert "never list or return candidate.py" in " ".join(rendered.split())
+
+
+@pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
+def test_source_operations_state_the_schema_rules_that_cost_an_attempt(
+    operation: ResearchOperation,
+) -> None:
+    """Both rules below are enforced by the strict schema and were previously unstated.
+
+    A repair returned model_impl.py twice and was rejected as malformed, consuming one of only
+    two attempts, because nothing told the model paths must be unique.
+    """
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "must be unique" in rendered
+    assert "Never return candidate.py" in rendered

@@ -71,11 +71,25 @@ def test_model_generation_prompt_defines_one_general_model_interface() -> None:
     assert "The protected wrapper owns them" in instructions
 
 
-def test_proposal_prompt_requires_a_legal_final_manifest() -> None:
-    instructions = instructions_for(ResearchOperation.PROPOSE)
+def test_proposal_prompt_requires_a_legal_returnable_manifest() -> None:
+    """files_expected must describe what the response RETURNS, not the final tree.
 
-    assert "files_expected describes the final candidate manifest" in instructions
-    assert "must include candidate.py" in instructions
+    This test previously asserted that PROPOSE tells the model files_expected "must include
+    candidate.py". That instruction contradicted IMPLEMENT, which forbids returning any
+    protected path -- and candidate.py is the protected path. A live campaign lost its first
+    branch to it: the model listed candidate.py as instructed, returned it, and was rejected at
+    materialization with "generated package cannot replace protected runtime file(s):
+    candidate.py" after exhausting both repairs.
+
+    The final tree does contain candidate.py, because overlay semantics retain unmentioned
+    parent files. The response must not.
+    """
+
+    instructions = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
+
+    assert "files_expected lists exactly the files the implementation will RETURN" in instructions
+    assert "never list or return candidate.py" in instructions
+    assert "must include candidate.py" not in instructions
 
 
 def test_delivered_prompt_uses_the_exact_request_policy_digest() -> None:

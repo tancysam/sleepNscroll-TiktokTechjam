@@ -167,8 +167,10 @@ _OPERATION: Final = {
         "Propose one falsifiable principal scientific change. Keep it within remaining resource "
         "evidence, name the exact parent, declare every required field and role, and provide "
         "explicit smoke, inner-fold, falsification, promotion, and rollback criteria. "
-        "files_expected describes the final candidate manifest, not just changed files, and "
-        "must include candidate.py."
+        "files_expected lists exactly the files the implementation will RETURN. Protected "
+        "runtime paths are inherited from the trusted parent automatically: never list or "
+        "return candidate.py. A typical manifest is [model_impl.py] alone, or "
+        "[model_impl.py, config.json] when the configuration schema also changes."
     ),
     ResearchOperation.IMPLEMENT: """Return only files whose content differs from the trusted
 parent, with complete content for each returned file; never return patches or filesystem
@@ -249,6 +251,15 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
             '- A compact valid final manifest is ["candidate.py", "pairwise_fm.py", '
             '"config.json"]. An invalid manifest is ["candidate.py", "baseline.py"] because '
             "baseline.py is reserved."
+        ),
+        (
+            "- Returned file paths must be unique. The same path twice is rejected as a "
+            "malformed response before any gate runs, and costs an attempt."
+        ),
+        (
+            "- Change model_impl.py, config.json, or helper modules you add and import. Never "
+            "return candidate.py: it is a protected runtime wrapper, it is retained from the "
+            "parent automatically, and returning it is refused before any other check."
         ),
         (
             "- provider JSON acceptance is not candidate admission. Local path, static, "
