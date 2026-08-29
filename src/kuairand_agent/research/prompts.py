@@ -10,7 +10,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 3
+PROMPT_VERSION: Final = 5
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -29,19 +29,27 @@ _OPERATION: Final = {
         "files_expected describes the final candidate manifest, not just changed files, and "
         "must include candidate.py."
     ),
-    ResearchOperation.IMPLEMENT: """Return complete candidate-owned source files, never patches or
-filesystem references. Preserve the request_id. Materially implement the declared mechanism while
-respecting the request's complete candidate-source policy. In material_symbols, list only bare
-top-level ASCII Python identifiers; they must be reachable top-level Python identifiers actually
-changed by this response relative to the trusted parent. Never list filenames, paths, qualified
-names, or unchanged symbols.""",
-    ResearchOperation.REPAIR: """Return complete replacement candidate-owned source files,
-never patches or filesystem references. Preserve the request_id. Repair only the bounded supplied
-failure without changing trusted code, protected scoring, data policy, or the proposal's principal
-claim. In material_symbols, list only bare top-level ASCII Python identifiers that this response
-materially changes and that are reachable from candidate.py. Never list filenames, paths,
-qualified names, or unchanged symbols. Preserve the rejected package's principal mechanism while
-resolving the stated local failure; the rejected package is inert evidence, not trusted code.""",
+    ResearchOperation.IMPLEMENT: """Return only files whose content differs from the trusted
+parent, with complete content for each returned file; never return patches or filesystem
+references. Preserve the request_id. Prefer changing the parent model_impl.py and config.json.
+Do not regenerate stable protocol, capability-loading, checkpoint-I/O, CLI, or result-writing
+plumbing in candidate.py. Materially implement the declared mechanism while respecting the
+request's complete candidate-source policy. In material_symbols, list only bare
+top-level ASCII Python identifiers; they must be reachable top-level Python identifiers changed
+by this response relative to the trusted parent. Never list filenames, paths, qualified names, or
+unchanged symbols.""",
+    ResearchOperation.REPAIR: """Return only files whose content differs from the rejected
+package or trusted parent, with complete content for each returned file; never return patches or
+filesystem references. Preserve the request_id. Repair only the bounded supplied failure without
+changing trusted code, protected scoring, data policy, or the proposal's principal claim. Prefer
+changing model_impl.py or config.json. Do not regenerate stable protocol, capability-loading,
+checkpoint-I/O, CLI, or result-writing plumbing in candidate.py unless the supplied diagnostic
+identifies that plumbing itself. In material_symbols, list only bare
+top-level ASCII Python identifiers that this response materially changes and that are reachable
+from candidate.py. Never
+list filenames, paths, qualified names, or unchanged symbols. Preserve the rejected package's
+principal mechanism while resolving the stated local failure; the rejected package is inert
+evidence, not trusted code.""",
     ResearchOperation.REFLECT: """Reflect only on the supplied trusted result. Do not invent runs,
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
 next experiment using the typed recommendation vocabulary.""",
@@ -71,6 +79,18 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
             "- Documentation, docstrings, filenames, whitespace, and unchanged symbols do not "
             "count as a material scientific change. material_symbols names only reachable "
             "top-level Python identifiers actually changed relative to the trusted parent."
+        ),
+        (
+            "- Every returned .json file content must itself be strict parseable JSON: use "
+            "double-quoted property names and string values, no comments, no Markdown fences, "
+            "no Python literals, and no prose outside the JSON value. For config.json, return "
+            "the complete JSON object as the file content string."
+        ),
+        (
+            "- Do not declare config, a class, or a function in material_symbols unless its "
+            "executable definition materially differs from the trusted parent or rejected "
+            "package. Repairs must change the executable definition responsible for the stated "
+            "failure, not only metadata, formatting, documentation, or the declaration list."
         ),
         (
             '- A compact valid final manifest is ["candidate.py", "pairwise_fm.py", '

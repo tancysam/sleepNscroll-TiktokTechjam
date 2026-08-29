@@ -176,6 +176,8 @@ from kuairand_agent.research.provider import (
     OpenAIProviderChainError,
     OpenAIProviderError,
     ProviderErrorCode,
+    ProviderModelLimitResolver,
+    ProviderTranscript,
     ResponsesTransport,
     RetryRuntime,
 )
@@ -200,6 +202,7 @@ _PRODUCTION_DIR = "production"
 _PORTFOLIO_REASON = "bounded_high_value_lambdarank_branch_prioritized"
 _REJECTION_JOURNAL_DIR = "controller-rejection-journal"
 _REJECTION_JOURNAL_LIMIT_BYTES = 65_536
+_PROVIDER_ATTEMPT_JOURNAL_DIR = "provider-attempt-journal"
 _SAFE_FOLD_FAILURE_OUTCOMES = frozenset(
     {
         ExecutionOutcome.TIMED_OUT,
@@ -1794,6 +1797,51 @@ def _persist_rejection_journal_entry(
     return journal_digest
 
 
+def _provider_transcript_sink(production: Path) -> Callable[[ProviderTranscript], None]:
+    journal = production / _PROVIDER_ATTEMPT_JOURNAL_DIR
+    journal.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if journal.is_symlink() or not journal.is_dir():
+        raise FullCampaignError("provider-attempt journal must be a real directory")
+
+    def persist(transcript: ProviderTranscript) -> None:
+        payload = transcript.json_bytes
+        if hashlib.sha256(payload).hexdigest() != transcript.digest:
+            raise FullCampaignError("provider transcript digest does not identify its bytes")
+        path = journal / f"{transcript.digest}.json"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            try:
+                retained = path.read_bytes()
+            except OSError as exc:
+                raise FullCampaignError("retained provider transcript is unavailable") from exc
+            if retained != payload:
+                raise FullCampaignError(
+                    "retained provider transcript differs from replay"
+                ) from None
+            return
+        except OSError as exc:
+            raise FullCampaignError("provider transcript cannot be persisted") from exc
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o400)
+        try:
+            directory_descriptor = os.open(journal, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as exc:
+            raise FullCampaignError("provider-attempt journal cannot be synchronized") from exc
+
+    return persist
+
+
 @dataclass(frozen=True, slots=True)
 class _LiveLineagePreparation:
     status: Literal[
@@ -1953,6 +2001,16 @@ def _prepare_live_lineage_portfolio(
 
 
 def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
+    def context_limits(endpoint: OpenAIChatCompletionsModel) -> Mapping[str, object] | None:
+        limits = endpoint.context_limits
+        if limits is None:
+            return None
+        return {
+            "context_length": limits.context_length,
+            "max_completion_tokens": limits.max_completion_tokens,
+            "source": limits.source,
+        }
+
     provider_models: tuple[tuple[str, OpenAIChatCompletionsModel], ...]
     if isinstance(model, OpenAIChatCompletionsModel):
         provider_models = (("main", model),)
@@ -1973,6 +2031,7 @@ def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
     return {
         "model": active_model.config.model,
         "base_url": active_model.config.base_url,
+        "context_limits": context_limits(active_model),
         "input_tokens": usage.input_tokens,
         "cached_input_tokens": usage.cached_input_tokens,
         "output_tokens": usage.output_tokens,
@@ -1992,6 +2051,7 @@ def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
                 "model": endpoint.config.model,
                 "base_url": endpoint.config.base_url,
                 "credential_env": endpoint.config.api_key_env,
+                "context_limits": context_limits(endpoint),
                 "input_tokens": endpoint.total_usage.input_tokens,
                 "cached_input_tokens": endpoint.total_usage.cached_input_tokens,
                 "output_tokens": endpoint.total_usage.output_tokens,
@@ -3369,6 +3429,7 @@ def run_provider_free_campaign(
         else:
 
             def remaining_research_seconds() -> float:
+                _check_cancel(cancel_event)
                 observed = selected_engine.inspect_deadline(run)
                 return max(
                     0.0,
@@ -3376,6 +3437,7 @@ def run_provider_free_campaign(
                 )
 
             retry_runtime = RetryRuntime(remaining_research_seconds=remaining_research_seconds)
+            persist_provider_transcript = _provider_transcript_sink(production)
 
             def build_openai_model(
                 config: OpenAIChatCompletionsConfig,
@@ -3385,6 +3447,8 @@ def run_provider_free_campaign(
                     config,
                     transport=transport,
                     retry_runtime=retry_runtime,
+                    model_limit_resolver=ProviderModelLimitResolver(),
+                    transcript_sink=persist_provider_transcript,
                 )
 
             selected_provider = select_research_provider(

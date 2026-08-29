@@ -480,6 +480,7 @@ def test_live_lineage_routes_reserved_filename_through_agent_repair_and_rehydrat
         "README.md",
         "candidate.py",
         "config.json",
+        "model_impl.py",
         "pairwise_helper.py",
     }
     assert len(model.repair_requests) == 1

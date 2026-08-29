@@ -9,11 +9,14 @@ python candidate.py predict --request request.json --checkpoint output/checkpoin
   --output prediction/
 ```
 
-`candidate.py` owns the executable scientific mechanism: finite numeric capability loading,
-training-only standardization, a full-batch logistic objective with fixed deterministic updates,
-checkpoint serialization, and label-free prediction. It imports neither the protected scorer nor
-trusted controller modules and never computes or declares GAUC, nDCG@5, or the primary benchmark
-metric.
+`candidate.py` is the stable protocol entrypoint. It owns finite numeric capability loading,
+request validation, checkpoint serialization, result writing, and the command-line interface.
+`model_impl.py` is the deliberately small mutable scientific surface: it owns training-only
+standardization, the full-batch logistic objective, fixed deterministic updates, checkpoint
+semantics, and label-free prediction. Autonomous implementations should normally replace only
+`model_impl.py` and `config.json`; preserving the entrypoint avoids repeatedly regenerating risky
+protocol and NumPy I/O plumbing. Neither file imports the protected scorer or trusted controller
+modules, and neither computes or declares GAUC, nDCG@5, or the primary benchmark metric.
 
 The trusted workspace request supplies opaque approved-input handles. The nested `request` object
 uses these exact fields for training:

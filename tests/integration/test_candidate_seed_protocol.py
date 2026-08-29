@@ -87,6 +87,7 @@ def _run(*arguments: str, cwd: Path) -> None:
 
 def test_seed_is_a_material_generated_source_candidate(tmp_path: Path) -> None:
     source = (SEED / "candidate.py").read_text(encoding="utf-8")
+    model_source = (SEED / "model_impl.py").read_text(encoding="utf-8")
     config = (SEED / "config.json").read_text(encoding="utf-8")
     parent = ParentSnapshot(
         candidate_id="minimal-parent",
@@ -104,6 +105,7 @@ def test_seed_is_a_material_generated_source_candidate(tmp_path: Path) -> None:
         response_id="seed-source",
         files=(
             GeneratedFile("candidate.py", source),
+            GeneratedFile("model_impl.py", model_source),
             GeneratedFile("config.json", config),
         ),
         material_change_summary="Own deterministic logistic training and prediction mechanics.",
@@ -114,10 +116,22 @@ def test_seed_is_a_material_generated_source_candidate(tmp_path: Path) -> None:
     evidence = require_material_executable_change(parent, child)
 
     assert evidence.changed_symbols == (
-        "candidate.py:predict_scores",
-        "candidate.py:train_model",
+        "model_impl.py:predict_scores",
+        "model_impl.py:train_model",
     )
-    assert evidence.reachable_python_files == ("candidate.py",)
+    assert evidence.reachable_python_files == ("candidate.py", "model_impl.py")
+
+
+def test_seed_keeps_mutable_model_code_out_of_stable_protocol_entrypoint() -> None:
+    entrypoint = (SEED / "candidate.py").read_text(encoding="utf-8")
+    model = (SEED / "model_impl.py").read_text(encoding="utf-8")
+
+    assert "from model_impl import" in entrypoint
+    assert "def train_model(" not in entrypoint
+    assert "def predict_scores(" not in entrypoint
+    assert "def train_model(" in model
+    assert "def predict_scores(" in model
+    assert len(model.encode("utf-8")) < len(entrypoint.encode("utf-8"))
 
 
 def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(

@@ -13,7 +13,9 @@ from typing import Any
 import pytest
 
 from kuairand_agent.research.interface import ResearchModel
+from kuairand_agent.research.prompts import PROMPT_VERSION
 from kuairand_agent.research.provider import (
+    ModelContextLimits,
     OpenAIChatCompletionsConfig,
     OpenAIChatCompletionsModel,
     OpenAIFailoverModel,
@@ -21,7 +23,9 @@ from kuairand_agent.research.provider import (
     OpenAIProviderError,
     OpenAIResponsesConfig,
     OpenAIResponsesModel,
+    OpenRouterModelLimitResolver,
     ProviderErrorCode,
+    ProviderModelLimitResolver,
     ResponsesTransportError,
     ResponseTooLargeError,
     RetryPolicy,
@@ -200,7 +204,7 @@ def test_propose_uses_chat_completions_schema_and_records_redacted_usage(
     assert payload["response_format"] == {
         "type": "json_schema",
         "json_schema": {
-            "name": "kuairand_propose_v3",
+            "name": f"kuairand_propose_v{PROMPT_VERSION}",
             "strict": True,
             "schema": _json_schema_format(payload)["schema"],
         },
@@ -217,6 +221,94 @@ def test_propose_uses_chat_completions_schema_and_records_redacted_usage(
     assert usage.unaccounted_attempts == 0
     assert len(model.transcripts) == 1
     assert key.encode() not in model.transcripts[0].json_bytes
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "https://openrouter.ai/api/v1",
+        "https://api.tokenrouter.com/v1",
+    ),
+)
+def test_gateway_payload_uses_gateway_reasoning_contract(
+    monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    monkeypatch.setenv("KUAIRAND_TEST_OPENAI_KEY", "gateway-fixture-secret")
+    transport = FakeTransport(
+        [TransportResponse(status_code=200, body=_response(_proposal_payload()))]
+    )
+    model = OpenAIChatCompletionsModel(
+        replace(_config(), base_url=base_url, reasoning_effort="low"),
+        transport=transport,
+    )
+
+    model.propose(_proposal_request())
+
+    payload = json.loads(transport.requests[0].body)
+    assert "reasoning_effort" not in payload
+    assert payload["reasoning"] == {"effort": "low", "exclude": True}
+    if base_url.startswith("https://openrouter.ai/"):
+        assert payload["provider"] == {
+            "allow_fallbacks": True,
+            "require_parameters": True,
+        }
+    else:
+        assert "provider" not in payload
+
+
+def test_model_metadata_clamps_completion_budget_to_advertised_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUAIRAND_TEST_OPENAI_KEY", "limits-fixture-secret")
+    transport = FakeTransport(
+        [TransportResponse(status_code=200, body=_response(_proposal_payload()))]
+    )
+    resolutions: list[str] = []
+
+    def resolve(config: OpenAIChatCompletionsConfig, _secret: str) -> ModelContextLimits:
+        resolutions.append(config.model)
+        return ModelContextLimits(
+            context_length=128_000,
+            max_completion_tokens=2_048,
+            source="fixture",
+        )
+
+    model = OpenAIChatCompletionsModel(
+        _config(),
+        transport=transport,
+        model_limit_resolver=resolve,
+    )
+
+    model.propose(_proposal_request())
+
+    payload = json.loads(transport.requests[0].body)
+    assert payload["max_completion_tokens"] == 2_048
+    assert resolutions == ["gpt-5.4"]
+    assert model.context_limits == ModelContextLimits(
+        context_length=128_000,
+        max_completion_tokens=2_048,
+        source="fixture",
+    )
+
+
+def test_provider_transcript_is_sent_to_durable_sink_before_call_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUAIRAND_TEST_OPENAI_KEY", "sink-fixture-secret")
+    persisted: list[bytes] = []
+    model = OpenAIChatCompletionsModel(
+        _config(),
+        transport=FakeTransport(
+            [TransportResponse(status_code=200, body=_response(_proposal_payload()))]
+        ),
+        transcript_sink=lambda transcript: persisted.append(transcript.json_bytes),
+    )
+
+    proposal = model.propose(_proposal_request())
+
+    assert proposal.proposal_id == "causal-tree-v1"
+    assert persisted == [model.transcripts[0].json_bytes]
+    assert json.loads(persisted[0])["outcome"] == "accepted"
 
 
 def test_chat_completions_portable_json_mode_preserves_local_schema_validation(
@@ -421,9 +513,9 @@ def test_all_four_operations_implement_the_existing_research_model_protocol(
     assert isinstance(model.reflect(reflection), Reflection)
     payloads = [json.loads(item.body) for item in transport.requests]
     assert [_json_schema_format(item)["name"] for item in payloads] == [
-        "kuairand_implement_v3",
-        "kuairand_repair_v3",
-        "kuairand_reflect_v3",
+        f"kuairand_implement_v{PROMPT_VERSION}",
+        f"kuairand_repair_v{PROMPT_VERSION}",
+        f"kuairand_reflect_v{PROMPT_VERSION}",
     ]
     assert [_json_schema_format(item)["schema"]["title"] for item in payloads] == [
         "GeneratedPackage",
@@ -1039,6 +1131,96 @@ class FakeHTTPResponse:
     def read(self, size: int) -> bytes:
         self.read_sizes.append(size)
         return self.body[:size]
+
+
+def test_openrouter_model_limit_discovery_uses_current_model_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeHTTPResponse(
+        json.dumps(
+            {
+                "data": {
+                    "id": "deepseek/deepseek-v4-pro-0813",
+                    "context_length": 128_000,
+                    "top_provider": {
+                        "context_length": 114_688,
+                        "max_completion_tokens": 65_536,
+                    },
+                }
+            }
+        ).encode("utf-8")
+    )
+    observed: list[tuple[str, str, float]] = []
+
+    def fake_urlopen(request: object, *, timeout: float) -> FakeHTTPResponse:
+        assert isinstance(request, urllib.request.Request)
+        observed.append((request.full_url, request.get_method(), timeout))
+        return response
+
+    monkeypatch.setattr("kuairand_agent.research.provider.urllib.request.urlopen", fake_urlopen)
+    config = replace(
+        _config(),
+        model="deepseek/deepseek-v4-pro-0813",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    limits = OpenRouterModelLimitResolver()(config, "metadata-fixture-secret")
+
+    assert limits == ModelContextLimits(
+        context_length=114_688,
+        max_completion_tokens=65_536,
+        source="openrouter-model-metadata",
+    )
+    assert observed == [
+        (
+            "https://openrouter.ai/api/v1/model/deepseek/deepseek-v4-pro-0813",
+            "GET",
+            10.0,
+        )
+    ]
+    assert response.read_sizes == [256 * 1024 + 1]
+
+
+def test_compatible_models_endpoint_is_used_only_when_it_publishes_exact_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeHTTPResponse(
+        json.dumps(
+            {
+                "data": [
+                    {"id": "unrelated/model"},
+                    {
+                        "id": "deepseek/deepseek-v4-pro-0813",
+                        "context_length": 96_000,
+                        "max_completion_tokens": 24_000,
+                    },
+                ]
+            }
+        ).encode("utf-8")
+    )
+    observed_urls: list[str] = []
+
+    def fake_urlopen(request: object, *, timeout: float) -> FakeHTTPResponse:
+        assert isinstance(request, urllib.request.Request)
+        observed_urls.append(request.full_url)
+        return response
+
+    monkeypatch.setattr("kuairand_agent.research.provider.urllib.request.urlopen", fake_urlopen)
+    config = replace(
+        _config(),
+        model="deepseek/deepseek-v4-pro-0813",
+        base_url="https://api.tokenrouter.com/v1",
+    )
+
+    limits = ProviderModelLimitResolver()(config, "metadata-fixture-secret")
+
+    assert limits == ModelContextLimits(
+        context_length=96_000,
+        max_completion_tokens=24_000,
+        source="openai-compatible-model-metadata",
+    )
+    assert observed_urls == ["https://api.tokenrouter.com/v1/models"]
+    assert response.read_sizes == [2 * 1024 * 1024 + 1]
 
 
 def test_stdlib_transport_passes_exact_timeout_and_reads_one_byte_past_the_limit(

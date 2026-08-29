@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import difflib
 import hashlib
+import math
 import os
 import shutil
 import stat
@@ -18,6 +19,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 from kuairand_agent.research.schemas import (
     GeneratedPackage,
@@ -25,6 +27,7 @@ from kuairand_agent.research.schemas import (
     ParentSourceFile,
     SchemaValidationError,
     canonical_digest,
+    canonical_json_bytes,
     parse_json_object,
 )
 from kuairand_agent.research.source_policy import (
@@ -118,6 +121,71 @@ def _tree_digest(files: Iterable[ParentSourceFile]) -> str:
     )
 
 
+_MAX_JSON_LITERAL_NODES = 4_096
+_MAX_JSON_LITERAL_DEPTH = 64
+
+
+def _json_literal_value(node: ast.AST, *, depth: int = 0) -> object:
+    """Decode only a bounded JSON-equivalent Python literal; never evaluate code."""
+
+    if depth > _MAX_JSON_LITERAL_DEPTH:
+        raise ValueError("JSON-equivalent literal exceeds the nesting limit")
+    if isinstance(node, ast.Dict):
+        result: dict[str, object] = {}
+        for key_node, value_node in zip(node.keys, node.values, strict=True):
+            if not isinstance(key_node, ast.Constant) or type(key_node.value) is not str:
+                raise ValueError("JSON-equivalent object keys must be strings")
+            key = key_node.value
+            if key in result:
+                raise ValueError("JSON-equivalent object contains duplicate keys")
+            result[key] = _json_literal_value(value_node, depth=depth + 1)
+        return result
+    if isinstance(node, ast.List):
+        return [_json_literal_value(item, depth=depth + 1) for item in node.elts]
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if value is None or type(value) in {str, bool, int}:
+            return value
+        if type(value) is float and math.isfinite(value):
+            return value
+        raise ValueError("literal contains a non-JSON scalar")
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.UAdd, ast.USub))
+        and isinstance(node.operand, ast.Constant)
+        and type(node.operand.value) in {int, float}
+    ):
+        numeric = cast(int | float, node.operand.value)
+        value = numeric if isinstance(node.op, ast.UAdd) else -numeric
+        if type(value) is float and not math.isfinite(value):
+            raise ValueError("literal contains a non-finite number")
+        return value
+    raise ValueError("literal contains non-JSON syntax")
+
+
+def _normalize_generated_content(path: str, content: str) -> str:
+    if not path.endswith(".json"):
+        return content
+    try:
+        parse_json_object(content)
+        return content
+    except SchemaValidationError:
+        pass
+    try:
+        expression = ast.parse(content, filename=path, mode="eval")
+    except SyntaxError:
+        return content
+    if sum(1 for _ in ast.walk(expression)) > _MAX_JSON_LITERAL_NODES:
+        return content
+    try:
+        value = _json_literal_value(expression.body)
+    except ValueError:
+        return content
+    if not isinstance(value, dict):
+        return content
+    return canonical_json_bytes(value).decode("ascii") + "\n"
+
+
 def _unified_diff(
     parent_files: Mapping[str, str], child_files: Mapping[str, str]
 ) -> tuple[tuple[str, ...], str]:
@@ -202,19 +270,11 @@ def materialize_candidate(
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise CandidateMaterializationError("candidate destination parent must be a real directory")
 
-    parent_content = {value.path: value.content for value in parent.files}
-    child_content = dict(parent_content)
-    child_content.update({value.path: value.content for value in package.files})
-    changed_paths, unified = _unified_diff(parent_content, child_content)
-    child_files = tuple(
-        ParentSourceFile.create(path, content) for path, content in sorted(child_content.items())
-    )
-    source_digest = _tree_digest(child_files)
-    diff_digest = hashlib.sha256(unified.encode("utf-8")).hexdigest()
+    described = describe_materialized_candidate(parent, package, destination_path)
 
     try:
         destination_path.mkdir(mode=0o700, exist_ok=False)
-        for value in child_files:
+        for value in described.files:
             relative = _validate_path(value.path, generated=False)
             target = destination_path.joinpath(*relative.parts)
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -228,14 +288,47 @@ def materialize_candidate(
 
     return MaterializedCandidate(
         destination=destination_path,
+        parent_digest=described.parent_digest,
+        package_digest=described.package_digest,
+        material_symbols=described.material_symbols,
+        files=described.files,
+        changed_paths=described.changed_paths,
+        unified_diff=described.unified_diff,
+        source_digest=described.source_digest,
+        diff_digest=described.diff_digest,
+    )
+
+
+def describe_materialized_candidate(
+    parent: ParentSnapshot,
+    package: GeneratedPackage,
+    destination: Path | str,
+) -> MaterializedCandidate:
+    """Compute the exact normalized child identity without touching the filesystem."""
+
+    _validate_package(parent, package)
+    parent_content = {value.path: value.content for value in parent.files}
+    child_content = dict(parent_content)
+    child_content.update(
+        {
+            value.path: _normalize_generated_content(value.path, value.content)
+            for value in package.files
+        }
+    )
+    changed_paths, unified = _unified_diff(parent_content, child_content)
+    child_files = tuple(
+        ParentSourceFile.create(path, content) for path, content in sorted(child_content.items())
+    )
+    return MaterializedCandidate(
+        destination=Path(destination),
         parent_digest=parent.digest,
         package_digest=package.digest,
         material_symbols=package.material_symbols,
         files=child_files,
         changed_paths=changed_paths,
         unified_diff=unified,
-        source_digest=source_digest,
-        diff_digest=diff_digest,
+        source_digest=_tree_digest(child_files),
+        diff_digest=hashlib.sha256(unified.encode("utf-8")).hexdigest(),
     )
 
 
@@ -281,6 +374,79 @@ def _import_root(name: str | None) -> str:
     return name.split(".", 1)[0]
 
 
+def _numpy_aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
+    modules: set[str] = set()
+    loads: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "numpy":
+                    modules.add(alias.asname or "numpy")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "numpy":
+            for alias in node.names:
+                if alias.name == "load":
+                    loads.add(alias.asname or "load")
+    return modules, loads
+
+
+def _is_numpy_load_call(node: ast.AST, modules: set[str], loads: set[str]) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    function = node.func
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr == "load"
+        and isinstance(function.value, ast.Name)
+        and function.value.id in modules
+    ) or (isinstance(function, ast.Name) and function.id in loads)
+
+
+def _returns_context_loaded_array(
+    statements: list[ast.stmt],
+    bound_name: str,
+    numpy_modules: set[str],
+) -> bool:
+    for statement in statements:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == bound_name:
+                return True
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr in {"array", "asarray", "ascontiguousarray"}
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in numpy_modules
+                and value.args
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == bound_name
+            ):
+                return True
+    return False
+
+
+def _validate_numpy_load_context_managers(path: str, tree: ast.Module) -> None:
+    numpy_modules, numpy_loads = _numpy_aliases(tree)
+    if not numpy_modules and not numpy_loads:
+        return
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        for item in node.items:
+            if not _is_numpy_load_call(item.context_expr, numpy_modules, numpy_loads):
+                continue
+            if not isinstance(item.optional_vars, ast.Name):
+                continue
+            if _returns_context_loaded_array(node.body, item.optional_vars.id, numpy_modules):
+                raise CandidateStaticError(
+                    f"np.load result is returned from a context manager in {path!r}; "
+                    ".npy files return ndarray objects that are not context managers, while "
+                    ".npz archives must be copied before the archive closes"
+                )
+
+
 def _validate_python(path: str, content: str) -> ast.Module:
     try:
         tree = ast.parse(content, filename=path)
@@ -304,6 +470,7 @@ def _validate_python(path: str, content: str) -> ast.Module:
             and node.func.id in DEFAULT_CANDIDATE_SOURCE_POLICY.forbidden_calls
         ):
             raise CandidateStaticError(f"forbidden call {node.func.id!r} in {path!r}")
+    _validate_numpy_load_context_managers(path, tree)
     return tree
 
 
@@ -437,17 +604,15 @@ def require_material_executable_change(
                         f"declared material symbol {name!r} is ambiguous across reachable files"
                     )
                 changed_by_name[name] = qualified
-    missing = sorted(set(candidate.material_symbols) - set(changed_by_name))
-    if missing:
+    declared_changes = tuple(
+        changed_by_name[name] for name in candidate.material_symbols if name in changed_by_name
+    )
+    if not declared_changes:
+        missing = sorted(set(candidate.material_symbols) - set(changed_by_name))
         raise CandidateStaticError(
             f"declared material symbol(s) did not change material executable-source: {missing!r}"
         )
-    changed_symbols = tuple(changed_by_name[name] for name in candidate.material_symbols)
-    if not changed_symbols:
-        raise CandidateStaticError(
-            "candidate does not contain a material executable-source symbol change"
-        )
-    return MaterialChangeEvidence(tuple(sorted(changed_symbols)), reachable)
+    return MaterialChangeEvidence(tuple(sorted(declared_changes)), reachable)
 
 
 def snapshot_materialized_candidate(

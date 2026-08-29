@@ -449,7 +449,7 @@ class CampaignCreateRequest:
             _require_digest(getattr(self, name), name)
         if self.config.runner.finalization_reserve_seconds < MIN_FINALIZATION_RESERVE_SECONDS:
             raise CampaignIntegrityError(
-                "campaign finalization reserve must be at least 3600 seconds"
+                "campaign finalization reserve must be at least 600 seconds"
             )
         if self.config.benchmark.max_iterations > MAX_TRAINING_LAUNCHES:
             raise CampaignIntegrityError("campaign scientific iteration cap cannot exceed 50")

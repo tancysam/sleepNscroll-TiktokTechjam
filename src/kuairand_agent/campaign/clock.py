@@ -16,7 +16,8 @@ import psutil  # type: ignore[import-untyped]
 
 DEADLINE_SCHEMA_VERSION: Final = 1
 MAX_WALL_CLOCK_SECONDS: Final = 21_600
-MIN_FINALIZATION_RESERVE_SECONDS: Final = 3_600
+MIN_FINALIZATION_RESERVE_SECONDS: Final = 600
+DEFAULT_FINALIZATION_RESERVE_SECONDS: Final = 3_600
 NANOSECONDS_PER_SECOND: Final = 1_000_000_000
 
 
@@ -187,7 +188,7 @@ class DeadlineState:
             < self.wall_clock_seconds
         ):
             raise DeadlineError(
-                "finalization_reserve_seconds must be at least 3600 and below wall clock"
+                "finalization_reserve_seconds must be at least 600 and below wall clock"
             )
         started = _aware_utc(self.started_utc, "started_utc")
         deadline = _aware_utc(self.utc_deadline, "utc_deadline")
@@ -226,7 +227,7 @@ class DeadlineState:
         clock: Clock,
         *,
         wall_clock_seconds: int = MAX_WALL_CLOCK_SECONDS,
-        finalization_reserve_seconds: int = MIN_FINALIZATION_RESERVE_SECONDS,
+        finalization_reserve_seconds: int = DEFAULT_FINALIZATION_RESERVE_SECONDS,
     ) -> Self:
         now_mono = clock.monotonic_ns()
         if type(now_mono) is not int or now_mono < 0:

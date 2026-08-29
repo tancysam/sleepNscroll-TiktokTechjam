@@ -16,7 +16,7 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
 ) -> None:
     instructions = instructions_for(operation)
 
-    assert PROMPT_VERSION == 3
+    assert PROMPT_VERSION == 5
     assert DEFAULT_CANDIDATE_SOURCE_POLICY.digest in instructions
     assert "candidate.py" in instructions
     assert "baseline.py" in instructions
@@ -43,6 +43,13 @@ def test_source_generation_prompts_define_overlay_and_material_symbol_semantics(
         "Documentation, docstrings, filenames, whitespace, and unchanged symbols do not count"
         in instructions
     )
+    assert "strict parseable JSON" in instructions
+    assert "double-quoted property names" in instructions
+    assert "complete JSON object as the file content string" in instructions
+    assert "executable definition responsible" in instructions
+    assert "Return only files whose content differs" in instructions
+    assert "Do not regenerate stable protocol" in instructions
+    assert "model_impl.py" in instructions
 
 
 def test_proposal_prompt_requires_a_legal_final_manifest() -> None:
