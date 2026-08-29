@@ -4,7 +4,7 @@ from typing import cast
 
 import pytest
 
-from kuairand_agent.data.fields import field_policy_digest
+from kuairand_agent.data.fields import field_policy_digest, field_policy_manifest
 from kuairand_agent.research.context import (
     AggregateRecord,
     MetricSummary,
@@ -71,7 +71,15 @@ def test_safe_context_contains_only_metadata_and_aggregate_results() -> None:
     ]
     assert inner_metrics[0]["precision"] == "exact"
     assert task["target"] == "long_view"
-    assert "fields" in field_policy
+    enabled_fields = cast(list[dict[str, object]], field_policy["fields"])
+    disabled_by_member = cast(dict[str, list[str]], field_policy["disabled_columns_by_member"])
+    assert enabled_fields
+    assert all(field["enabled"] is True for field in enabled_fields)
+    represented_field_count = sum(len(columns) for columns in disabled_by_member.values()) + len(
+        enabled_fields
+    )
+    assert represented_field_count == len(cast(list[object], field_policy_manifest()["fields"]))
+    assert "every unspecified field is forbidden" in cast(str, field_policy["policy_semantics"])
     assert (
         context.digest
         == build_safe_research_context(
