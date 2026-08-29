@@ -333,3 +333,115 @@ sh -n scripts/run_full_campaign.sh
 
 Full-data and optional performance/replay gates require the verified local archive or their
 documented optional dependency groups. They never require external training data.
+
+## How the agent works
+
+Two planes with a narrow typed wire between them.
+
+The **trusted controller** owns everything that could compromise the result: the dataset and its
+split boundaries, the byte-protected organizer scorer, the sandbox, every budget, and the durable
+campaign record. The **research model** reaches it through exactly four typed methods —
+`propose`, `implement`, `repair`, `reflect` (`src/kuairand_agent/research/interface.py`) — and has
+no filesystem, shell, network, evaluator, credential, or label authority.
+
+One scientific iteration:
+
+1. The model receives a leakage-safe context: benchmark contract, train-only EDA, label-free
+   validation-input EDA, method cards, prior iteration outcomes, and remaining budget.
+2. It returns a falsifiable **hypothesis** naming one principal change and its expected effect on
+   GAUC or nDCG@5.
+3. It returns **complete candidate source files** — never patches. The controller writes them into
+   a fresh disposable directory and computes the diff itself.
+4. Static gates run: path policy, forbidden imports, forbidden calls, and a material-change check
+   that rejects a package claiming a modification it did not make.
+5. The candidate trains in a sandbox and is scored by the untouched organizer evaluator through a
+   three-tier gate — smoke, then inner temporal folds, then a rationed outer validation query.
+6. Promotion or rejection is decided by the measured score, never by the model's own report.
+7. The model reflects on the trusted result and chooses what to try next.
+
+The campaign ends on the organizer convergence rule (ε = 0.002 over N = 3 iterations) or a frozen
+iteration, launch, promotion, reserve, or wall-clock boundary — whichever comes first. The
+validation-best eligible checkpoint is then replayed in a clean locked environment and emitted as
+a label-free submission.
+
+**The model proposes; code decides.** No metric in this system is ever self-reported.
+
+## Results
+
+See [`docs/RESULTS.md`](docs/RESULTS.md) for the full table, run logs, resource accounting, and
+evaluation-integrity analysis.
+
+Headline, stated conservatively:
+
+| | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| FM — official baseline (test) | 0.6610 | 0.5282 | 0.5946 |
+| Oracle ceiling (test) | 1.0000 | 0.7289 | 0.8645 |
+| Best completed run (validation) | 0.6671879292 | 0.5359807014 | 0.6015843153 |
+
+That run reproduces the official baseline to within noise — a **+0.000144** delta against this
+repository's official-FM confirmation-seed mean, roughly one fifth of one seed standard deviation.
+**We do not claim it as an improvement.** It demonstrates that the pipeline runs end to end
+without human intervention and emits an organizer-valid submission.
+
+GPU-hours consumed: **0.00**. Every configuration is CPU-only.
+
+## Limitations, and what we would do with more time
+
+**What is not demonstrated.** No live-provider autonomous campaign has completed; every finalized
+run records `provider = scripted` and zero API calls. Consequently we have not shown a
+validation-primary improvement above ε = 0.002, and hidden-test performance is unknown and
+unclaimed.
+
+**The constraint-transmission asymmetry.** The most instructive defect we found was in our own
+design. `materialize.py` enforces 44 distinct constants on generated code — forbidden import
+roots, reserved basenames, trusted path prefixes, forbidden calls, size limits — but the
+implementation request transmitted only three of them. The model was being rejected for rules it
+was never told. Every model tried (gpt-4o, DeepSeek, gpt-5.4-mini) failed the contract, and the
+cause was our instruction surface, not their capability. `research/prompts.py` now renders its
+constraint text *from those enforcement constants directly*, so the two cannot drift apart. It is
+a reminder that in an agent system the prompt is part of the interface, and deserves the same
+rigour as a schema.
+
+**A record-ordering defect that made failure permanent.** The live lineage record was written
+immediately after the model responded but before static validation, using create-once read-only
+semantics. A single contract-violating package therefore persisted an unwritable record, killed
+the campaign, and made `resume` fail identically forever. Fixed by holding the response in memory
+and writing only after every check passes. The general lesson — persist a decision after
+validating it, not before — is one we would apply earlier next time.
+
+**With more time, in priority order:**
+
+1. **Optimize the ranking objective properly.** Training uses pointwise log loss while GAUC and
+   nDCG are ranking metrics. This is the organizers' own top-ranked open direction and our
+   pairwise implementation exists but is trained only to a tiny acceptance configuration.
+2. **Per-operation model routing.** Reasoning effort and model choice are currently uniform across
+   all four research operations, so deep reasoning is paid on code generation as well as on
+   research. The adapter seam already supports a router; only configuration plumbing is missing.
+3. **Inspiration-based crossover and a quality-diversity archive.** The search is greedy against a
+   single incumbent. Because GAUC (mixed-label users only) and nDCG@5 (all users) genuinely
+   diverge, keeping the best candidate *per objective* and letting the model merge two parents'
+   mechanisms is a natural fit. We designed this and deliberately did not ship it: it requires a
+   new wire field in the subsystem that guarantees replay integrity, which is not a change to make
+   days before a deadline.
+4. **Unbiased validation via the randomized-exposure log.** `log_random_4_22_to_5_08_pure.csv`
+   (1.18M rows) is blocked as training data by our field policy, correctly. Used as a *second,
+   unbiased validation signal*, it would reveal whether a promoted candidate only wins on biased
+   traffic — a genuine improvement to the selection loop rather than the model.
+5. **Windows support.** The runtime is POSIX-only (`resource`, `os.killpg`, `SIGKILL`), which cost
+   the team parallel capacity when one member could not execute anything locally.
+
+## Team contributions
+
+- **Samuel Tan** ([@tancysam](https://github.com/tancysam)) — system architecture and the bulk of
+  the implementation: trusted controller, leakage-safe data layer, campaign store and runtime,
+  execution sandbox, finalization and replay. Environment and dataset qualification; execution of
+  the full-data campaigns; the lineage record-ordering fix and its regression test.
+- **Sean Koh** ([@TerrorByter](https://github.com/TerrorByter)) — architecture review and failure
+  analysis; live-provider testing across multiple models that surfaced the code-generation
+  contract failures; design and implementation of the bounded repair path and campaign-level
+  failure recovery.
+- **Makendra Prasad** ([@makilover3000](https://github.com/makilover3000)) — benchmark contract
+  verification against the starter kit (identifying that the planning documents encoded the wrong
+  label and metrics); the research-model instruction surface, including constraint transmission
+  and the domain briefing; results, resource accounting, and submission documentation.

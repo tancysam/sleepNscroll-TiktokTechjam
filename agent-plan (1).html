@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Autonomous ML Research Agent — Build Plan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F5F5F1; --surface:#FFFFFF; --ink:#1B1D22; --sec:#54575E; --muted:#8B8E95;
+    --line:#E1E1DA; --line-strong:#CFCFC7;
+    --reason:#463BB0; --reason-tint:#ECEAF8; --reason-line:#C6C0EE;
+    --exec:#0C8467; --exec-tint:#E0F2EC; --exec-line:#AEDDCF;
+    --err:#B24E2A; --err-tint:#F6E8E1; --err-line:#E7C3B2;
+    --store:#5F6169; --store-tint:#ECECE8;
+    --diag:#9EA0A5;
+    --maxw:1020px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:16.5px; line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 28px}
+  .mono{font-family:"IBM Plex Mono",monospace}
+
+  /* ---- hero ---- */
+  header.hero{padding:76px 0 40px; border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:"IBM Plex Mono",monospace; font-size:12.5px; letter-spacing:.14em;
+    text-transform:uppercase; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap; align-items:center}
+  .eyebrow .tag{color:var(--reason)}
+  h1{font-family:"Space Grotesk",sans-serif; font-weight:700; letter-spacing:-.02em;
+    font-size:clamp(2.3rem,6vw,3.65rem); line-height:1.02; margin:22px 0 0}
+  .thesis{font-size:clamp(1.05rem,2.4vw,1.32rem); line-height:1.5; color:var(--sec);
+    max-width:41ch; margin:24px 0 0; font-weight:400}
+  .thesis b{color:var(--ink); font-weight:600}
+  .legend{display:flex; gap:22px; flex-wrap:wrap; margin-top:34px;
+    font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--sec)}
+  .legend span{display:inline-flex; align-items:center; gap:8px}
+  .dot{width:11px; height:11px; border-radius:3px; display:inline-block}
+
+  /* ---- sections ---- */
+  section{padding:58px 0; border-bottom:1px solid var(--line)}
+  .snum{font-family:"IBM Plex Mono",monospace; font-size:12.5px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--muted)}
+  .snum b{color:var(--reason); font-weight:500}
+  h2{font-family:"Space Grotesk",sans-serif; font-weight:600; letter-spacing:-.01em;
+    font-size:clamp(1.6rem,3.6vw,2.15rem); margin:12px 0 0; line-height:1.1}
+  .lead{color:var(--sec); max-width:64ch; margin:16px 0 0}
+  h3{font-family:"Space Grotesk",sans-serif; font-weight:600; font-size:1.12rem; margin:0 0 4px}
+  p{margin:0 0 14px}
+  a{color:var(--reason); text-decoration:none; border-bottom:1px solid var(--reason-line)}
+  a:hover{border-color:var(--reason)}
+
+  /* ---- diagram ---- */
+  .diagram{margin-top:34px; background:var(--surface); border:1px solid var(--line);
+    border-radius:16px; padding:26px 22px}
+  .diagram svg{width:100%; height:auto; display:block}
+  .cap{font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--muted);
+    text-align:center; margin-top:12px}
+
+  /* ---- numbered trajectory ---- */
+  .steps{margin-top:32px; counter-reset:step}
+  .step{display:grid; grid-template-columns:56px 1fr; gap:20px; padding:22px 0;
+    border-top:1px solid var(--line)}
+  .step:last-child{border-bottom:1px solid var(--line)}
+  .step .idx{counter-increment:step; font-family:"IBM Plex Mono",monospace; font-weight:500;
+    font-size:14px; color:var(--reason)}
+  .step .idx::before{content:"0" counter(step)}
+  .step p{margin:6px 0 0; color:var(--sec)}
+  .pill{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:11px;
+    letter-spacing:.04em; padding:3px 9px; border-radius:20px; margin-left:8px; vertical-align:middle}
+  .pill.key{background:var(--reason-tint); color:var(--reason)}
+  .note{margin-top:26px; background:var(--reason-tint); border-left:3px solid var(--reason);
+    padding:16px 20px; border-radius:0 8px 8px 0; color:#2f2a63; font-size:15px}
+
+  /* ---- component grid ---- */
+  .grid{display:grid; grid-template-columns:repeat(2,1fr); gap:16px; margin-top:32px}
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:14px;
+    padding:20px 20px 18px; border-top-width:3px; transition:transform .18s ease, box-shadow .18s ease}
+  .card:hover{transform:translateY(-2px); box-shadow:0 6px 22px rgba(27,29,34,.07)}
+  .card .role{font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.08em;
+    text-transform:uppercase; margin-bottom:10px}
+  .card p{margin:0; color:var(--sec); font-size:15px; line-height:1.55}
+  .card.reason{border-top-color:var(--reason)} .card.reason .role{color:var(--reason)}
+  .card.exec{border-top-color:var(--exec)} .card.exec .role{color:var(--exec)}
+  .card.err{border-top-color:var(--err)} .card.err .role{color:var(--err)}
+  .card.store{border-top-color:var(--store)} .card.store .role{color:var(--store)}
+
+  /* ---- scoring levers ---- */
+  .levers{margin-top:30px; display:flex; flex-direction:column; gap:18px}
+  .lever{display:grid; grid-template-columns:1fr; gap:8px}
+  .lever .top{display:flex; justify-content:space-between; align-items:baseline; gap:16px}
+  .lever .name{font-family:"Space Grotesk",sans-serif; font-weight:600; font-size:1.05rem}
+  .lever .wt{font-family:"IBM Plex Mono",monospace; font-weight:600; font-size:1.05rem; color:var(--reason)}
+  .bar{height:9px; background:var(--line); border-radius:6px; overflow:hidden}
+  .bar i{display:block; height:100%; background:var(--reason); border-radius:6px; width:0;
+    transition:width 1s cubic-bezier(.2,.7,.3,1)}
+  .lever .how{color:var(--sec); font-size:14.5px; margin:0}
+  .lever.sub .wt{color:var(--muted)} .lever.sub .bar i{background:var(--muted)}
+
+  /* ---- toolbox ---- */
+  .kit{margin-top:30px; display:grid; grid-template-columns:1fr; gap:26px}
+  .kit-group{display:grid; grid-template-columns:190px 1fr; gap:24px; padding-top:24px;
+    border-top:1px solid var(--line)}
+  .kit-group h3{margin:0}
+  .kit-group .why{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--muted);
+    margin-top:6px; line-height:1.5}
+  .tools{display:flex; flex-direction:column; gap:12px}
+  .tool{display:grid; grid-template-columns:150px 1fr; gap:16px; font-size:15px}
+  .tool .tn{font-weight:600; color:var(--ink)}
+  .tool .td{color:var(--sec); line-height:1.5}
+  .star{color:var(--exec); font-family:"IBM Plex Mono",monospace; font-size:11px; margin-left:6px}
+
+  /* ---- stack callout ---- */
+  .stack{background:var(--ink); color:#EDEDE7; border-radius:16px; padding:34px 32px; margin-top:8px}
+  .stack .snum{color:#9a9ca3} .stack .snum b{color:#b9b2f2}
+  .stack h2{color:#fff; margin-top:10px}
+  .flow{display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:22px;
+    font-family:"IBM Plex Mono",monospace; font-size:14px}
+  .flow .node{background:#2a2d34; border:1px solid #3a3d45; border-radius:9px; padding:9px 14px}
+  .flow .node b{color:#fff}
+  .flow .arw{color:#7b7e86}
+  .stack .cc{color:#a7aab1; margin:20px 0 0; max-width:60ch; font-size:15px}
+
+  footer{padding:40px 0 64px; color:var(--muted); font-family:"IBM Plex Mono",monospace; font-size:12px}
+  footer b{color:var(--sec); font-weight:500}
+
+  /* reveal */
+  .rv{opacity:0; transform:translateY(14px)}
+  .rv.in{opacity:1; transform:none; transition:opacity .6s ease, transform .6s ease}
+
+  @media (max-width:720px){
+    .grid{grid-template-columns:1fr}
+    .kit-group{grid-template-columns:1fr; gap:10px}
+    .tool{grid-template-columns:1fr; gap:2px}
+    .tool .tn{font-size:15.5px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .rv{opacity:1; transform:none} .card{transition:none}
+  }
+  @media print{
+    body{background:#fff; font-size:11pt}
+    section,header.hero{border-color:#ddd}
+    .card:hover{transform:none; box-shadow:none}
+    .rv{opacity:1; transform:none}
+    .stack{background:#fff; color:#000; border:1px solid #ccc}
+    .stack h2,.stack .flow .node b{color:#000} .stack .flow .node{background:#f4f4f2; border-color:#ddd}
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">
+      <span class="tag">Build plan</span>
+      <span>Autonomous ML Research Agent · KuaiRand</span>
+    </div>
+    <h1>An agent that does the<br>ML engineer's loop.</h1>
+    <p class="thesis">The graded artifact isn't the best recommender — it's the <b>agent that builds one cheaply, autonomously, and without falling over.</b> Every design choice below is aimed at a scoring lever.</p>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--reason)"></i> LLM reasoning</span>
+      <span><i class="dot" style="background:var(--exec)"></i> Code execution</span>
+      <span><i class="dot" style="background:var(--store)"></i> Storage / logging</span>
+      <span><i class="dot" style="background:var(--err)"></i> Error handling</span>
+    </div>
+  </div>
+</header>
+
+<section class="rv">
+  <div class="wrap">
+    <div class="snum"><b>01</b> — The idea</div>
+    <h2>Two layers, stacked</h2>
+    <p class="lead">A recommender pipeline is the thing being optimized. An LLM-driven loop is the thing doing the optimizing. You build the outer loop; it writes and rewrites the inner pipeline on KuaiRand-Pure, chasing NDCG@10 / Recall@50 on the click label — using only train + validation, never the hidden test.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 900 300" role="img" aria-label="Agent loop: proposer, coder, executor, evaluator feeding back on themselves, supported by a solution tree, debugger, and run logger.">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M2 1L8 5L2 9" fill="none" stroke="var(--diag)" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+
+        <text x="449" y="50" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12.5" fill="#8B8E95">reflect + revise → next iteration</text>
+        <path d="M784 90 L784 60 L115 60 L115 90" fill="none" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah)"/>
+
+        <!-- loop row -->
+        <g>
+          <rect x="30" y="90" width="170" height="64" rx="10" fill="var(--reason-tint)" stroke="var(--reason-line)"/>
+          <text x="115" y="116" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="15" fill="#463BB0">Proposer</text>
+          <text x="115" y="136" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#6a61c0">picks next idea</text>
+
+          <rect x="253" y="90" width="170" height="64" rx="10" fill="var(--exec-tint)" stroke="var(--exec-line)"/>
+          <text x="338" y="116" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="15" fill="#0C8467">Coder</text>
+          <text x="338" y="136" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#3a9c82">writes code diff</text>
+
+          <rect x="476" y="90" width="170" height="64" rx="10" fill="var(--exec-tint)" stroke="var(--exec-line)"/>
+          <text x="561" y="116" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="15" fill="#0C8467">Executor</text>
+          <text x="561" y="136" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#3a9c82">trains in sandbox</text>
+
+          <rect x="699" y="90" width="170" height="64" rx="10" fill="var(--reason-tint)" stroke="var(--reason-line)"/>
+          <text x="784" y="116" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="15" fill="#463BB0">Evaluator</text>
+          <text x="784" y="136" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#6a61c0">scores, converge?</text>
+        </g>
+
+        <line x1="202" y1="122" x2="251" y2="122" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah)"/>
+        <line x1="425" y1="122" x2="474" y2="122" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah)"/>
+        <line x1="648" y1="122" x2="697" y2="122" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah)"/>
+
+        <!-- vertical connectors -->
+        <line x1="115" y1="210" x2="115" y2="156" stroke="var(--diag)" stroke-width="1.4" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line x1="561" y1="156" x2="561" y2="210" stroke="var(--diag)" stroke-width="1.4" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line x1="784" y1="156" x2="784" y2="210" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah)"/>
+
+        <!-- support row -->
+        <g>
+          <rect x="30" y="210" width="170" height="56" rx="10" fill="var(--store-tint)" stroke="var(--line-strong)"/>
+          <text x="115" y="234" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="14.5" fill="#3f4147">Solution tree</text>
+          <text x="115" y="252" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#7a7d84">attempts + scores</text>
+
+          <rect x="476" y="210" width="170" height="56" rx="10" fill="var(--err-tint)" stroke="var(--err-line)"/>
+          <text x="561" y="234" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="14.5" fill="#B24E2A">Debugger</text>
+          <text x="561" y="252" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#bb6b4c">retry, route around</text>
+
+          <rect x="699" y="210" width="170" height="56" rx="10" fill="var(--store-tint)" stroke="var(--line-strong)"/>
+          <text x="784" y="234" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="14.5" fill="#3f4147">Run logger</text>
+          <text x="784" y="252" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#7a7d84">hypothesis, diff</text>
+        </g>
+      </svg>
+      <div class="cap">The loop writes the pipeline. Purple stages reason; teal stages execute.</div>
+    </div>
+  </div>
+</section>
+
+<section class="rv">
+  <div class="wrap">
+    <div class="snum"><b>02</b> — Layer one · the pipeline</div>
+    <h2>What a good run climbs through</h2>
+    <p class="lead">The agent generates this code — you don't write it by hand. But the proposer needs to be steered toward a trajectory like this, where gains come from the whole stack, not just swapping the model.</p>
+
+    <div class="steps">
+      <div class="step"><div class="idx"></div><div>
+        <h3>Reproduce the baseline</h3>
+        <p>Stand up an end-to-end pipeline — load the fixed date splits, embed user/item IDs, a simple ranker — and confirm it matches the organizer's reported score. One clean turn of the loop.</p>
+      </div></div>
+      <div class="step"><div class="idx"></div><div>
+        <h3>Feature engineering</h3>
+        <p>User-history sequences, temporal/recency features (the splits are date-based), feature crossing like user × category. Often the cheapest wins on the board.</p>
+      </div></div>
+      <div class="step"><div class="idx"></div><div>
+        <h3>Architecture</h3>
+        <p>Climb from a DeepFM-style start toward attention over user history (DIN) or explicit interactions (DCNv2).</p>
+      </div></div>
+      <div class="step"><div class="idx"></div><div>
+        <h3>Multi-task learning<span class="pill key">the KuaiRand insight</span></h3>
+        <p>Only click is scored, but there are 12 feedback signals. An MMoE / PLE head that also predicts like, long_view, and follow shares representation and lifts the click metric — PLE directly targets the seesaw problem.</p>
+      </div></div>
+      <div class="step"><div class="idx"></div><div>
+        <h3>Training strategy</h3>
+        <p>Negative sampling, loss choice, LR schedule. If the agent gets ambitious, the randomized-exposure data opens a debiasing angle.</p>
+      </div></div>
+    </div>
+
+    <div class="note"><b>Score the converged result, not the peak.</b> A run converges when validation stops improving by more than ε over N iterations, or the budget runs out. Designate the converged validation-best checkpoint as final — don't chase a lucky mid-run high.</div>
+  </div>
+</section>
+
+<section class="rv">
+  <div class="wrap">
+    <div class="snum"><b>03</b> — Layer two · the agent</div>
+    <h2>The parts of the loop</h2>
+    <p class="lead">Robustness, autonomy, and the run logs are all graded on how <em>this</em> harness behaves — so instrument it heavily rather than treating these parts as plumbing.</p>
+
+    <div class="grid">
+      <div class="card reason"><div class="role">Reasoning</div><h3>Proposer</h3><p>Reads the current best solution plus the history of what's been tried, and picks the next move — grounded in named RS methods, since that's exactly what Innovation scoring rewards.</p></div>
+      <div class="card exec"><div class="role">Execution</div><h3>Coder</h3><p>Turns the chosen idea into a concrete code diff — or, with a config-driven library, a config edit, which is cheaper and less error-prone.</p></div>
+      <div class="card exec"><div class="role">Execution</div><h3>Executor</h3><p>Runs training + eval in a sandbox with a hard timeout, capturing both metrics and any stack traces.</p></div>
+      <div class="card reason"><div class="role">Reasoning</div><h3>Evaluator</h3><p>Reads the validation score, updates the solution tree, and applies the ε / N rule to decide keep-going vs. converged.</p></div>
+      <div class="card err"><div class="role">Error handling</div><h3>Debugger</h3><p>Your robustness story: on an error or timeout, feed the message back to the LLM to patch and retry, so a human never has to unstick it.</p></div>
+      <div class="card store"><div class="role">Storage</div><h3>Solution tree / memory</h3><p>Holds every attempt and its score, so promising branches get reused and dead ones get pruned.</p></div>
+      <div class="card store"><div class="role">Storage</div><h3>Run logger</h3><p>One structured record per iteration — hypothesis, diff, metrics, error/recovery. Not polish: it's a required deliverable and the judges' evidence for autonomy and robustness.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="rv">
+  <div class="wrap">
+    <div class="snum"><b>04</b> — Strategy</div>
+    <h2>Design to the scoring levers</h2>
+    <p class="lead">The rubric tells you what to optimize. Most teams over-index on the score and leave the other 65% on the table.</p>
+
+    <div class="levers">
+      <div class="lever"><div class="top"><span class="name">Technical Execution</span><span class="wt" data-w="35">35%</span></div><div class="bar"><i data-w="35"></i></div><p class="how">Beat the baseline on hidden test — and recover from failures. Robustness is judged by how you handle a crash, not whether one happens. Log the crash-and-recover; a suspiciously clean run scores worse.</p></div>
+      <div class="lever"><div class="top"><span class="name">Innovation &amp; Insight</span><span class="wt" data-w="20">20%</span></div><div class="bar"><i data-w="20"></i></div><p class="how">Judged on what the agent chose and <em>why</em>. The multi-task angle on the 12 signals is your ready-made insight — non-obvious and grounded in the domain.</p></div>
+      <div class="lever"><div class="top"><span class="name">Impact &amp; Relevance</span><span class="wt" data-w="20">20%</span></div><div class="bar"><i data-w="20"></i></div><p class="how">Autonomy, measured by intervention count. Every spot a human would step in is a gap for the debugger and convergence logic to cover. Track the number — you report it.</p></div>
+      <div class="lever"><div class="top"><span class="name">Feasibility &amp; Practicality</span><span class="wt" data-w="15">15%</span></div><div class="bar"><i data-w="15"></i></div><p class="how">Tokens + GPU-hours. Route routine coding to a cheap model, explore on a subsample and promote survivors, early-stop bad runs. A cheaper agent at the same score wins.</p></div>
+      <div class="lever sub"><div class="top"><span class="name">Presentation</span><span class="wt" data-w="10">10% · final only</span></div><div class="bar"><i data-w="10"></i></div><p class="how">Final event only — but the run logs and solution-tree visualization do double duty as the story.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="rv">
+  <div class="wrap">
+    <div class="snum"><b>05</b> — Toolbox</div>
+    <h2>Open-source stack</h2>
+    <p class="lead">Almost everything is open source, and the brief hands you the starting points. <span class="star">★</span> marks the pick for each role.</p>
+
+    <div class="kit">
+      <div class="kit-group">
+        <div><h3>Agent harness</h3><div class="why">the outer loop — what you're graded on</div></div>
+        <div class="tools">
+          <div class="tool"><span class="tn">AIDE / aideml <span class="star">★</span></span><span class="td">The system your brief cites and the reference scaffold behind MLE-bench and RE-Bench. Tree search over code, drafting → debugging → refining. Fork and adapt its proposer/executor to KuaiRand.</span></div>
+          <div class="tool"><span class="tn">Weco CLI</span><span class="td"><span class="mono">pip install weco</span> — the productionized AIDE algorithm. Lower effort, but a black box where you want control.</span></div>
+          <div class="tool"><span class="tn">AI-Scientist-v2</span><span class="td">Also cited; heavier and discovery-oriented. Read it for hypothesis-generation ideas.</span></div>
+          <div class="tool"><span class="tn">MLE-bench</span><span class="td">Not a harness — the standard eval suite. Reference for how these agents are scored.</span></div>
+        </div>
+      </div>
+
+      <div class="kit-group">
+        <div><h3>Recommender pipeline</h3><div class="why">the inner ML the agent iterates on</div></div>
+        <div class="tools">
+          <div class="tool"><span class="tn">FuxiCTR <span class="star">★</span></span><span class="td">Configurable, reproducible CTR library with DeepFM, DCNv2, DIN, MMoE, PLE. Config-driven, so the agent edits YAML instead of rewriting code — cheaper and more robust.</span></div>
+          <div class="tool"><span class="tn">RecBole</span><span class="td">Broad unified library, dozens of models across families. Good for sweeping model types fast.</span></div>
+          <div class="tool"><span class="tn">DeepCTR-Torch</span><span class="td">Lighter and readable — good when the agent should fully understand what it edits.</span></div>
+          <div class="tool"><span class="tn">TorchRec</span><span class="td">Production-scale sharded embeddings. Optional even for the 27k bonus (see §06) — its value there is throughput kernels, not sharding.</span></div>
+          <div class="tool"><span class="tn">LightGBM · XGBoost · CatBoost</span><span class="td">Strong, GPU-cheap tabular baselines — a good early rung to climb from.</span></div>
+        </div>
+      </div>
+
+      <div class="kit-group">
+        <div><h3>Cost control</h3><div class="why">feeds Feasibility (15%)</div></div>
+        <div class="tools">
+          <div class="tool"><span class="tn">LiteLLM <span class="star">★</span></span><span class="td">Unified API across providers — route routine coding to a cheap model, reserve an expensive one for strategy. The biggest token lever.</span></div>
+          <div class="tool"><span class="tn">Optuna</span><span class="td">HPO with successive-halving / Hyperband pruning — the "explore on a subsample, promote survivors" mechanism.</span></div>
+          <div class="tool"><span class="tn">Ray Tune</span><span class="td">Distributed HPO when you have parallel GPUs.</span></div>
+          <div class="tool"><span class="tn">Polars · DuckDB</span><span class="td">Fast data prep — close to essential if you touch the 1k / 27k bonus sets.</span></div>
+        </div>
+      </div>
+
+      <div class="kit-group">
+        <div><h3>Experiment tracking</h3><div class="why">this <em>is</em> a deliverable</div></div>
+        <div class="tools">
+          <div class="tool"><span class="tn">MLflow <span class="star">★</span></span><span class="td">Fully open source; logs params, metrics, and artifacts per run — maps cleanly onto the required log schema.</span></div>
+          <div class="tool"><span class="tn">Aim</span><span class="td">Open source, fast UI for comparing many runs and visualizing the solution-tree trajectory.</span></div>
+          <div class="tool"><span class="tn">Weights &amp; Biases</span><span class="td">Popular, free tier — but not fully open source, if that matters to you.</span></div>
+        </div>
+      </div>
+
+      <div class="kit-group">
+        <div><h3>Foundation</h3><div class="why">standard, all in scope</div></div>
+        <div class="tools">
+          <div class="tool"><span class="tn">PyTorch · Lightning</span><span class="td">The training loop.</span></div>
+          <div class="tool"><span class="tn">pandas · NumPy · scikit-learn</span><span class="td">The glue.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="rv">
+  <div class="wrap">
+    <div class="snum"><b>06</b> — Bonus · scaling to 27k</div>
+    <h2>Same brain, bigger muscles</h2>
+    <p class="lead">The loop is untouched — it's dataset-agnostic. What breaks at 27k is the <em>economics</em>: 322M interactions is ~230× Pure, so one full-data run that took minutes now takes hours, and an agent built on many cheap iterations stalls. Everything below restores cheap iteration and survives long runs.</p>
+
+    <p style="margin-top:20px; max-width:64ch; color:var(--sec)">The one conceptual change: give the loop <b style="color:var(--ink)">two eval fidelities</b>. The agent explores ideas on a cheap proxy and promotes only the survivors to full 27k — and Pure and 1k are ready-made proxies, since they're the same task on smaller data.</p>
+
+    <div class="diagram">
+      <svg viewBox="0 0 900 340" role="img" aria-label="A funnel: many ideas explored cheaply on a subsample, survivors promoted to a 1k confirmation tier, and one designated final run on full 27k.">
+        <defs>
+          <marker id="ah2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M2 1L8 5L2 9" fill="none" stroke="var(--diag)" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </marker>
+        </defs>
+
+        <!-- tier labels -->
+        <text x="22" y="70" font-family="IBM Plex Mono, monospace" font-weight="600" font-size="13" fill="#1B1D22">Explore</text>
+        <text x="22" y="86" font-family="IBM Plex Mono, monospace" font-size="11" fill="#8B8E95">subsample · Pure</text>
+        <text x="22" y="176" font-family="IBM Plex Mono, monospace" font-weight="600" font-size="13" fill="#1B1D22">Confirm</text>
+        <text x="22" y="192" font-family="IBM Plex Mono, monospace" font-size="11" fill="#8B8E95">survivors · 1k</text>
+        <text x="22" y="282" font-family="IBM Plex Mono, monospace" font-weight="600" font-size="13" fill="#1B1D22">Final</text>
+        <text x="22" y="298" font-family="IBM Plex Mono, monospace" font-size="11" fill="#8B8E95">full 27k</text>
+
+        <!-- cost labels -->
+        <text x="772" y="78" font-family="IBM Plex Mono, monospace" font-size="11" fill="#8B8E95">minutes · cheap</text>
+        <text x="772" y="184" font-family="IBM Plex Mono, monospace" font-size="11" fill="#8B8E95">≈1 GPU-hr</text>
+        <text x="772" y="290" font-family="IBM Plex Mono, monospace" font-size="11" fill="#8B8E95">hours</text>
+
+        <!-- promotion arrows (drawn first, behind nodes) -->
+        <line x1="320" y1="94" x2="325" y2="158" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah2)"/>
+        <line x1="520" y1="94" x2="485" y2="158" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah2)"/>
+        <line x1="620" y1="94" x2="625" y2="158" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah2)"/>
+        <line x1="485" y1="202" x2="485" y2="262" stroke="var(--diag)" stroke-width="1.4" marker-end="url(#ah2)"/>
+
+        <!-- tier 1: 6 candidate ideas -->
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <rect x="180" y="54" width="80" height="40" rx="8" fill="#EFEFEB" stroke="#DEDED8"/><text x="220" y="74" text-anchor="middle" dominant-baseline="central" fill="#AEB0B5">A</text>
+          <rect x="280" y="54" width="80" height="40" rx="8" fill="var(--exec-tint)" stroke="var(--exec-line)"/><text x="320" y="74" text-anchor="middle" dominant-baseline="central" fill="#0C8467" font-weight="600">B</text>
+          <rect x="380" y="54" width="80" height="40" rx="8" fill="#EFEFEB" stroke="#DEDED8"/><text x="420" y="74" text-anchor="middle" dominant-baseline="central" fill="#AEB0B5">C</text>
+          <rect x="480" y="54" width="80" height="40" rx="8" fill="var(--exec-tint)" stroke="var(--exec-line)"/><text x="520" y="74" text-anchor="middle" dominant-baseline="central" fill="#0C8467" font-weight="600">D</text>
+          <rect x="580" y="54" width="80" height="40" rx="8" fill="var(--exec-tint)" stroke="var(--exec-line)"/><text x="620" y="74" text-anchor="middle" dominant-baseline="central" fill="#0C8467" font-weight="600">E</text>
+          <rect x="680" y="54" width="80" height="40" rx="8" fill="#EFEFEB" stroke="#DEDED8"/><text x="720" y="74" text-anchor="middle" dominant-baseline="central" fill="#AEB0B5">F</text>
+        </g>
+
+        <!-- tier 2: 3 survivors -->
+        <g font-family="IBM Plex Mono, monospace" font-size="12">
+          <rect x="275" y="158" width="100" height="44" rx="8" fill="#EFEFEB" stroke="#DEDED8"/><text x="325" y="180" text-anchor="middle" dominant-baseline="central" fill="#AEB0B5">B</text>
+          <rect x="435" y="158" width="100" height="44" rx="8" fill="var(--exec-tint)" stroke="var(--exec-line)"/><text x="485" y="180" text-anchor="middle" dominant-baseline="central" fill="#0C8467" font-weight="600">D</text>
+          <rect x="575" y="158" width="100" height="44" rx="8" fill="#EFEFEB" stroke="#DEDED8"/><text x="625" y="180" text-anchor="middle" dominant-baseline="central" fill="#AEB0B5">E</text>
+        </g>
+
+        <!-- tier 3: designated final -->
+        <rect x="395" y="262" width="180" height="48" rx="9" fill="var(--reason-tint)" stroke="var(--reason)" stroke-width="1.8"/>
+        <text x="485" y="286" text-anchor="middle" dominant-baseline="central" font-family="Space Grotesk, sans-serif" font-weight="600" font-size="14.5" fill="#463BB0">D — final on 27k</text>
+      </svg>
+      <div class="cap">Ideas explored cheaply; only survivors are promoted. The solution tree stores each idea's score at every fidelity.</div>
+    </div>
+
+    <div class="grid">
+      <div class="card exec"><div class="role">Execution · data</div><h3>Cached columnar data</h3><p>322M rows won't sit in pandas. Convert to Parquet, load with Polars/DuckDB streaming, and precompute ID encodings and user-history sequences <em>once</em> — recomputing features per iteration is a silent budget killer.</p></div>
+      <div class="card exec"><div class="role">Execution</div><h3>Executor at scale</h3><p>bf16 / mixed precision, large batches, multi-GPU DDP if you have the cards. Most important: checkpoint + resume, so a crash at hour 2.5 becomes a resume, not a lost run.</p></div>
+      <div class="card err"><div class="role">Error handling</div><h3>OOM-aware debugger</h3><p>Add one failure mode explicitly: out-of-memory is the most common failure at scale and the easiest to recover — catch it, halve the batch, retry. A concrete logged win for robustness.</p></div>
+      <div class="card reason"><div class="role">Reasoning</div><h3>Explore cheap, confirm expensive</h3><p>Rank ideas on the subsample / Pure / 1k tiers, promote only survivors to full 27k (Optuna pruning makes it finishable). Since 27k is bonus and GPU-hours are scored, spend most iterations cheap and reserve 27k for a handful of confirmations.</p></div>
+    </div>
+
+    <div class="note"><b>TorchRec isn't actually required here.</b> Sharded embeddings solve table <em>size</em> (cardinality), but with only ~27K users and a modest item catalog your tables fit on one GPU — the bottleneck is interaction <em>throughput</em>. FuxiCTR + DDP + AMP is simpler for the agent to iterate on; reach for TorchRec only if throughput is still the wall after that.</div>
+  </div>
+</section>
+
+<section class="rv" style="border-bottom:none">
+  <div class="wrap">
+    <div class="stack">
+      <div class="snum"><b>07</b> — If you build one thing</div>
+      <h2>The recommended stack</h2>
+      <div class="flow">
+        <span class="node">fork <b>AIDE</b></span><span class="arw">→</span>
+        <span class="node">drive <b>FuxiCTR</b> configs</span><span class="arw">→</span>
+        <span class="node"><b>Optuna</b> pruning + <b>LiteLLM</b> routing</span><span class="arw">→</span>
+        <span class="node">log to <b>MLflow</b></span>
+      </div>
+      <p class="cc">The harness handles autonomy and robustness, FuxiCTR gives the agent a config surface to iterate on, pruning and routing keep the cost score down, and MLflow produces the required logs. All four scored levers, one stack.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Build plan · Autonomous ML Research Agent for KuaiRand · <b>required benchmark: KuaiRand-Pure · metrics: NDCG@10 / Recall@50</b>
+  </div>
+</footer>
+
+<script>
+  const io = new IntersectionObserver((es)=>{
+    es.forEach(e=>{
+      if(e.isIntersecting){
+        e.target.classList.add('in');
+        e.target.querySelectorAll('.bar i').forEach(b=>{ b.style.width = b.dataset.w + '%'; });
+        io.unobserve(e.target);
+      }
+    });
+  },{threshold:.12});
+  document.querySelectorAll('.rv').forEach(s=>io.observe(s));
+</script>
+</body>
+</html>

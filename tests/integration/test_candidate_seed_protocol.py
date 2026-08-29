@@ -129,6 +129,7 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
     train_targets = np.array([0.0, 1.0, 0.0, 1.0], dtype="<f8")
     _write_npy(inputs / "train-features.npy", train_features)
     _write_npy(inputs / "train-targets.npy", train_targets)
+    _write_npy(inputs / "train-groups.npy", np.array([7.0, 7.0, 9.0, 9.0], dtype="<f8"))
     config_digest = _sha256(SEED / "config.json")
     train_request = tmp_path / "train-request.json"
     _write_request(
@@ -136,6 +137,7 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
         approved=(
             ("features", "inputs/train-features.npy"),
             ("targets", "inputs/train-targets.npy"),
+            ("user_groups", "inputs/train-groups.npy"),
         ),
         split_role="train",
         request={
@@ -145,7 +147,9 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
             "data_digest": TRAIN_DATA,
             "split_token": "train-seed-fold",
             "features_handle": "features",
+            "seed": 0,
             "targets_handle": "targets",
+            "user_groups_handle": "user_groups",
         },
     )
 
@@ -159,7 +163,7 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
         config_digest=config_digest,
         data_digest=TRAIN_DATA,
         split_token="train-seed-fold",
-        checkpoint_path="checkpoint/model.npz",
+        checkpoint_path="checkpoint/model.txt",
     )
     first = validate_train_outputs(first_train, expected_train)
     second = validate_train_outputs(second_train, expected_train)

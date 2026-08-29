@@ -31,9 +31,11 @@ TRAIN_KEYS = {
     "data_digest",
     "features_handle",
     "protocol_schema_version",
+    "seed",
     "source_digest",
     "split_token",
     "targets_handle",
+    "user_groups_handle",
 }
 PREDICT_KEYS = {
     "checkpoint_digest",
@@ -80,6 +82,12 @@ def _require_digest(value: object, name: str) -> str:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise CandidateInputError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_seed(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= 2**32 - 1:
+        raise CandidateInputError("seed must be an unsigned 32-bit integer")
     return value
 
 
@@ -179,16 +187,28 @@ def _sigmoid(logits: np.ndarray, clip: float) -> np.ndarray:
 def train_model(
     features: np.ndarray,
     targets: np.ndarray,
+    user_groups: np.ndarray,
     config: dict[str, object],
+    seed: int,
 ) -> dict[str, np.ndarray]:
-    """Fit a fixed-step standardized logistic model with deterministic full-batch updates."""
+    """Fit a fixed-step standardized logistic model with deterministic full-batch updates.
+
+    ``user_groups`` is the trusted per-row user identity for this split. This pointwise
+    objective does not consume it, but the benchmark ranks within a user, so any ranking
+    objective must group by this array rather than by a feature column. ``seed`` is supplied
+    per request by the controller; this objective is deterministic and records it for replay
+    identity.
+    """
 
     if features.ndim != 2 or features.shape[0] == 0 or features.shape[1] == 0:
         raise CandidateInputError("training features must have non-empty shape (N, D)")
     if targets.shape != (features.shape[0],):
         raise CandidateInputError("training targets must have shape (N,)")
+    if user_groups.shape != (features.shape[0],):
+        raise CandidateInputError("training user_groups must have shape (N,)")
     if not bool(np.logical_or(targets == 0.0, targets == 1.0).all()):
         raise CandidateInputError("training targets must be binary")
+    _require_seed(seed)
     mean = features.mean(axis=0, dtype=np.float64)
     scale = features.std(axis=0, dtype=np.float64)
     scale = np.where(scale > 0.0, scale, 1.0)
@@ -219,6 +239,7 @@ def train_model(
         "feature_mean": np.ascontiguousarray(mean, dtype=np.float64),
         "feature_scale": np.ascontiguousarray(scale, dtype=np.float64),
         "final_objective": np.asarray(objective, dtype=np.float64),
+        "seed": np.asarray(float(seed), dtype=np.float64),
         "weights": np.ascontiguousarray(weights, dtype=np.float64),
     }
 
@@ -226,7 +247,14 @@ def train_model(
 def predict_scores(features: np.ndarray, checkpoint: dict[str, np.ndarray]) -> np.ndarray:
     """Apply the owned normalization and logistic interaction from a verified checkpoint."""
 
-    expected = {"bias", "feature_mean", "feature_scale", "final_objective", "weights"}
+    expected = {
+        "bias",
+        "feature_mean",
+        "feature_scale",
+        "final_objective",
+        "seed",
+        "weights",
+    }
     if set(checkpoint) != expected:
         raise CandidateInputError("checkpoint inventory is invalid")
     mean = checkpoint["feature_mean"]
@@ -266,24 +294,35 @@ def _train(request_path: Path, output: Path) -> None:
     config_digest = _require_digest(request["config_digest"], "config_digest")
     data_digest = _require_digest(request["data_digest"], "data_digest")
     split_token = _require_token(request["split_token"])
+    seed = _require_seed(request["seed"])
     features_handle = request["features_handle"]
     targets_handle = request["targets_handle"]
-    if type(features_handle) is not str or type(targets_handle) is not str:
+    user_groups_handle = request["user_groups_handle"]
+    if (
+        type(features_handle) is not str
+        or type(targets_handle) is not str
+        or type(user_groups_handle) is not str
+    ):
         raise CandidateInputError("training capability handles must be strings")
     try:
         feature_path = capabilities[features_handle]
         target_path = capabilities[targets_handle]
+        user_groups_path = capabilities[user_groups_handle]
     except KeyError as exc:
         raise CandidateInputError("training capability handle is not approved") from exc
     features = _load_numeric_array(feature_path, "training features")
     targets = _load_numeric_array(target_path, "training targets")
+    user_groups = _load_numeric_array(user_groups_path, "training user groups")
     config = _load_config(config_digest)
-    checkpoint = train_model(features, targets, config)
+    checkpoint = train_model(features, targets, user_groups, config, seed)
 
     output.mkdir(parents=True, exist_ok=False)
     checkpoint_dir = output / "checkpoint"
     checkpoint_dir.mkdir()
-    checkpoint_path = checkpoint_dir / "model.npz"
+    # The trusted protocol pins this exact path
+    # (GeneratedCandidateIdentity.checkpoint_path); it is not a free choice.
+    # The bytes remain a NumPy archive.
+    checkpoint_path = checkpoint_dir / "model.txt"
     with checkpoint_path.open("xb") as handle:
         np.savez(
             handle,
@@ -291,6 +330,7 @@ def _train(request_path: Path, output: Path) -> None:
             feature_mean=checkpoint["feature_mean"],
             feature_scale=checkpoint["feature_scale"],
             final_objective=checkpoint["final_objective"],
+            seed=checkpoint["seed"],
             weights=checkpoint["weights"],
         )
     checkpoint_digest = _sha256(checkpoint_path)
@@ -304,7 +344,7 @@ def _train(request_path: Path, output: Path) -> None:
         "checkpoint_digest": checkpoint_digest,
         "artifacts": [
             {
-                "path": "checkpoint/model.npz",
+                "path": "checkpoint/model.txt",
                 "sha256": checkpoint_digest,
                 "size_bytes": checkpoint_path.stat().st_size,
             }
@@ -314,6 +354,8 @@ def _train(request_path: Path, output: Path) -> None:
             "feature_count": int(features.shape[1]),
             "final_objective": float(checkpoint["final_objective"]),
             "row_count": int(features.shape[0]),
+            "seed": seed,
+            "user_count": int(np.unique(user_groups).size),
         },
     }
     _write_json(output / "candidate_result.json", result)

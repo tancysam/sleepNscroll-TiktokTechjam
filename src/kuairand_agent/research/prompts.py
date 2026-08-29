@@ -21,6 +21,131 @@ randomized-log data, snapshot/statistic tables, public/final outcomes, or curren
 features. The protected organizer evaluator, attempt policy, and promotion policy are not yours to
 change."""
 
+_BENCHMARK: Final = """Benchmark briefing
+
+Task: rank each user's own logged impressions. This is within-user ranking over an existing
+impression list, not retrieval over a catalogue.
+
+Target: `long_view` (binary). Metrics: GAUC and nDCG@5; the primary score is their arithmetic
+mean. The official FM baseline scores primary 0.5946 on the held-out period.
+
+Ceilings, so you calibrate expectations correctly:
+- A perfect oracle scores primary 0.8645, NOT 1.0. nDCG@5 alone ceilings at 0.7289.
+- 27.1% of users have zero positives (nDCG is permanently 0 for them); 9.2% are all-positive
+  (permanently 1). Only the remaining 63.7% are GAUC-eligible.
+- The baseline has already captured ~30% of the reachable range. Remaining headroom is ~0.27.
+- A result near 1.0 indicates a leak or an evaluation bug, not a breakthrough.
+
+Measured dead ends. The organizers ran these and published the results. Do not spend an iteration
+rediscovering them:
+- Adding all 13 static feature domains scored 0.5940 versus 0.5950 for the 5-field baseline.
+  Worse, within noise. Feature breadth is not the bottleneck.
+- Embedding dimension k = 8 / 16 / 32 scored 0.5895 / 0.5902 / 0.5887. Capacity is not the
+  bottleneck either.
+- Purely user-side first-order terms contribute EXACTLY ZERO. Ranking happens within a user, so
+  any term constant across that user's rows cannot reorder them. User-side signal can only act
+  through crosses with item-side features.
+
+Where the headroom actually is, in the organizers' own priority order:
+1. The objective. Training uses pointwise log loss while GAUC and nDCG are ranking metrics. This
+   mismatch is the single largest known opportunity. Pairwise (BPR-style) or listwise (softmax
+   over the user's impressions) objectives align the loss with the metric. Softmax cross-entropy
+   is a convex bound on NDCG and is NDCG-consistent (Bruch et al., ICTIR 2019).
+2. User behaviour sequences. The current features use no history at all; DIN/SIM-style interest
+   modelling is untouched.
+3. Multi-task auxiliaries drawn from the other logged feedback signals.
+4. Watch-time modelling as censored regression (watch time is truncated when a video completes,
+   so a one-sided loss is more faithful than squared error).
+5. Architecture swaps (DeepFM / DCN / xDeepFM). Deprioritised, since capacity is measured flat.
+6. Temporal features and train/evaluation drift.
+
+Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
+user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive
+row uniformly from GAUC-eligible users, then a negative uniformly from that same user's logged
+negatives, and optimise `softplus(-(s_positive - s_negative))`. Sampling users uniformly, or
+sampling uniformly across all pairs, or sampling unexposed catalogue items, each optimises a
+different quantity than the one being scored.
+
+Slate sizes: median 4 impressions per user, 90th percentile 12. Because most slates are shorter
+than 5, an nDCG@5 top-K truncation is inert for the majority of users; the gain concentrates in
+GAUC-eligible mixed-label users."""
+
+_PACKAGES: Final = """Execution environment
+
+Available: `numpy` (import as `np`), plus the Python standard library minus the forbidden import
+roots supplied in the request. You have `math`, `json`, `dataclasses`, `typing`, `collections`,
+`itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.
+You do NOT have `os`, `sys`, `pickle`, `shutil`, `glob`, `tempfile`, `importlib`,
+`multiprocessing`, or any network library. The forbidden check is on the FIRST dotted component,
+so `import os.path` is rejected for the same reason as `import os`. Relative imports between your
+own files (`from . import helper`) are permitted.
+
+Serialize checkpoints with `numpy` (`np.savez`), never with `pickle`. Take every path from the
+parsed request object; never construct one with `os.path`.
+
+Naming, which is a common and costly mistake. Your request context includes an organizer artifact
+manifest listing `baseline.py`, `data.py`, `evaluate.py`, `submit.py`, `ablation_features.py`,
+`baseline_scores.json` and `README.md`. Those are immutable ORGANIZER REFERENCE FILES that already
+exist. They are named there so you know what the benchmark is, NOT as files for you to write. Four
+of them are reserved basenames and returning one is rejected outright before your code is ever
+run. Name a helper module after the mechanism it implements -- `pairwise_sampler.py`,
+`user_grouping.py` -- never after a starter-kit file.
+
+Fixed output paths, pinned by the trusted protocol and verified after your process exits:
+- Training writes its checkpoint to `checkpoint/model.txt`. The extension does not constrain the
+  bytes; a NumPy archive at that path is correct. Any other path fails validation.
+- Prediction writes `scores.npy` as little-endian float64.
+
+The training request supplies `seed` and `user_groups_handle` alongside `features_handle` and
+`targets_handle`. The request key set is checked exactly, so a parser that omits either key fails
+before your model runs."""
+
+_WORKED_EXAMPLE: Final = '''Worked example
+
+Parent `candidate.py` contains, among other definitions:
+
+```python
+def fit_scores(features, targets, *, seed):
+    """Pointwise logistic objective over all rows."""
+    weights = np.zeros(features.shape[1], dtype=np.float64)
+    for _ in range(EPOCHS):
+        margins = features @ weights
+        residual = _sigmoid(margins) - targets
+        weights -= LEARNING_RATE * (features.T @ residual) / features.shape[0]
+    return weights
+```
+
+A valid response replaces that function body with a genuinely different mechanism:
+
+```python
+def fit_scores(features, targets, *, seed):
+    """GAUC-weighted pairwise objective over same-user logged pairs."""
+    rng = np.random.default_rng(seed)
+    weights = np.zeros(features.shape[1], dtype=np.float64)
+    positives, negatives = _sample_user_pairs(features, targets, rng)
+    for _ in range(EPOCHS):
+        gaps = (features[positives] - features[negatives]) @ weights
+        grad = -_sigmoid(-gaps)
+        update = (features[positives] - features[negatives]).T @ grad
+        weights -= LEARNING_RATE * update / positives.size
+    return weights
+```
+
+and declares:
+
+```json
+{"material_symbols": ["fit_scores", "_sample_user_pairs"]}
+```
+
+That is accepted because `fit_scores` is a top-level function whose body changed, and
+`_sample_user_pairs` is a newly added top-level function reachable from `candidate.py`.
+
+Contrast — each of these is REJECTED:
+- Declaring `["LEARNING_RATE"]` after changing only that constant. Not a top-level def or class.
+- Declaring `["fit_scores"]` after editing only its docstring. Docstrings are stripped first.
+- Declaring `["candidate.py:fit_scores"]`. Qualified names never match; use the bare name.
+- Adding `sampling.py` with the new logic but not importing it from `candidate.py`. Unreachable.'''
+
 _OPERATION: Final = {
     ResearchOperation.PROPOSE: (
         "Propose one falsifiable principal scientific change. Keep it within remaining resource "
@@ -46,6 +171,16 @@ resolving the stated local failure; the rejected package is inert evidence, not 
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
 next experiment using the typed recommendation vocabulary.""",
 }
+
+# PROPOSE and REFLECT emit no files, so they are not charged for the environment notes or the
+# worked example. Every operation that reasons about the science receives the briefing.
+_SECTIONS: Final = {
+    ResearchOperation.PROPOSE: (_BENCHMARK,),
+    ResearchOperation.IMPLEMENT: (_PACKAGES, _WORKED_EXAMPLE, _BENCHMARK),
+    ResearchOperation.REPAIR: (_PACKAGES, _WORKED_EXAMPLE),
+    ResearchOperation.REFLECT: (_BENCHMARK,),
+}
+
 
 
 def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
@@ -111,7 +246,8 @@ def instructions_for(
         in {ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR}
         else ""
     )
-    return f"{_COMMON}\n\n{_OPERATION[operation]}{policy}{retry}"
+    sections = "".join(f"\n\n{section}" for section in _SECTIONS[operation])
+    return f"{_COMMON}{sections}\n\n{_OPERATION[operation]}{policy}{retry}"
 
 
 __all__ = ["PROMPT_VERSION", "instructions_for"]
