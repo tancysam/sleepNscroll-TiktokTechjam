@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import re
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -34,9 +36,11 @@ from kuairand_agent.research.materialize import (
     MaterializedCandidate,
     materialize_candidate,
     require_material_executable_change,
+    snapshot_materialized_candidate,
     validate_candidate_static,
 )
 from kuairand_agent.research.schemas import (
+    FailureCategory,
     GeneratedFile,
     GeneratedPackage,
     ImplementationRequest,
@@ -44,6 +48,8 @@ from kuairand_agent.research.schemas import (
     ParentSourceFile,
     Proposal,
     ProposalRequest,
+    RejectedPackageSnapshot,
+    RepairRequest,
     RequiredField,
     ResearchOperation,
     canonical_digest,
@@ -55,6 +61,7 @@ from kuairand_agent.research.scripted import (
     ScriptedResearchModel,
     ScriptedResponse,
 )
+from kuairand_agent.research.source_policy import CandidateManifestPolicyError
 
 SCRIPTED_PRODUCTION_SCHEMA_VERSION: Final = 1
 SCRIPTED_CANDIDATE_ID: Final = "generated-causal-lambdarank-v1"
@@ -72,6 +79,228 @@ def predict_scores(features, checkpoint_text):
 
 class ProductionResearchError(RuntimeError):
     """The frozen scripted production lineage cannot be constructed exactly."""
+
+
+_FAILURE_DIAGNOSTIC_LIMIT: Final = 2_000
+_FAILURE_SUBJECT_LIMIT: Final = 160
+_SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _bounded_failure_text(value: str, *, maximum: int) -> str:
+    normalized = " ".join(
+        "".join(character if 32 <= ord(character) < 127 else " " for character in value).split()
+    )
+    return normalized[:maximum] or "unspecified"
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchFailureObservation:
+    """Bounded, normalized evidence for one failed live-research admission stage."""
+
+    stage: str
+    category: str
+    code: str
+    subject: str
+    fingerprint: str
+    diagnostic: str
+
+    def __post_init__(self) -> None:
+        for name in ("stage", "category", "code"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or len(value) > 64:
+                raise ProductionResearchError(f"failure observation {name} is invalid")
+        if type(self.subject) is not str or not self.subject or len(self.subject) > 160:
+            raise ProductionResearchError("failure observation subject is invalid")
+        if type(self.fingerprint) is not str or _SHA256_RE.fullmatch(self.fingerprint) is None:
+            raise ProductionResearchError("failure observation fingerprint is invalid")
+        if (
+            type(self.diagnostic) is not str
+            or not self.diagnostic
+            or len(self.diagnostic) > _FAILURE_DIAGNOSTIC_LIMIT
+        ):
+            raise ProductionResearchError("failure observation diagnostic is invalid")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        stage: str,
+        category: str,
+        code: str,
+        subject: str,
+        diagnostic: str,
+    ) -> ResearchFailureObservation:
+        bounded_stage = _bounded_failure_text(stage, maximum=64)
+        bounded_category = _bounded_failure_text(category, maximum=64)
+        bounded_code = _bounded_failure_text(code, maximum=64)
+        bounded_subject = _bounded_failure_text(subject, maximum=_FAILURE_SUBJECT_LIMIT)
+        bounded_diagnostic = _bounded_failure_text(diagnostic, maximum=_FAILURE_DIAGNOSTIC_LIMIT)
+        fingerprint = canonical_digest(
+            {
+                "schema_version": 1,
+                "stage": bounded_stage,
+                "category": bounded_category,
+                "code": bounded_code,
+                "subject": bounded_subject,
+            }
+        )
+        return cls(
+            stage=bounded_stage,
+            category=bounded_category,
+            code=bounded_code,
+            subject=bounded_subject,
+            fingerprint=fingerprint,
+            diagnostic=bounded_diagnostic,
+        )
+
+    def to_wire(self) -> dict[str, str]:
+        return {
+            "stage": self.stage,
+            "category": self.category,
+            "code": self.code,
+            "subject": self.subject,
+            "fingerprint": self.fingerprint,
+            "diagnostic": self.diagnostic,
+        }
+
+
+def _quoted_failure_subject(diagnostic: str) -> str:
+    match = re.search(r"'([^'\r\n]{1,160})'", diagnostic)
+    return match.group(1) if match is not None else "candidate"
+
+
+def _observe_candidate_failure(
+    error: CandidateMaterializationError | CandidateStaticError,
+) -> ResearchFailureObservation:
+    diagnostic = str(error)
+    lowered = diagnostic.lower()
+    subject = _quoted_failure_subject(diagnostic)
+    if isinstance(error, CandidateMaterializationError):
+        stage = "materialization"
+        category = "static_policy"
+        if "reserved candidate filename" in lowered:
+            code = "reserved_filename"
+        elif "suffix is not allowed" in lowered:
+            code = "unsupported_suffix"
+        elif "path" in lowered and "unsafe" in lowered:
+            code = "unsafe_path"
+        elif "byte limit" in lowered:
+            code = "package_byte_limit"
+        elif "file-count limit" in lowered:
+            code = "package_file_limit"
+        else:
+            code = "materialization_rejected"
+    elif "material symbol" in lowered or "material executable-source" in lowered:
+        stage = "materiality"
+        category = "materiality"
+        code = "declared_symbol_unchanged" if "did not change" in lowered else "no_material_change"
+    else:
+        stage = "static_validation"
+        category = "static_policy"
+        if "forbidden import" in lowered:
+            code = "forbidden_import"
+        elif "forbidden call" in lowered:
+            code = "forbidden_call"
+        elif "invalid python" in lowered:
+            code = "invalid_python"
+        elif "invalid json" in lowered:
+            code = "invalid_json"
+        elif "entry point" in lowered:
+            code = "missing_entrypoint"
+        else:
+            code = "static_validation_rejected"
+    return ResearchFailureObservation.create(
+        stage=stage,
+        category=category,
+        code=code,
+        subject=subject,
+        diagnostic=diagnostic,
+    )
+
+
+def _proposal_family(proposal: Proposal) -> str:
+    scientific_text = " ".join(
+        (proposal.objective, proposal.mechanism, proposal.principal_change)
+    ).lower()
+    families = (
+        ("pairwise", ("pairwise", "bpr")),
+        ("listwise", ("listwise", "lambdarank", "lambda rank")),
+        ("duration-bucket", ("duration bucket", "duration-bucket")),
+        ("user-balanced", ("user balanced", "user-balanced")),
+    )
+    for family, markers in families:
+        if any(marker in scientific_text for marker in markers):
+            return family
+    normalized = re.sub(r"[^a-z0-9]+", "-", proposal.objective.lower()).strip("-")
+    return normalized[:64] or "unknown"
+
+
+def _proposal_signature(proposal: Proposal) -> str:
+    return canonical_digest(
+        {
+            "schema_version": 1,
+            "parent_candidate_id": proposal.parent_candidate_id,
+            "principal_change": proposal.principal_change,
+            "objective": proposal.objective,
+            "sampling": proposal.sampling,
+            "grouping": proposal.grouping,
+            "weighting": proposal.weighting,
+            "files_expected": list(proposal.files_expected),
+            "required_fields": [field.to_wire() for field in proposal.required_fields],
+        }
+    )
+
+
+def _proposal_family_is_blocked(safe_context: SafeResearchContext, *, proposal_family: str) -> bool:
+    records = safe_context.to_wire().get("campaign_records", [])
+    if not isinstance(records, list):
+        return False
+    for raw_record in records:
+        if not isinstance(raw_record, Mapping):
+            continue
+        values = raw_record.get("values")
+        if (
+            isinstance(values, Mapping)
+            and values.get("proposal_family_blocked") is True
+            and values.get("proposal_family") == proposal_family
+        ):
+            return True
+    return False
+
+
+class LiveResearchBranchRejected(ProductionResearchError):
+    """One generated live-research branch exhausted its bounded repair allowance."""
+
+    def __init__(
+        self,
+        *,
+        failed_candidate_id: str,
+        repairs_attempted: int,
+        diagnostic: str,
+        root_failure: ResearchFailureObservation | None = None,
+        terminal_failure: ResearchFailureObservation | None = None,
+        proposal_family: str = "unknown",
+        proposal_signature: str = "",
+    ) -> None:
+        legacy_failure = ResearchFailureObservation.create(
+            stage="research_admission",
+            category="research_admission",
+            code="branch_rejected",
+            subject=failed_candidate_id,
+            diagnostic=diagnostic,
+        )
+        root = root_failure or terminal_failure or legacy_failure
+        terminal = terminal_failure or root
+        super().__init__(terminal.diagnostic)
+        self.failed_candidate_id = failed_candidate_id
+        self.repairs_attempted = repairs_attempted
+        self.diagnostic = terminal.diagnostic
+        self.root_failure = root
+        self.terminal_failure = terminal
+        self.proposal_family = _bounded_failure_text(proposal_family, maximum=64)
+        if proposal_signature and _SHA256_RE.fullmatch(proposal_signature) is None:
+            raise ProductionResearchError("proposal signature must be SHA-256 when present")
+        self.proposal_signature = proposal_signature
 
 
 def load_parent_snapshot(parent_dir: Path, *, candidate_id: str) -> ParentSnapshot:
@@ -747,25 +976,35 @@ def _live_transcript_bytes(
     proposal_request: ProposalRequest,
     proposal: Proposal,
     implementation_request: ImplementationRequest,
-    package: GeneratedPackage,
+    implementation_package: GeneratedPackage,
+    repair_calls: tuple[tuple[RepairRequest, GeneratedPackage], ...],
 ) -> bytes:
+    calls: list[dict[str, object]] = [
+        {
+            "operation": ResearchOperation.PROPOSE.value,
+            "request": proposal_request.to_wire(),
+            "response": proposal.to_wire(),
+        },
+        {
+            "operation": ResearchOperation.IMPLEMENT.value,
+            "request": implementation_request.to_wire(),
+            "response": implementation_package.to_wire(),
+        },
+    ]
+    calls.extend(
+        {
+            "operation": ResearchOperation.REPAIR.value,
+            "request": request.to_wire(),
+            "response": response.to_wire(),
+        }
+        for request, response in repair_calls
+    )
     return canonical_json_bytes(
         {
             "schema_version": SCRIPTED_PRODUCTION_SCHEMA_VERSION,
             "provider": provider,
             "live_provider_used": True,
-            "calls": [
-                {
-                    "operation": ResearchOperation.PROPOSE.value,
-                    "request": proposal_request.to_wire(),
-                    "response": proposal.to_wire(),
-                },
-                {
-                    "operation": ResearchOperation.IMPLEMENT.value,
-                    "request": implementation_request.to_wire(),
-                    "response": package.to_wire(),
-                },
-            ],
+            "calls": calls,
         }
     )
 
@@ -814,7 +1053,9 @@ def prepare_or_rehydrate_live_lineage(
     record_path = generated_root / f"iteration-{scientific_iteration:02d}-lineage.json"
     proposal_request_id = f"iteration-{scientific_iteration:02d}-propose"
     implementation_request_id = f"iteration-{scientific_iteration:02d}-implement"
-    if record_path.exists() or record_path.is_symlink():
+    rehydrating = record_path.exists() or record_path.is_symlink()
+    repair_calls: list[tuple[RepairRequest, GeneratedPackage]] = []
+    if rehydrating:
         try:
             record_metadata = record_path.lstat()
             raw = parse_json_object(record_path.read_text(encoding="utf-8"))
@@ -831,6 +1072,8 @@ def prepare_or_rehydrate_live_lineage(
             "safe_context_digest",
             "candidate_id",
             "proposal",
+            "implementation_package",
+            "repair_calls",
             "package",
         }
         if set(raw) != expected_fields:
@@ -845,10 +1088,33 @@ def prepare_or_rehydrate_live_lineage(
         ):
             raise ProductionResearchError("live research lineage identity differs on resume")
         proposal_raw = raw["proposal"]
+        implementation_package_raw = raw["implementation_package"]
+        repair_calls_raw = raw["repair_calls"]
         package_raw = raw["package"]
-        if not isinstance(proposal_raw, dict) or not isinstance(package_raw, dict):
+        if (
+            not isinstance(proposal_raw, dict)
+            or not isinstance(implementation_package_raw, dict)
+            or not isinstance(repair_calls_raw, list)
+            or not isinstance(package_raw, dict)
+        ):
             raise ProductionResearchError("live research lineage responses are malformed")
         proposal = Proposal.from_mapping(cast(dict[str, object], proposal_raw))
+        implementation_package = GeneratedPackage.from_mapping(
+            cast(dict[str, object], implementation_package_raw)
+        )
+        for index, call_raw in enumerate(repair_calls_raw):
+            if not isinstance(call_raw, dict) or set(call_raw) != {"request", "response"}:
+                raise ProductionResearchError(f"live research repair call {index} is malformed")
+            request_raw = call_raw["request"]
+            response_raw = call_raw["response"]
+            if not isinstance(request_raw, dict) or not isinstance(response_raw, dict):
+                raise ProductionResearchError(f"live research repair call {index} is malformed")
+            repair_calls.append(
+                (
+                    RepairRequest.from_mapping(cast(dict[str, object], request_raw)),
+                    GeneratedPackage.from_mapping(cast(dict[str, object], response_raw)),
+                )
+            )
         package = GeneratedPackage.from_mapping(cast(dict[str, object], package_raw))
         candidate_id_raw = raw["candidate_id"]
         if type(candidate_id_raw) is not str:
@@ -863,30 +1129,58 @@ def prepare_or_rehydrate_live_lineage(
             safe_context=safe_context.to_wire(),
         )
         proposal = model.propose(proposal_request)
+        candidate_id = f"candidate-{scientific_iteration:02d}-{proposal.digest[:16]}"
+        proposal_family = _proposal_family(proposal)
+        try:
+            proposal_request.source_policy.validate_manifest(
+                proposal.files_expected,
+                require_final_entrypoint=True,
+            )
+        except CandidateManifestPolicyError as exc:
+            failure = ResearchFailureObservation.create(
+                stage="proposal_admission",
+                category="static_policy",
+                code="candidate_source_policy",
+                subject=exc.fingerprint,
+                diagnostic=str(exc),
+            )
+            raise LiveResearchBranchRejected(
+                failed_candidate_id=candidate_id,
+                repairs_attempted=0,
+                diagnostic=str(exc),
+                root_failure=failure,
+                terminal_failure=failure,
+                proposal_family=proposal_family,
+                proposal_signature=_proposal_signature(proposal),
+            ) from exc
+        if _proposal_family_is_blocked(safe_context, proposal_family=proposal_family):
+            diagnostic = (
+                f"proposal family {proposal_family!r} is blocked by prior admission evidence"
+            )
+            failure = ResearchFailureObservation.create(
+                stage="proposal_admission",
+                category="novelty_policy",
+                code="proposal_family_blocked",
+                subject=proposal_family,
+                diagnostic=diagnostic,
+            )
+            raise LiveResearchBranchRejected(
+                failed_candidate_id=candidate_id,
+                repairs_attempted=0,
+                diagnostic=diagnostic,
+                root_failure=failure,
+                terminal_failure=failure,
+                proposal_family=proposal_family,
+                proposal_signature=_proposal_signature(proposal),
+            )
         implementation_request = ImplementationRequest.create(
             request_id=implementation_request_id,
             proposal=proposal,
             parent=parent,
             safe_context=safe_context.to_wire(),
         )
-        package = model.implement(implementation_request)
-        candidate_id = f"candidate-{scientific_iteration:02d}-{proposal.digest[:16]}"
-        _write_live_record(
-            record_path,
-            canonical_json_bytes(
-                {
-                    "schema_version": SCRIPTED_PRODUCTION_SCHEMA_VERSION,
-                    "provider": provider,
-                    "campaign_id": campaign_id,
-                    "scientific_iteration": scientific_iteration,
-                    "parent_digest": parent.digest,
-                    "safe_context_digest": safe_context.digest,
-                    "candidate_id": candidate_id,
-                    "proposal": proposal.to_wire(),
-                    "package": package.to_wire(),
-                }
-            ),
-        )
+        implementation_package = model.implement(implementation_request)
+        package = implementation_package
 
     proposal_request = ProposalRequest.create(
         request_id=proposal_request_id,
@@ -903,16 +1197,110 @@ def prepare_or_rehydrate_live_lineage(
         parent=parent,
         safe_context=safe_context.to_wire(),
     )
-    if package.request_id != implementation_request.request_id:
+    if implementation_package.request_id != implementation_request.request_id:
         raise ProductionResearchError("live generated package names a different request")
-    destination = generated_root / candidate_id
-    if destination.exists() or destination.is_symlink():
+    causative_package = implementation_package
+    base_candidate_id = candidate_id.rsplit("-repair-", 1)[0] if repair_calls else candidate_id
+    for index, (repair_request, repair_package) in enumerate(repair_calls, start=1):
+        rejected_package = repair_request.rejected_package
+        expected_failed_candidate_id = (
+            base_candidate_id if index == 1 else f"{base_candidate_id}-repair-{index - 1}"
+        )
+        if (
+            repair_request.proposal_id != proposal.proposal_id
+            or repair_request.safe_context_digest != safe_context.digest
+            or repair_request.request_id != f"iteration-{scientific_iteration:02d}-repair-{index}"
+            or repair_request.failed_candidate_id != expected_failed_candidate_id
+            or repair_package.request_id != repair_request.request_id
+            or repair_request.remaining_repairs != min(proposal.maximum_repairs, 2) - index + 1
+            or rejected_package is None
+            or rejected_package.to_generated_package() != causative_package
+        ):
+            raise ProductionResearchError("live research repair lineage is inconsistent")
+        causative_package = repair_package
+    expected_final_package = repair_calls[-1][1] if repair_calls else implementation_package
+    if package != expected_final_package:
+        raise ProductionResearchError("live research final package differs from its call lineage")
+
+    candidate: MaterializedCandidate
+    if rehydrating:
+        destination = generated_root / candidate_id
         candidate = _describe_expected_candidate(parent, package, destination)
         _verify_exact_generated_tree(candidate)
+        validate_candidate_static(candidate)
+        material_change = require_material_executable_change(parent, candidate)
     else:
-        candidate = materialize_candidate(parent, package, destination)
-    validate_candidate_static(candidate)
-    material_change = require_material_executable_change(parent, candidate)
+        maximum_repairs = min(proposal.maximum_repairs, 2)
+        base_candidate_id = candidate_id
+        root_failure: ResearchFailureObservation | None = None
+        while True:
+            destination = generated_root / candidate_id
+            attempted_candidate: MaterializedCandidate | None = None
+            try:
+                attempted_candidate = materialize_candidate(parent, package, destination)
+                candidate = attempted_candidate
+                validate_candidate_static(candidate)
+                material_change = require_material_executable_change(parent, candidate)
+                break
+            except (CandidateMaterializationError, CandidateStaticError) as exc:
+                observed_failure = _observe_candidate_failure(exc)
+                if root_failure is None:
+                    root_failure = observed_failure
+                if len(repair_calls) >= maximum_repairs:
+                    raise LiveResearchBranchRejected(
+                        failed_candidate_id=candidate_id,
+                        repairs_attempted=len(repair_calls),
+                        diagnostic=str(exc),
+                        root_failure=root_failure,
+                        terminal_failure=observed_failure,
+                        proposal_family=_proposal_family(proposal),
+                        proposal_signature=_proposal_signature(proposal),
+                    ) from exc
+                failed_child = (
+                    snapshot_materialized_candidate(attempted_candidate, candidate_id=candidate_id)
+                    if attempted_candidate is not None
+                    else parent
+                )
+                repair_number = len(repair_calls) + 1
+                repair_request = RepairRequest.create(
+                    request_id=(f"iteration-{scientific_iteration:02d}-repair-{repair_number}"),
+                    proposal_id=proposal.proposal_id,
+                    failed_candidate_id=candidate_id,
+                    failed_child=failed_child,
+                    failure_category=FailureCategory.STATIC_POLICY,
+                    diagnostics=str(exc),
+                    remaining_repairs=maximum_repairs - len(repair_calls),
+                    safe_context=safe_context.to_wire(),
+                    rejected_package=RejectedPackageSnapshot.from_generated_package(package),
+                )
+                repair_package = model.repair(repair_request)
+                if repair_package.request_id != repair_request.request_id:
+                    raise ProductionResearchError(
+                        "live repaired package names a different request"
+                    ) from exc
+                repair_calls.append((repair_request, repair_package))
+                package = repair_package
+                candidate_id = f"{base_candidate_id}-repair-{repair_number}"
+
+        pending_record_payload = canonical_json_bytes(
+            {
+                "schema_version": SCRIPTED_PRODUCTION_SCHEMA_VERSION,
+                "provider": provider,
+                "campaign_id": campaign_id,
+                "scientific_iteration": scientific_iteration,
+                "parent_digest": parent.digest,
+                "safe_context_digest": safe_context.digest,
+                "candidate_id": candidate_id,
+                "proposal": proposal.to_wire(),
+                "implementation_package": implementation_package.to_wire(),
+                "repair_calls": [
+                    {"request": request.to_wire(), "response": response.to_wire()}
+                    for request, response in repair_calls
+                ],
+                "package": package.to_wire(),
+            }
+        )
+        _write_live_record(record_path, pending_record_payload)
     source_snapshot = artifact_store.put_directory(destination, kind=ArtifactKind.SOURCE)
     by_path = {entry.path: entry.artifact for entry in source_snapshot.entries}
     config_artifact = by_path.get("config.json")
@@ -926,7 +1314,8 @@ def prepare_or_rehydrate_live_lineage(
         proposal_request=proposal_request,
         proposal=proposal,
         implementation_request=implementation_request,
-        package=package,
+        implementation_package=implementation_package,
+        repair_calls=tuple(repair_calls),
     )
     transcript_artifact = artifact_store.put_bytes(transcript_bytes, kind=ArtifactKind.LOG)
     identity = GeneratedCandidateIdentity(
@@ -955,7 +1344,11 @@ def prepare_or_rehydrate_live_lineage(
             ScriptedCall(
                 ResearchOperation.IMPLEMENT,
                 implementation_request.digest,
-                package.digest,
+                implementation_package.digest,
+            ),
+            *(
+                ScriptedCall(ResearchOperation.REPAIR, request.digest, response.digest)
+                for request, response in repair_calls
             ),
         ),
     )
@@ -969,8 +1362,10 @@ __all__ = [
     "SCRIPTED_CANDIDATE_ID",
     "SCRIPTED_PARENT_ID",
     "SCRIPTED_PRODUCTION_SCHEMA_VERSION",
+    "LiveResearchBranchRejected",
     "LiveResearchLineage",
     "ProductionResearchError",
+    "ResearchFailureObservation",
     "ScriptedLambdaRankLineage",
     "load_parent_snapshot",
     "prepare_or_rehydrate_live_lineage",

@@ -13,7 +13,12 @@ from typing import Final
 from kuairand_agent import __version__
 from kuairand_agent.campaign import CampaignControllerError, CampaignEngine, CampaignStatus
 from kuairand_agent.campaign.provenance import ProvenanceError, build_campaign_request
-from kuairand_agent.config import ConfigError, load_config
+from kuairand_agent.config import (
+    ConfigError,
+    OpenAIFailoverResearchConfig,
+    OpenAIResearchConfig,
+    load_config,
+)
 from kuairand_agent.contract import OrganizerIntegrityError, verify_starter_kit
 from kuairand_agent.data.acquire import (
     ArchiveIntegrityError,
@@ -93,6 +98,35 @@ def _preflight_provider(args: argparse.Namespace) -> int:
         )
         return EXIT_INVALID
     openai = config.research.openai
+    if isinstance(openai, OpenAIResearchConfig):
+        model: str | None = openai.model
+        credential_env: str | None = openai.api_key_env
+        provider_profiles: list[dict[str, object]] = [
+            {
+                "slot": "main",
+                "model": openai.model,
+                "base_url": openai.base_url,
+                "credential_env": openai.api_key_env,
+            }
+        ]
+    elif isinstance(openai, OpenAIFailoverResearchConfig):
+        model = None
+        credential_env = None
+        selected_model = selection.model
+        endpoint_models = getattr(selected_model, "provider_models", ())
+        provider_profiles = [
+            {
+                "slot": slot,
+                "model": endpoint.config.model,
+                "base_url": endpoint.config.base_url,
+                "credential_env": endpoint.config.api_key_env,
+            }
+            for slot, endpoint in endpoint_models
+        ]
+    else:
+        model = None
+        credential_env = None
+        provider_profiles = []
     payload = {
         "schema_version": 1,
         "status": "available",
@@ -100,8 +134,9 @@ def _preflight_provider(args: argparse.Namespace) -> int:
         "run_kind": config.research.run_kind,
         "provider": selection.provider,
         "live_provider_used": selection.live_provider_used,
-        "model": None if openai is None else openai.model,
-        "credential_env": None if openai is None else openai.api_key_env,
+        "model": model,
+        "credential_env": credential_env,
+        "provider_profiles": provider_profiles,
         "api_request_sent": False,
     }
     print(_stable_json(payload))

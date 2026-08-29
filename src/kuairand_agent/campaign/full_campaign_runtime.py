@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import resource
 import stat
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
@@ -161,15 +162,26 @@ from kuairand_agent.research.materialize import snapshot_materialized_candidate
 from kuairand_agent.research.production import (
     SCRIPTED_CANDIDATE_ID,
     SCRIPTED_PARENT_ID,
+    LiveResearchBranchRejected,
     LiveResearchLineage,
     ScriptedLambdaRankLineage,
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
     prepare_or_rehydrate_scripted_lambdarank_lineage,
 )
-from kuairand_agent.research.provider import OpenAIResponsesModel
+from kuairand_agent.research.provider import (
+    OpenAIChatCompletionsConfig,
+    OpenAIChatCompletionsModel,
+    OpenAIFailoverModel,
+    OpenAIProviderChainError,
+    OpenAIProviderError,
+    ProviderErrorCode,
+    ResponsesTransport,
+    RetryRuntime,
+)
 from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
+    ParentSnapshot,
     Reflection,
     ReflectionRequest,
     ResearchOperation,
@@ -186,6 +198,8 @@ from kuairand_agent.scoring.protected import (
 _SCHEMA_VERSION = 1
 _PRODUCTION_DIR = "production"
 _PORTFOLIO_REASON = "bounded_high_value_lambdarank_branch_prioritized"
+_REJECTION_JOURNAL_DIR = "controller-rejection-journal"
+_REJECTION_JOURNAL_LIMIT_BYTES = 65_536
 _SAFE_FOLD_FAILURE_OUTCOMES = frozenset(
     {
         ExecutionOutcome.TIMED_OUT,
@@ -1396,6 +1410,7 @@ class _AutonomousFollowupResult:
     reflection_response_digest: str
     reflection_transcript: ArtifactRef
     iterations_completed: int
+    rejected_records: tuple[AggregateRecord, ...]
 
 
 def _iteration_record(
@@ -1426,12 +1441,538 @@ def _iteration_record(
     )
 
 
-def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
-    if not isinstance(model, OpenAIResponsesModel):
-        return None
-    usage = model.total_usage
+def _rejected_lineage_record(
+    rejection: LiveResearchBranchRejected,
+    *,
+    scientific_iteration: int,
+    root_failure_total_count: int = 1,
+    root_failure_consecutive_count: int = 1,
+    proposal_family_attempt_count: int = 1,
+    proposal_family_blocked: bool = False,
+) -> AggregateRecord:
+    root = rejection.root_failure
+    terminal = rejection.terminal_failure
+    return AggregateRecord(
+        name=f"rejected_lineage_{scientific_iteration:02d}",
+        values={
+            "scientific_iteration": scientific_iteration,
+            "candidate_id": rejection.failed_candidate_id,
+            "branch_outcome": "rejected_before_execution",
+            "repairs_attempted": rejection.repairs_attempted,
+            "diagnostic": rejection.diagnostic[:4096],
+            "root_failure_stage": root.stage,
+            "root_failure_category": root.category,
+            "root_failure_code": root.code,
+            "root_failure_subject": root.subject,
+            "root_failure_fingerprint": root.fingerprint,
+            "root_failure_diagnostic": root.diagnostic,
+            "root_failure_total_count": root_failure_total_count,
+            "root_failure_consecutive_count": root_failure_consecutive_count,
+            "terminal_failure_stage": terminal.stage,
+            "terminal_failure_category": terminal.category,
+            "terminal_failure_code": terminal.code,
+            "terminal_failure_subject": terminal.subject,
+            "terminal_failure_fingerprint": terminal.fingerprint,
+            "terminal_failure_diagnostic": terminal.diagnostic,
+            "proposal_family": rejection.proposal_family,
+            "proposal_signature": rejection.proposal_signature or None,
+            "proposal_family_attempt_count": proposal_family_attempt_count,
+            "proposal_family_blocked": proposal_family_blocked,
+        },
+    )
+
+
+def _research_stage_counts(
+    *,
+    model: ResearchModel | None,
+    branches_attempted: int,
+    rejected_records: Sequence[AggregateRecord],
+    candidates_admitted: int,
+    training_started: int = 0,
+    inner_evaluations_completed: int = 0,
+    outer_evaluations_completed: int = 0,
+) -> dict[str, int]:
+    transcripts = (
+        model.transcripts
+        if isinstance(model, (OpenAIChatCompletionsModel, OpenAIFailoverModel))
+        else ()
+    )
+
+    def accepted(operation: ResearchOperation) -> int:
+        return sum(
+            item.operation is operation and item.outcome == "accepted" for item in transcripts
+        )
+
     return {
-        "model": model.config.model,
+        "branches_attempted": branches_attempted,
+        "proposal_responses_accepted": accepted(ResearchOperation.PROPOSE),
+        "implementation_responses_accepted": accepted(ResearchOperation.IMPLEMENT),
+        "repair_responses_accepted": accepted(ResearchOperation.REPAIR),
+        "branches_rejected_pre_execution": len(rejected_records),
+        "candidates_admitted": candidates_admitted,
+        "training_started": training_started,
+        "inner_evaluations_completed": inner_evaluations_completed,
+        "outer_evaluations_completed": outer_evaluations_completed,
+    }
+
+
+def _failure_count_rows(
+    records: Sequence[AggregateRecord],
+    *,
+    role: Literal["root", "terminal"],
+) -> tuple[list[dict[str, object]], bool]:
+    observed: dict[str, dict[str, object]] = {}
+    prefix = f"{role}_failure_"
+    for record in records:
+        fingerprint = record.values.get(f"{prefix}fingerprint")
+        if type(fingerprint) is not str:
+            continue
+        row = observed.setdefault(
+            fingerprint,
+            {
+                "fingerprint": fingerprint,
+                "stage": record.values.get(f"{prefix}stage"),
+                "category": record.values.get(f"{prefix}category"),
+                "code": record.values.get(f"{prefix}code"),
+                "subject": record.values.get(f"{prefix}subject"),
+                "count": 0,
+            },
+        )
+        row["count"] = cast(int, row["count"]) + 1
+    ordered = sorted(
+        observed.values(),
+        key=lambda item: (-cast(int, item["count"]), cast(str, item["fingerprint"])),
+    )
+    return ordered[:8], len(ordered) > 8
+
+
+def _research_rejection_summary(
+    records: Sequence[AggregateRecord],
+) -> dict[str, object]:
+    root_counts, root_truncated = _failure_count_rows(records, role="root")
+    terminal_counts, terminal_truncated = _failure_count_rows(records, role="terminal")
+    examples: list[dict[str, object]] = []
+    for record in reversed(records):
+        for role in ("terminal", "root"):
+            prefix = f"{role}_failure_"
+            fingerprint = record.values.get(f"{prefix}fingerprint")
+            diagnostic = record.values.get(f"{prefix}diagnostic")
+            if type(fingerprint) is not str or type(diagnostic) is not str:
+                continue
+            examples.append(
+                {
+                    "scientific_iteration": record.values.get("scientific_iteration"),
+                    "candidate_id": record.values.get("candidate_id"),
+                    "proposal_family": record.values.get("proposal_family"),
+                    "proposal_signature": record.values.get("proposal_signature"),
+                    "role": role,
+                    "fingerprint": fingerprint,
+                    "diagnostic": diagnostic,
+                }
+            )
+            if len(examples) == 6:
+                break
+        if len(examples) == 6:
+            break
+    return {
+        "branches_rejected_pre_execution": len(records),
+        "root_counts": root_counts,
+        "terminal_counts": terminal_counts,
+        "examples": examples,
+        "counts_truncated": root_truncated or terminal_truncated,
+        "examples_truncated": len(records) * 2 > len(examples),
+    }
+
+
+def _research_rejection_evidence(
+    records: Sequence[AggregateRecord],
+    *,
+    artifacts: ArtifactStore,
+) -> dict[str, object]:
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "records": [record.to_wire() for record in records],
+    }
+    ledger = artifacts.put_bytes(canonical_json_bytes(payload), kind=ArtifactKind.LOG)
+    return {
+        "research_rejection_summary": _research_rejection_summary(records),
+        "research_rejection_ledger": ledger.manifest(),
+    }
+
+
+def _rejection_journal_directory(generated_root: Path) -> Path:
+    try:
+        generated_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root_metadata = generated_root.lstat()
+    except OSError as exc:
+        raise FullCampaignError("generated-source root is unavailable") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise FullCampaignError("generated-source root must be a real directory")
+    journal = generated_root / _REJECTION_JOURNAL_DIR
+    try:
+        journal.mkdir(exist_ok=True, mode=0o700)
+        journal_metadata = journal.lstat()
+    except OSError as exc:
+        raise FullCampaignError("research rejection journal is unavailable") from exc
+    if stat.S_ISLNK(journal_metadata.st_mode) or not stat.S_ISDIR(journal_metadata.st_mode):
+        raise FullCampaignError("research rejection journal must be a real directory")
+    return journal
+
+
+def _rejection_journal_payload(
+    *,
+    campaign_id: str,
+    scientific_iteration: int,
+    record: AggregateRecord,
+    previous_journal_digest: str | None,
+) -> dict[str, object]:
+    record_wire = record.to_wire()
+    record_digest = _digest(b"kuairand-rejected-lineage-record-v1", record_wire)
+    unsigned = {
+        "schema_version": _SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "scientific_iteration": scientific_iteration,
+        "previous_journal_digest": previous_journal_digest,
+        "record_digest": record_digest,
+        "record": record_wire,
+    }
+    return unsigned | {"journal_digest": _digest(b"kuairand-rejection-journal-entry-v1", unsigned)}
+
+
+def _decode_rejection_journal_entry(
+    payload: bytes,
+    *,
+    campaign_id: str,
+    scientific_iteration: int,
+    previous_journal_digest: str | None,
+) -> tuple[AggregateRecord, str]:
+    if len(payload) > _REJECTION_JOURNAL_LIMIT_BYTES:
+        raise FullCampaignError("research rejection journal entry exceeds its byte limit")
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise FullCampaignError("research rejection journal entry is malformed") from exc
+    if not isinstance(decoded, dict) or payload != canonical_json_bytes(decoded):
+        raise FullCampaignError("research rejection journal entry is not exact canonical JSON")
+    expected_keys = {
+        "schema_version",
+        "campaign_id",
+        "scientific_iteration",
+        "previous_journal_digest",
+        "record_digest",
+        "record",
+        "journal_digest",
+    }
+    if set(decoded) != expected_keys:
+        raise FullCampaignError("research rejection journal entry has unexpected fields")
+    if (
+        decoded["schema_version"] != _SCHEMA_VERSION
+        or decoded["campaign_id"] != campaign_id
+        or decoded["scientific_iteration"] != scientific_iteration
+        or decoded["previous_journal_digest"] != previous_journal_digest
+    ):
+        raise FullCampaignError("research rejection journal identity is inconsistent")
+    record_wire = decoded["record"]
+    if (
+        not isinstance(record_wire, dict)
+        or set(record_wire) != {"name", "values"}
+        or type(record_wire["name"]) is not str
+        or not isinstance(record_wire["values"], dict)
+    ):
+        raise FullCampaignError("research rejection journal record is malformed")
+    record = AggregateRecord(record_wire["name"], record_wire["values"])
+    if (
+        record.name != f"rejected_lineage_{scientific_iteration:02d}"
+        or record.values.get("scientific_iteration") != scientific_iteration
+    ):
+        raise FullCampaignError("research rejection journal iteration is inconsistent")
+    expected_record_digest = _digest(b"kuairand-rejected-lineage-record-v1", record.to_wire())
+    unsigned = {key: decoded[key] for key in expected_keys - {"journal_digest"}}
+    expected_journal_digest = _digest(b"kuairand-rejection-journal-entry-v1", unsigned)
+    if (
+        decoded["record_digest"] != expected_record_digest
+        or decoded["journal_digest"] != expected_journal_digest
+    ):
+        raise FullCampaignError("research rejection journal digest is inconsistent")
+    return record, cast(str, decoded["journal_digest"])
+
+
+def _load_rejection_journal(
+    generated_root: Path,
+    *,
+    campaign_id: str,
+    maximum_iterations: int,
+) -> tuple[list[AggregateRecord], str | None]:
+    journal = _rejection_journal_directory(generated_root)
+    try:
+        entries = tuple(sorted(journal.iterdir()))
+    except OSError as exc:
+        raise FullCampaignError("research rejection journal cannot be listed") from exc
+    if len(entries) > maximum_iterations:
+        raise FullCampaignError("research rejection journal exceeds the campaign iteration cap")
+    records: list[AggregateRecord] = []
+    previous_digest: str | None = None
+    for iteration, path in enumerate(entries, start=1):
+        expected_name = f"rejection-{iteration:02d}.json"
+        try:
+            metadata = path.lstat()
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise FullCampaignError("research rejection journal entry is unavailable") from exc
+        if (
+            path.name != expected_name
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise FullCampaignError("research rejection journal is not a contiguous file ledger")
+        record, previous_digest = _decode_rejection_journal_entry(
+            payload,
+            campaign_id=campaign_id,
+            scientific_iteration=iteration,
+            previous_journal_digest=previous_digest,
+        )
+        records.append(record)
+    return records, previous_digest
+
+
+def _persist_rejection_journal_entry(
+    generated_root: Path,
+    *,
+    campaign_id: str,
+    scientific_iteration: int,
+    record: AggregateRecord,
+    previous_journal_digest: str | None,
+) -> str:
+    journal = _rejection_journal_directory(generated_root)
+    payload = canonical_json_bytes(
+        _rejection_journal_payload(
+            campaign_id=campaign_id,
+            scientific_iteration=scientific_iteration,
+            record=record,
+            previous_journal_digest=previous_journal_digest,
+        )
+    )
+    if len(payload) > _REJECTION_JOURNAL_LIMIT_BYTES:
+        raise FullCampaignError("research rejection journal entry exceeds its byte limit")
+    path = journal / f"rejection-{scientific_iteration:02d}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        try:
+            retained = path.read_bytes()
+        except OSError as exc:
+            raise FullCampaignError("retained research rejection entry is unavailable") from exc
+        if retained != payload:
+            raise FullCampaignError(
+                "retained research rejection entry differs from replay"
+            ) from None
+    except OSError as exc:
+        raise FullCampaignError("research rejection entry cannot be persisted") from exc
+    else:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o400)
+        try:
+            directory_descriptor = os.open(journal, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as exc:
+            raise FullCampaignError("research rejection journal cannot be synchronized") from exc
+    _, journal_digest = _decode_rejection_journal_entry(
+        payload,
+        campaign_id=campaign_id,
+        scientific_iteration=scientific_iteration,
+        previous_journal_digest=previous_journal_digest,
+    )
+    return journal_digest
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveLineagePreparation:
+    status: Literal[
+        "accepted",
+        "admission_closed",
+        "portfolio_exhausted",
+        "repeated_pre_admission_failure",
+        "provider_unavailable",
+    ]
+    lineage: LiveResearchLineage | None
+    safe_context: SafeResearchContext | None
+    scientific_iteration: int | None
+    rejected_records: tuple[AggregateRecord, ...]
+    branches_attempted: int
+    provider_error: OpenAIProviderError | None = None
+
+
+def _prepare_live_lineage_portfolio(
+    *,
+    campaign_id: str,
+    parent: ParentSnapshot,
+    generated_root: Path,
+    artifact_store: ArtifactStore,
+    model: ResearchModel,
+    provider: str,
+    maximum_iterations: int,
+    safe_context_factory: Callable[[tuple[AggregateRecord, ...]], SafeResearchContext],
+    continue_check: Callable[[], bool],
+) -> _LiveLineagePreparation:
+    """Prepare one valid lineage or return an exact, evidence-preserving closure reason."""
+
+    rejected, previous_journal_digest = _load_rejection_journal(
+        generated_root,
+        campaign_id=campaign_id,
+        maximum_iterations=maximum_iterations,
+    )
+    root_failure_totals: dict[str, int] = {}
+    proposal_family_attempts: dict[str, int] = {}
+    previous_root_fingerprint: str | None = None
+    consecutive_root_failures = 0
+    for retained_iteration, retained in enumerate(rejected, start=1):
+        root_fingerprint = retained.values.get("root_failure_fingerprint")
+        family = retained.values.get("proposal_family")
+        if type(root_fingerprint) is not str or type(family) is not str:
+            raise FullCampaignError("retained research rejection lacks typed identity")
+        root_total = root_failure_totals.get(root_fingerprint, 0) + 1
+        root_failure_totals[root_fingerprint] = root_total
+        if root_fingerprint == previous_root_fingerprint:
+            consecutive_root_failures += 1
+        else:
+            previous_root_fingerprint = root_fingerprint
+            consecutive_root_failures = 1
+        family_total = proposal_family_attempts.get(family, 0) + 1
+        proposal_family_attempts[family] = family_total
+        if (
+            retained.values.get("root_failure_total_count") != root_total
+            or retained.values.get("root_failure_consecutive_count") != consecutive_root_failures
+            or retained.values.get("proposal_family_attempt_count") != family_total
+            or retained.values.get("proposal_family_blocked") != (family_total >= 2)
+        ):
+            raise FullCampaignError("retained research rejection counters are inconsistent")
+        if root_total >= 3:
+            return _LiveLineagePreparation(
+                status="repeated_pre_admission_failure",
+                lineage=None,
+                safe_context=None,
+                scientific_iteration=None,
+                rejected_records=tuple(rejected),
+                branches_attempted=retained_iteration,
+            )
+    for iteration in range(len(rejected) + 1, maximum_iterations + 1):
+        if not continue_check():
+            return _LiveLineagePreparation(
+                status="admission_closed",
+                lineage=None,
+                safe_context=None,
+                scientific_iteration=None,
+                rejected_records=tuple(rejected),
+                branches_attempted=iteration - 1,
+            )
+        safe_context = safe_context_factory(tuple(rejected))
+        try:
+            lineage = prepare_or_rehydrate_live_lineage(
+                campaign_id=campaign_id,
+                scientific_iteration=iteration,
+                parent=parent,
+                generated_root=generated_root,
+                artifact_store=artifact_store,
+                safe_context=safe_context,
+                model=model,
+                provider=provider,
+            )
+        except OpenAIProviderError as error:
+            return _LiveLineagePreparation(
+                status="provider_unavailable",
+                lineage=None,
+                safe_context=None,
+                scientific_iteration=None,
+                rejected_records=tuple(rejected),
+                branches_attempted=iteration,
+                provider_error=error,
+            )
+        except LiveResearchBranchRejected as rejection:
+            root_fingerprint = rejection.root_failure.fingerprint
+            root_failure_total = root_failure_totals.get(root_fingerprint, 0) + 1
+            root_failure_totals[root_fingerprint] = root_failure_total
+            if root_fingerprint == previous_root_fingerprint:
+                consecutive_root_failures += 1
+            else:
+                previous_root_fingerprint = root_fingerprint
+                consecutive_root_failures = 1
+            family = rejection.proposal_family
+            family_attempt_count = proposal_family_attempts.get(family, 0) + 1
+            proposal_family_attempts[family] = family_attempt_count
+            record = _rejected_lineage_record(
+                rejection,
+                scientific_iteration=iteration,
+                root_failure_total_count=root_failure_total,
+                root_failure_consecutive_count=consecutive_root_failures,
+                proposal_family_attempt_count=family_attempt_count,
+                proposal_family_blocked=family_attempt_count >= 2,
+            )
+            previous_journal_digest = _persist_rejection_journal_entry(
+                generated_root,
+                campaign_id=campaign_id,
+                scientific_iteration=iteration,
+                record=record,
+                previous_journal_digest=previous_journal_digest,
+            )
+            rejected.append(record)
+            if root_failure_total >= 3:
+                return _LiveLineagePreparation(
+                    status="repeated_pre_admission_failure",
+                    lineage=None,
+                    safe_context=None,
+                    scientific_iteration=None,
+                    rejected_records=tuple(rejected),
+                    branches_attempted=iteration,
+                )
+            continue
+        return _LiveLineagePreparation(
+            status="accepted",
+            lineage=lineage,
+            safe_context=safe_context,
+            scientific_iteration=iteration,
+            rejected_records=tuple(rejected),
+            branches_attempted=iteration,
+        )
+    return _LiveLineagePreparation(
+        status="portfolio_exhausted",
+        lineage=None,
+        safe_context=None,
+        scientific_iteration=None,
+        rejected_records=tuple(rejected),
+        branches_attempted=maximum_iterations,
+    )
+
+
+def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
+    provider_models: tuple[tuple[str, OpenAIChatCompletionsModel], ...]
+    if isinstance(model, OpenAIChatCompletionsModel):
+        provider_models = (("main", model),)
+        active_slot = "main"
+        transcripts = model.transcripts
+        failovers: tuple[object, ...] = ()
+        usage = model.total_usage
+        active_model = model
+    elif isinstance(model, OpenAIFailoverModel):
+        provider_models = model.provider_models
+        active_slot = model.active_slot
+        transcripts = model.transcripts
+        failovers = tuple(item.to_wire() for item in model.failover_events)
+        usage = model.total_usage
+        active_model = model.active_model
+    else:
+        return None
+    return {
+        "model": active_model.config.model,
+        "base_url": active_model.config.base_url,
         "input_tokens": usage.input_tokens,
         "cached_input_tokens": usage.cached_input_tokens,
         "output_tokens": usage.output_tokens,
@@ -1439,9 +1980,45 @@ def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
         "total_tokens": usage.total_tokens,
         "estimated_cost_usd": usage.estimated_cost_usd,
         "unaccounted_attempts": usage.unaccounted_attempts,
-        "transcript_count": len(model.transcripts),
-        "provider_wall_seconds": round(sum(item.latency_seconds for item in model.transcripts), 6),
+        "retry_wait_seconds": round(usage.retry_wait_seconds, 6),
+        "transcript_count": len(transcripts),
+        "provider_wall_seconds": round(sum(item.latency_seconds for item in transcripts), 6),
+        "active_slot": active_slot,
+        "failover_count": len(failovers),
+        "failover_events": list(failovers),
+        "provider_chain": [
+            {
+                "slot": slot,
+                "model": endpoint.config.model,
+                "base_url": endpoint.config.base_url,
+                "credential_env": endpoint.config.api_key_env,
+                "input_tokens": endpoint.total_usage.input_tokens,
+                "cached_input_tokens": endpoint.total_usage.cached_input_tokens,
+                "output_tokens": endpoint.total_usage.output_tokens,
+                "reasoning_tokens": endpoint.total_usage.reasoning_tokens,
+                "total_tokens": endpoint.total_usage.total_tokens,
+                "estimated_cost_usd": endpoint.total_usage.estimated_cost_usd,
+                "unaccounted_attempts": endpoint.total_usage.unaccounted_attempts,
+                "retry_wait_seconds": round(endpoint.total_usage.retry_wait_seconds, 6),
+                "transcript_count": len(endpoint.transcripts),
+            }
+            for slot, endpoint in provider_models
+        ],
     }
+
+
+def _provider_transcripts(
+    model: OpenAIChatCompletionsModel | OpenAIFailoverModel,
+) -> tuple[object, ...]:
+    return tuple(json.loads(item.json_bytes) for item in model.transcripts)
+
+
+def _provider_credential_envs(
+    model: OpenAIChatCompletionsModel | OpenAIFailoverModel,
+) -> tuple[str, ...]:
+    if isinstance(model, OpenAIChatCompletionsModel):
+        return (model.config.api_key_env,)
+    return tuple(endpoint.config.api_key_env for _, endpoint in model.provider_models)
 
 
 def _run_autonomous_followups(
@@ -1463,6 +2040,7 @@ def _run_autonomous_followups(
     first_selection: FinalizationSelectionPlan | None,
     first_reflection: Reflection,
     first_reflection_evidence: tuple[str, str, ArtifactRef],
+    prior_records: tuple[AggregateRecord, ...],
 ) -> _AutonomousFollowupResult:
     """Continue propose→implement→evaluate→reflect until an exact terminal condition."""
 
@@ -1481,8 +2059,16 @@ def _run_autonomous_followups(
     )
     candidates = list(result.candidates)
     feedback = list(result.public_feedback)
-    records = [_iteration_record(result, reflection, scientific_iteration=1)]
-    iteration = 1
+    records = [
+        *prior_records,
+        _iteration_record(
+            result,
+            reflection,
+            scientific_iteration=runtime_template.scientific_iteration,
+        ),
+    ]
+    rejected_records = list(prior_records)
+    iteration = runtime_template.scientific_iteration
     terminal = result.stop_reason
 
     while True:
@@ -1490,6 +2076,9 @@ def _run_autonomous_followups(
             terminal = CampaignStopReason.CONVERGED
             break
         if result.convergence.completed_iterations >= scientific_config.max_scientific_iterations:
+            terminal = CampaignStopReason.ITERATION_CAP
+            break
+        if iteration >= scientific_config.max_scientific_iterations:
             terminal = CampaignStopReason.ITERATION_CAP
             break
         if result.launches_used >= scientific_config.max_launches:
@@ -1517,16 +2106,26 @@ def _run_autonomous_followups(
             campaign_records=tuple(records),
             evidence=context_evidence,
         )
-        lineage = prepare_or_rehydrate_live_lineage(
-            campaign_id=request.campaign_id,
-            scientific_iteration=iteration,
-            parent=parent,
-            generated_root=runtime_template.run_dir / _PRODUCTION_DIR / "generated-source",
-            artifact_store=runtime_template.artifacts,
-            safe_context=safe_context,
-            model=research_model,
-            provider="openai",
-        )
+        try:
+            lineage = prepare_or_rehydrate_live_lineage(
+                campaign_id=request.campaign_id,
+                scientific_iteration=iteration,
+                parent=parent,
+                generated_root=runtime_template.run_dir / _PRODUCTION_DIR / "generated-source",
+                artifact_store=runtime_template.artifacts,
+                safe_context=safe_context,
+                model=research_model,
+                provider="openai",
+            )
+        except LiveResearchBranchRejected as rejection:
+            rejected_record = _rejected_lineage_record(
+                rejection,
+                scientific_iteration=iteration,
+            )
+            records.append(rejected_record)
+            rejected_records.append(rejected_record)
+            terminal = CampaignStopReason.CANDIDATES_EXHAUSTED
+            continue
         candidate_id = lineage.candidate_id
         research_ledger, experiment_id = _ensure_lineage_ledger(
             campaign_store=runtime_template.campaign_store,
@@ -1637,6 +2236,7 @@ def _run_autonomous_followups(
         reflection_response_digest=reflection_response,
         reflection_transcript=reflection_transcript,
         iterations_completed=iteration,
+        rejected_records=tuple(rejected_records),
     )
 
 
@@ -1734,6 +2334,13 @@ def _provider_unavailable_outcome(
     scorer_digest: str,
     fallback_receipt_digest: str,
 ) -> FullCampaignOutcome:
+    rejection_evidence = _research_rejection_evidence((), artifacts=artifacts)
+    stage_counts = _research_stage_counts(
+        model=None,
+        branches_attempted=0,
+        rejected_records=(),
+        candidates_admitted=0,
+    )
     receipt = artifacts.put_bytes(
         canonical_json_bytes(
             {
@@ -1750,6 +2357,9 @@ def _provider_unavailable_outcome(
         "diagnostic_artifact": receipt.manifest(),
         "fallback_receipt_digest": fallback_receipt_digest,
         "fallback_preserved": True,
+        "provider_usage": None,
+        "research_stage_counts": stage_counts,
+        **rejection_evidence,
     }
     _stage(
         progress,
@@ -1773,6 +2383,139 @@ def _provider_unavailable_outcome(
             "reflection_response_digest": None,
             "portfolio_count": 0,
             "portfolio_cap_reason": "configured_provider_unavailable",
+        },
+    )
+    return _commit_outcome(
+        run_dir=run_dir,
+        request=request,
+        engine=engine,
+        campaign_store=campaign_store,
+        artifacts=artifacts,
+        progress=progress,
+        qualification=qualification,
+        scorer_digest=scorer_digest,
+        fallback_receipt_digest=fallback_receipt_digest,
+        scientific_result_digest=None,
+        reflection_request_digest=None,
+        reflection_response_digest=None,
+        reflection_transcript=None,
+        selection=None,
+    )
+
+
+def _runtime_provider_unavailable_outcome(
+    *,
+    error: OpenAIProviderError,
+    model: OpenAIChatCompletionsModel | OpenAIFailoverModel,
+    run_dir: Path,
+    request: CampaignCreateRequest,
+    engine: CampaignEngine,
+    campaign_store: CampaignStore,
+    artifacts: ArtifactStore,
+    progress: FullCampaignProgressLedger,
+    qualification: OfficialFMQualificationEvidence,
+    scorer_digest: str,
+    fallback_receipt_digest: str,
+    rejected_records: Sequence[AggregateRecord] = (),
+    branches_attempted: int = 1,
+) -> FullCampaignOutcome:
+    """Close initial research safely after the live provider exhausts bounded retries."""
+
+    retryable = error.code in {
+        ProviderErrorCode.TRANSPORT,
+        ProviderErrorCode.HTTP,
+        ProviderErrorCode.INCOMPLETE,
+    }
+    credential_envs = _provider_credential_envs(model)
+    failures = (
+        [item.to_wire() for item in error.failures]
+        if isinstance(error, OpenAIProviderChainError)
+        else []
+    )
+    diagnostic = {
+        "category": "provider_unavailable",
+        "provider": "openai",
+        "code": error.code.value,
+        "message": "The live research provider failed after its bounded retry policy.",
+        "retryable": retryable,
+        "credential_env": credential_envs[0],
+        "credential_envs": list(credential_envs),
+        "operation": None if error.operation is None else error.operation.value,
+        "attempts": error.attempts,
+        "status_code": error.status_code,
+        "provider_failures": failures,
+    }
+    transcript_payloads = list(_provider_transcripts(model))
+    rejection_evidence = _research_rejection_evidence(
+        rejected_records,
+        artifacts=artifacts,
+    )
+    stage_counts = _research_stage_counts(
+        model=model,
+        branches_attempted=branches_attempted,
+        rejected_records=rejected_records,
+        candidates_admitted=0,
+    )
+    receipt = artifacts.put_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "diagnostic": diagnostic,
+                "provider_attempt_transcripts": transcript_payloads,
+                "provider_failover_events": (
+                    [item.to_wire() for item in model.failover_events]
+                    if isinstance(model, OpenAIFailoverModel)
+                    else []
+                ),
+                "rejected_lineage_records": [record.to_wire() for record in rejected_records],
+                "research_stage_counts": stage_counts,
+                "fallback_preserved": True,
+                "manual_interventions": 0,
+            }
+        ),
+        kind=ArtifactKind.LOG,
+    )
+    evidence = {
+        "provider_diagnostic": diagnostic,
+        "diagnostic_artifact": receipt.manifest(),
+        "provider_usage": _provider_usage(model),
+        "research_stage_counts": stage_counts,
+        **rejection_evidence,
+        "fallback_receipt_digest": fallback_receipt_digest,
+        "fallback_preserved": True,
+    }
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.LINEAGE_READY,
+        evidence=evidence
+        | {
+            "generated_lineage_status": "provider_retry_exhausted",
+            "manual_source_edits": 0,
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.SCIENCE_COMPLETE,
+        evidence=evidence
+        | {
+            "scientific_result_digest": None,
+            "portfolio_count": branches_attempted,
+            "portfolio_cap_reason": "runtime_provider_unavailable",
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.REFLECTED,
+        evidence=evidence
+        | {
+            "reflection_request_digest": None,
+            "reflection_response_digest": None,
+            "portfolio_count": branches_attempted,
+            "portfolio_cap_reason": "runtime_provider_unavailable",
+            "manual_interventions": 0,
         },
     )
     return _commit_outcome(
@@ -1917,6 +2660,9 @@ def _research_admission_closed_outcome(
     fold_a_status: str = "not_started",
     fold_b_status: str | None = None,
     diagnostic_details: Mapping[str, object] | None = None,
+    research_model: ResearchModel | None = None,
+    rejected_records: Sequence[AggregateRecord] = (),
+    branches_attempted: int = 0,
 ) -> FullCampaignOutcome:
     fallback_receipt = (
         _qualification_fallback_receipt(qualification, reason=reason)
@@ -1937,12 +2683,25 @@ def _research_admission_closed_outcome(
         ),
         kind=ArtifactKind.LOG,
     )
+    stage_counts = _research_stage_counts(
+        model=research_model,
+        branches_attempted=branches_attempted,
+        rejected_records=rejected_records,
+        candidates_admitted=0,
+    )
+    rejection_evidence = _research_rejection_evidence(
+        rejected_records,
+        artifacts=artifacts,
+    )
     common = {
         "admission_closed": True,
         "reason": reason,
         "diagnostic_artifact": diagnostic.manifest(),
         "fallback_receipt_digest": fallback_receipt,
         "fallback_preserved": True,
+        "provider_usage": _provider_usage(research_model),
+        "research_stage_counts": stage_counts,
+        **rejection_evidence,
     }
     _stage(
         progress,
@@ -1985,7 +2744,7 @@ def _research_admission_closed_outcome(
         evidence=common
         | {
             "scientific_result_digest": None,
-            "portfolio_count": 0,
+            "portfolio_count": branches_attempted,
             "portfolio_cap_reason": reason,
         },
     )
@@ -2588,6 +3347,8 @@ def run_provider_free_campaign(
 
         _check_cancel(cancel_event)
         research_model: ResearchModel | None = None
+        accepted_scientific_iteration = 1
+        rejected_lineage_records: tuple[AggregateRecord, ...] = ()
         if request.config.research.provider == "scripted":
             template_dir = _resolve_directory(
                 root,
@@ -2606,7 +3367,30 @@ def run_provider_free_campaign(
             )
             candidate_id = SCRIPTED_CANDIDATE_ID
         else:
-            selected_provider = select_research_provider(request.config.research)
+
+            def remaining_research_seconds() -> float:
+                observed = selected_engine.inspect_deadline(run)
+                return max(
+                    0.0,
+                    observed.remaining_seconds - request.config.runner.finalization_reserve_seconds,
+                )
+
+            retry_runtime = RetryRuntime(remaining_research_seconds=remaining_research_seconds)
+
+            def build_openai_model(
+                config: OpenAIChatCompletionsConfig,
+                transport: ResponsesTransport | None,
+            ) -> object:
+                return OpenAIChatCompletionsModel(
+                    config,
+                    transport=transport,
+                    retry_runtime=retry_runtime,
+                )
+
+            selected_provider = select_research_provider(
+                request.config.research,
+                openai_model_factory=build_openai_model,
+            )
             if isinstance(selected_provider, ProviderUnavailableDiagnostic):
                 return _provider_unavailable_outcome(
                     diagnostic=selected_provider,
@@ -2629,24 +3413,114 @@ def run_provider_free_campaign(
                 _resolve_directory(root, Path("candidate_seed"), "candidate seed"),
                 candidate_id=SCRIPTED_PARENT_ID,
             )
-            lineage = prepare_or_rehydrate_live_lineage(
+
+            def continue_live_lineage() -> bool:
+                _check_cancel(cancel_event)
+                return not selected_engine.inspect_deadline(run).finalization_reserve_active
+
+            preparation = _prepare_live_lineage_portfolio(
                 campaign_id=request.campaign_id,
-                scientific_iteration=1,
                 parent=parent,
                 generated_root=production / "generated-source",
                 artifact_store=artifacts,
-                safe_context=safe_context,
                 model=research_model,
                 provider=selected_provider.provider,
+                maximum_iterations=request.config.benchmark.max_iterations,
+                safe_context_factory=(
+                    (lambda _records: safe_context)
+                    if retained_lineage is not None
+                    else lambda records: _safe_context(
+                        request=request,
+                        qualification=qualification,
+                        fold_a=fold_a,
+                        fold_b=fold_b,
+                        status=selected_engine.status(run),
+                        campaign_records=records,
+                        evidence=context_evidence,
+                    )
+                ),
+                continue_check=continue_live_lineage,
             )
+            if preparation.status == "provider_unavailable":
+                if not isinstance(
+                    research_model, (OpenAIChatCompletionsModel, OpenAIFailoverModel)
+                ):
+                    raise FullCampaignError(
+                        "non-OpenAI research model returned an OpenAI provider failure"
+                    )
+                if preparation.provider_error is None:
+                    raise FullCampaignError("provider-unavailable preparation lost its error")
+                return _runtime_provider_unavailable_outcome(
+                    error=preparation.provider_error,
+                    model=research_model,
+                    run_dir=run,
+                    request=request,
+                    engine=selected_engine,
+                    campaign_store=campaign_store,
+                    artifacts=artifacts,
+                    progress=progress,
+                    qualification=qualification,
+                    scorer_digest=scorer_digest,
+                    fallback_receipt_digest=fallback_receipt,
+                    rejected_records=preparation.rejected_records,
+                    branches_attempted=preparation.branches_attempted,
+                )
+            if preparation.status != "accepted":
+                reason = (
+                    "repeated_pre_admission_failure"
+                    if preparation.status == "repeated_pre_admission_failure"
+                    else "live_lineage_portfolio_exhausted_or_reserve_active"
+                )
+                return _research_admission_closed_outcome(
+                    reason=reason,
+                    run_dir=run,
+                    request=request,
+                    engine=selected_engine,
+                    campaign_store=campaign_store,
+                    artifacts=artifacts,
+                    progress=progress,
+                    qualification=qualification,
+                    scorer_digest=scorer_digest,
+                    fold_b=fold_b,
+                    fallback_receipt_digest=fallback_receipt,
+                    diagnostic_category="live_lineage_portfolio_closed",
+                    fold_a_status="completed",
+                    diagnostic_details={
+                        "maximum_iterations": request.config.benchmark.max_iterations,
+                        "preparation_status": preparation.status,
+                    },
+                    research_model=research_model,
+                    rejected_records=preparation.rejected_records,
+                    branches_attempted=preparation.branches_attempted,
+                )
+            if (
+                preparation.lineage is None
+                or preparation.safe_context is None
+                or preparation.scientific_iteration is None
+            ):
+                raise FullCampaignError("accepted live-lineage preparation is incomplete")
+            lineage = preparation.lineage
+            safe_context = preparation.safe_context
+            accepted_scientific_iteration = preparation.scientific_iteration
+            rejected_lineage_records = preparation.rejected_records
             candidate_id = lineage.candidate_id
         research_ledger, experiment_id = _ensure_lineage_ledger(
             campaign_store=campaign_store,
             lineage=lineage,
             candidate_id=candidate_id,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
         )
         observed_start = selected_engine.inspect_deadline(run)
+        lineage_stage_counts = _research_stage_counts(
+            model=research_model,
+            branches_attempted=accepted_scientific_iteration,
+            rejected_records=rejected_lineage_records,
+            candidates_admitted=1,
+        )
+        lineage_rejection_evidence = _research_rejection_evidence(
+            rejected_lineage_records,
+            artifacts=artifacts,
+        )
         lineage_stage = _stage(
             progress,
             request_digest=request.digest,
@@ -2658,6 +3532,9 @@ def run_provider_free_campaign(
                 "manual_source_edits": 0,
                 "provider": lineage.provider,
                 "live_provider_used": lineage.live_provider_used,
+                "provider_usage": _provider_usage(research_model),
+                "research_stage_counts": lineage_stage_counts,
+                **lineage_rejection_evidence,
                 "safe_context": safe_context.to_wire(),
                 "safe_context_digest": safe_context.digest,
                 "scientific_start": {
@@ -2703,7 +3580,7 @@ def run_provider_free_campaign(
             lineage=lineage,
             candidate_id=candidate_id,
             candidate_limits=candidate_limits,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
         )
         fold_a_data_digest = _digest(
             b"kuairand-production-fold-A-science-v1",
@@ -2763,7 +3640,7 @@ def run_provider_free_campaign(
             lineage=lineage,
             candidate=candidate,
             experiment_id=experiment_id,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
             config=scientific_config,
             feature_artifacts=feature_artifacts,
             features=features,
@@ -2862,10 +3739,10 @@ def run_provider_free_campaign(
             artifacts=artifacts,
             research_model=research_model,
             candidate_id=candidate_id,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
         )
         _check_cancel(cancel_event)
-        iterations_completed = 1
+        iterations_completed = accepted_scientific_iteration
         if isinstance(lineage, LiveResearchLineage):
             if research_model is None:
                 raise FullCampaignError("live lineage lost its research model")
@@ -2891,6 +3768,7 @@ def run_provider_free_campaign(
                     reflection_response,
                     reflection_transcript,
                 ),
+                prior_records=rejected_lineage_records,
             )
             result = followup.result
             selection = followup.selection
@@ -2898,6 +3776,7 @@ def run_provider_free_campaign(
             reflection_response = followup.reflection_response_digest
             reflection_transcript = followup.reflection_transcript
             iterations_completed = followup.iterations_completed
+            rejected_lineage_records = followup.rejected_records
         observed_launches = campaign_store.snapshot().launches_used
         if observed_launches != result.launches_used:
             raise FullCampaignError(
@@ -2906,6 +3785,32 @@ def run_provider_free_campaign(
         result_artifact = artifacts.put_bytes(
             _canonical_json(result.manifest() | {"digest": result.digest}),
             kind=ArtifactKind.MANIFEST,
+        )
+        inner_evaluations_completed = sum(
+            run.metrics is not None
+            for candidate_result in result.candidates
+            for run in candidate_result.runs[:2]
+        )
+        outer_evaluations_completed = sum(
+            run.metrics is not None
+            for candidate_result in result.candidates
+            for run in candidate_result.runs[2:]
+        )
+        final_stage_counts = _research_stage_counts(
+            model=research_model,
+            branches_attempted=iterations_completed,
+            rejected_records=rejected_lineage_records,
+            candidates_admitted=max(0, iterations_completed - len(rejected_lineage_records)),
+            training_started=max(
+                0,
+                result.launches_used - scientific_config.launches_already_used,
+            ),
+            inner_evaluations_completed=inner_evaluations_completed,
+            outer_evaluations_completed=outer_evaluations_completed,
+        )
+        final_rejection_evidence = _research_rejection_evidence(
+            rejected_lineage_records,
+            artifacts=artifacts,
         )
         _check_cancel(cancel_event)
         _stage(
@@ -2925,6 +3830,8 @@ def run_provider_free_campaign(
                 "iterations_completed": iterations_completed,
                 "autonomous_loop_completed": isinstance(lineage, LiveResearchLineage),
                 "provider_usage": _provider_usage(research_model),
+                "research_stage_counts": final_stage_counts,
+                **final_rejection_evidence,
             },
         )
         _check_cancel(cancel_event)
@@ -2944,6 +3851,8 @@ def run_provider_free_campaign(
                 "manual_source_edits": 0,
                 "manual_interventions": 0,
                 "provider_usage": _provider_usage(research_model),
+                "research_stage_counts": final_stage_counts,
+                **final_rejection_evidence,
             },
         )
         _check_cancel(cancel_event)

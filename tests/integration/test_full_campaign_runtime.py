@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ from kuairand_agent.campaign.controller import (
 )
 from kuairand_agent.campaign.convergence import ConvergenceState
 from kuairand_agent.campaign.full_campaign import (
+    FullCampaignCancelled,
+    FullCampaignError,
     FullCampaignOutcome,
     FullCampaignOutcomeRepository,
     FullCampaignProgressLedger,
@@ -32,12 +35,361 @@ from kuairand_agent.campaign.selector import IncumbentEvidence, OrganizerMetrics
 from kuairand_agent.campaign.store import CampaignStore
 from kuairand_agent.contract import STARTER_FILE_SHA256
 from kuairand_agent.execution.artifacts import ArtifactKind, ArtifactRef, ArtifactStore
-from kuairand_agent.research.schemas import Reflection
+from kuairand_agent.research.context import AggregateRecord
+from kuairand_agent.research.production import (
+    LiveResearchBranchRejected,
+    ResearchFailureObservation,
+)
+from kuairand_agent.research.schemas import Reflection, canonical_json_bytes
 from tests.integration.test_campaign_controller import FakeClock, build_request
 from tests.unit.test_full_campaign import _dataset
 from tests.unit.test_scientific_campaign import _config, _fallback
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _typed_branch_rejection(
+    *,
+    candidate_id: str,
+    root_code: str,
+    root_subject: str,
+    terminal_code: str = "declared_symbol_unchanged",
+    terminal_subject: str = "main",
+    family: str = "pairwise",
+    signature_seed: str = "1",
+) -> LiveResearchBranchRejected:
+    root = ResearchFailureObservation.create(
+        stage="materialization",
+        category="static_policy",
+        code=root_code,
+        subject=root_subject,
+        diagnostic=f"root {root_code}: {root_subject}",
+    )
+    terminal = ResearchFailureObservation.create(
+        stage="materiality",
+        category="materiality",
+        code=terminal_code,
+        subject=terminal_subject,
+        diagnostic=f"terminal {terminal_code}: {terminal_subject}",
+    )
+    return LiveResearchBranchRejected(
+        failed_candidate_id=candidate_id,
+        repairs_attempted=1,
+        diagnostic=terminal.diagnostic,
+        root_failure=root,
+        terminal_failure=terminal,
+        proposal_family=family,
+        proposal_signature=hashlib.sha256(signature_seed.encode("ascii")).hexdigest(),
+    )
+
+
+def test_initial_live_lineage_portfolio_skips_an_exhausted_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = cast(Any, object())
+    attempted: list[int] = []
+    context_record_counts: list[int] = []
+
+    def prepare(**kwargs: object) -> object:
+        iteration = cast(int, kwargs["scientific_iteration"])
+        attempted.append(iteration)
+        if iteration == 1:
+            raise LiveResearchBranchRejected(
+                failed_candidate_id="candidate-01-repair-1",
+                repairs_attempted=1,
+                diagnostic="declared material symbol did not change executable source",
+            )
+        return SimpleNamespace(candidate_id="candidate-02")
+
+    def safe_context(records: tuple[object, ...]) -> object:
+        context_record_counts.append(len(records))
+        return opaque
+
+    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare)
+    prepared = runtime._prepare_live_lineage_portfolio(
+        campaign_id="initial-live-portfolio",
+        parent=opaque,
+        generated_root=tmp_path / "generated",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        model=opaque,
+        provider="openai",
+        maximum_iterations=3,
+        safe_context_factory=cast(Any, safe_context),
+        continue_check=lambda: True,
+    )
+
+    assert prepared is not None
+    assert prepared.scientific_iteration == 2
+    assert prepared.lineage is not None
+    assert prepared.lineage.candidate_id == "candidate-02"
+    assert len(prepared.rejected_records) == 1
+    assert attempted == [1, 2]
+    assert context_record_counts == [0, 1]
+
+
+def test_initial_live_lineage_portfolio_stops_on_third_identical_root_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = cast(Any, object())
+    attempts: list[int] = []
+    contexts: list[tuple[object, ...]] = []
+
+    def prepare(**kwargs: object) -> object:
+        iteration = cast(int, kwargs["scientific_iteration"])
+        attempts.append(iteration)
+        raise _typed_branch_rejection(
+            candidate_id=f"candidate-{iteration:02d}",
+            root_code="reserved_filename",
+            root_subject="baseline.py",
+            family=("pairwise" if iteration < 3 else "listwise"),
+            signature_seed=str(iteration),
+        )
+
+    def safe_context(records: tuple[object, ...]) -> object:
+        contexts.append(records)
+        return opaque
+
+    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare)
+    prepared = runtime._prepare_live_lineage_portfolio(
+        campaign_id="repeated-root-failure",
+        parent=opaque,
+        generated_root=tmp_path / "generated",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        model=opaque,
+        provider="openai",
+        maximum_iterations=10,
+        safe_context_factory=cast(Any, safe_context),
+        continue_check=lambda: True,
+    )
+
+    assert prepared.status == "repeated_pre_admission_failure"
+    assert prepared.lineage is None
+    assert prepared.safe_context is None
+    assert prepared.scientific_iteration is None
+    assert prepared.branches_attempted == 3
+    assert attempts == [1, 2, 3]
+    assert [len(items) for items in contexts] == [0, 1, 2]
+    assert len(prepared.rejected_records) == 3
+    first, second, third = prepared.rejected_records
+    assert first.values["root_failure_total_count"] == 1
+    assert first.values["root_failure_consecutive_count"] == 1
+    assert second.values["root_failure_total_count"] == 2
+    assert second.values["root_failure_consecutive_count"] == 2
+    assert second.values["proposal_family_blocked"] is True
+    assert third.values["root_failure_total_count"] == 3
+    assert third.values["root_failure_consecutive_count"] == 3
+
+
+def test_initial_live_lineage_portfolio_resets_only_consecutive_root_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = cast(Any, object())
+    roots = (
+        ("reserved_filename", "baseline.py", "pairwise"),
+        ("reserved_filename", "baseline.py", "listwise"),
+        ("unsupported_suffix", ".csv", "calibration"),
+        ("reserved_filename", "baseline.py", "optimization"),
+    )
+
+    def prepare(**kwargs: object) -> object:
+        iteration = cast(int, kwargs["scientific_iteration"])
+        code, subject, family = roots[iteration - 1]
+        raise _typed_branch_rejection(
+            candidate_id=f"candidate-{iteration:02d}",
+            root_code=code,
+            root_subject=subject,
+            family=family,
+            signature_seed=str(iteration),
+        )
+
+    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare)
+    prepared = runtime._prepare_live_lineage_portfolio(
+        campaign_id="nonconsecutive-root-failure",
+        parent=opaque,
+        generated_root=tmp_path / "generated",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        model=opaque,
+        provider="openai",
+        maximum_iterations=10,
+        safe_context_factory=lambda _records: cast(Any, opaque),
+        continue_check=lambda: True,
+    )
+
+    assert prepared.status == "repeated_pre_admission_failure"
+    assert prepared.branches_attempted == 4
+    assert prepared.rejected_records[-1].values["root_failure_total_count"] == 3
+    assert prepared.rejected_records[-1].values["root_failure_consecutive_count"] == 1
+
+
+def test_initial_live_lineage_portfolio_exposes_second_same_family_as_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = cast(Any, object())
+    seen_contexts: list[tuple[AggregateRecord, ...]] = []
+
+    def prepare(**kwargs: object) -> object:
+        iteration = cast(int, kwargs["scientific_iteration"])
+        if iteration < 3:
+            raise _typed_branch_rejection(
+                candidate_id=f"candidate-{iteration:02d}",
+                root_code=("reserved_filename" if iteration == 1 else "unsupported_suffix"),
+                root_subject=("baseline.py" if iteration == 1 else ".csv"),
+                family="pairwise",
+                signature_seed=str(iteration),
+            )
+        return SimpleNamespace(candidate_id="candidate-03")
+
+    def safe_context(records: tuple[AggregateRecord, ...]) -> object:
+        seen_contexts.append(records)
+        return opaque
+
+    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare)
+    prepared = runtime._prepare_live_lineage_portfolio(
+        campaign_id="same-family-block",
+        parent=opaque,
+        generated_root=tmp_path / "generated",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        model=opaque,
+        provider="openai",
+        maximum_iterations=5,
+        safe_context_factory=cast(Any, safe_context),
+        continue_check=lambda: True,
+    )
+
+    assert prepared.status == "accepted"
+    assert prepared.branches_attempted == 3
+    assert len(seen_contexts) == 3
+    assert seen_contexts[-1][-1].values["proposal_family"] == "pairwise"
+    assert seen_contexts[-1][-1].values["proposal_family_attempt_count"] == 2
+    assert seen_contexts[-1][-1].values["proposal_family_blocked"] is True
+
+
+def test_initial_live_lineage_portfolio_resumes_persisted_rejections_without_duplicate_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = cast(Any, object())
+    generated_root = tmp_path / "generated"
+    provider_calls: list[int] = []
+
+    def prepare(**kwargs: object) -> object:
+        iteration = cast(int, kwargs["scientific_iteration"])
+        provider_calls.append(iteration)
+        raise _typed_branch_rejection(
+            candidate_id=f"candidate-{iteration:02d}",
+            root_code="reserved_filename",
+            root_subject="baseline.py",
+            family=("pairwise" if iteration < 3 else "listwise"),
+            signature_seed=str(iteration),
+        )
+
+    continue_calls = 0
+
+    def interrupt_after_one_rejection() -> bool:
+        nonlocal continue_calls
+        continue_calls += 1
+        if continue_calls == 1:
+            return True
+        raise FullCampaignCancelled("synthetic interruption after durable rejection")
+
+    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare)
+    with pytest.raises(FullCampaignCancelled, match="synthetic interruption"):
+        runtime._prepare_live_lineage_portfolio(
+            campaign_id="durable-rejection-resume",
+            parent=opaque,
+            generated_root=generated_root,
+            artifact_store=ArtifactStore(tmp_path / "artifacts"),
+            model=opaque,
+            provider="openai",
+            maximum_iterations=10,
+            safe_context_factory=cast(Any, lambda _records: opaque),
+            continue_check=interrupt_after_one_rejection,
+        )
+
+    resumed_context_sizes: list[int] = []
+
+    def resumed_safe_context(records: tuple[AggregateRecord, ...]) -> object:
+        resumed_context_sizes.append(len(records))
+        return opaque
+
+    resumed = runtime._prepare_live_lineage_portfolio(
+        campaign_id="durable-rejection-resume",
+        parent=opaque,
+        generated_root=generated_root,
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        model=opaque,
+        provider="openai",
+        maximum_iterations=10,
+        safe_context_factory=cast(Any, resumed_safe_context),
+        continue_check=lambda: True,
+    )
+
+    assert resumed.status == "repeated_pre_admission_failure"
+    assert resumed.branches_attempted == 3
+    assert provider_calls == [1, 2, 3]
+    assert resumed_context_sizes == [1, 2]
+    assert len(resumed.rejected_records) == 3
+
+
+def test_initial_live_lineage_portfolio_rejects_tampered_rejection_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = cast(Any, object())
+    generated_root = tmp_path / "generated"
+    continue_calls = 0
+
+    def continue_once() -> bool:
+        nonlocal continue_calls
+        continue_calls += 1
+        return continue_calls == 1
+
+    monkeypatch.setattr(
+        runtime,
+        "prepare_or_rehydrate_live_lineage",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            _typed_branch_rejection(
+                candidate_id="candidate-01",
+                root_code="reserved_filename",
+                root_subject="baseline.py",
+            )
+        ),
+    )
+    stopped = runtime._prepare_live_lineage_portfolio(
+        campaign_id="tampered-rejection-resume",
+        parent=opaque,
+        generated_root=generated_root,
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        model=opaque,
+        provider="openai",
+        maximum_iterations=10,
+        safe_context_factory=cast(Any, lambda _records: opaque),
+        continue_check=continue_once,
+    )
+    assert stopped.status == "admission_closed"
+
+    journal_entry = generated_root / runtime._REJECTION_JOURNAL_DIR / "rejection-01.json"
+    decoded = json.loads(journal_entry.read_bytes())
+    decoded["record"]["values"]["root_failure_code"] = "tampered"
+    journal_entry.chmod(0o600)
+    journal_entry.write_bytes(canonical_json_bytes(decoded))
+
+    with pytest.raises(FullCampaignError, match="journal digest is inconsistent"):
+        runtime._prepare_live_lineage_portfolio(
+            campaign_id="tampered-rejection-resume",
+            parent=opaque,
+            generated_root=generated_root,
+            artifact_store=ArtifactStore(tmp_path / "artifacts"),
+            model=opaque,
+            provider="openai",
+            maximum_iterations=10,
+            safe_context_factory=cast(Any, lambda _records: opaque),
+            continue_check=lambda: True,
+        )
 
 
 def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
@@ -145,10 +497,17 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     )
     prepared_iterations: list[int] = []
     cursor_history: list[tuple[int, int]] = []
+    context_record_counts: list[int] = []
 
     def prepare_lineage(**kwargs: object) -> SimpleNamespace:
         iteration = cast(int, kwargs["scientific_iteration"])
         prepared_iterations.append(iteration)
+        if iteration == 2:
+            raise LiveResearchBranchRejected(
+                failed_candidate_id="live-candidate-2-repair-1",
+                repairs_attempted=1,
+                diagnostic="declared material symbols did not change executable source",
+            )
         return SimpleNamespace(
             candidate_id=f"live-candidate-{iteration}",
             parent=kwargs["parent"],
@@ -186,7 +545,11 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
             ),
         )
 
-    monkeypatch.setattr(runtime, "_safe_context", lambda **_kwargs: opaque)
+    def safe_context(**kwargs: object) -> object:
+        context_record_counts.append(len(cast(tuple[object, ...], kwargs["campaign_records"])))
+        return opaque
+
+    monkeypatch.setattr(runtime, "_safe_context", safe_context)
     monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare_lineage)
     monkeypatch.setattr(
         runtime,
@@ -222,17 +585,21 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
         first_selection=None,
         first_reflection=first_reflection,
         first_reflection_evidence=("request-1", "response-1", transcript),
+        prior_records=(),
     )
 
-    assert prepared_iterations == [2, 3]
+    assert prepared_iterations == [2, 3, 4]
     assert cursor_history == [(1, 7), (2, 8)]
-    assert result.iterations_completed == 3
+    assert context_record_counts == [1, 2, 3]
+    assert result.iterations_completed == 4
     assert result.result.convergence.completed_iterations == 3
     assert result.result.convergence.should_stop is True
     assert result.result.launches_used == 9
     assert result.result.stop_reason is CampaignStopReason.CONVERGED
+    assert len(result.rejected_records) == 1
+    assert result.rejected_records[0].values["root_failure_code"] == "branch_rejected"
     assert len(store.convergence_manifests) == 2
-    assert engine.status_calls == 2
+    assert engine.status_calls == 3
 
 
 def test_production_runtime_preserves_active_interpreter_at_both_child_seams() -> None:
@@ -411,5 +778,19 @@ def test_provider_free_runtime_closes_fallback_and_exactly_retries_without_final
     assert canonical.final.targets is None
     assert canonical.final.outcome_trace.parsed_cell_count == 0
     assert tuple(item.stage for item in first_checkpoints) == tuple(FullCampaignStage)
+    science = next(
+        item for item in first_checkpoints if item.stage is FullCampaignStage.SCIENCE_COMPLETE
+    )
+    assert science.evidence["research_stage_counts"] == {
+        "branches_attempted": 1,
+        "proposal_responses_accepted": 0,
+        "implementation_responses_accepted": 0,
+        "repair_responses_accepted": 0,
+        "branches_rejected_pre_execution": 0,
+        "candidates_admitted": 1,
+        "training_started": 0,
+        "inner_evaluations_completed": 0,
+        "outer_evaluations_completed": 0,
+    }
     assert progress.checkpoints() == first_checkpoints
     assert tuple((request.run_dir / "controller" / "deadline").iterdir()) == first_deadlines

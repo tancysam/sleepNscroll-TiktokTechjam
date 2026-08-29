@@ -33,6 +33,7 @@ from kuairand_agent.finalization.production import (
     ProductionFinalizationOutcome,
 )
 from kuairand_agent.finalization.recipe import GeneratedLambdaRankReplayRecipe
+from kuairand_agent.finalization.report import MetricEvidence
 from kuairand_agent.finalization.submission_bundle import (
     FINAL_BUNDLE_SCHEMA_VERSION,
     REQUIRED_DIRECTORY_PATHS,
@@ -1496,6 +1497,7 @@ def test_positive_submaterial_delta_is_explicitly_reported_as_unconfirmed() -> N
         status=FinalStatus.BASELINE_REPRODUCED,
     )
     assert "Immutable official FM seed 4" in baseline_rationale
+    assert "not agent-generated" in baseline_rationale
     assert baseline_limitations == ()
 
 
@@ -1557,6 +1559,62 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
             "portfolio_count": 1,
             "portfolio_cap": 1,
             "portfolio_cap_reason": "bounded_high_value_lambdarank_branch_prioritized",
+            "research_stage_counts": {
+                "branches_attempted": 3,
+                "proposal_responses_accepted": 3,
+                "implementation_responses_accepted": 2,
+                "repair_responses_accepted": 1,
+                "branches_rejected_pre_execution": 2,
+                "candidates_admitted": 1,
+                "training_started": 1,
+                "inner_evaluations_completed": 1,
+                "outer_evaluations_completed": 0,
+            },
+            "research_rejection_summary": {
+                "branches_rejected_pre_execution": 2,
+                "root_counts": [
+                    {
+                        "fingerprint": (_digest("1")),
+                        "stage": "implementation",
+                        "category": "candidate_path_policy",
+                        "code": "forbidden_basename",
+                        "subject": "baseline.py",
+                        "count": 2,
+                    }
+                ],
+                "terminal_counts": [
+                    {
+                        "fingerprint": _digest("2"),
+                        "stage": "repair",
+                        "category": "materiality",
+                        "code": "declared_symbol_unchanged",
+                        "subject": "main",
+                        "count": 2,
+                    }
+                ],
+                "examples": [
+                    {
+                        "scientific_iteration": 2,
+                        "candidate_id": "candidate-02",
+                        "proposal_family": "pairwise:bpr",
+                        "proposal_signature": _digest("e"),
+                        "role": "root",
+                        "fingerprint": (_digest("1")),
+                        "diagnostic": ("reserved candidate filename is forbidden: baseline.py"),
+                    },
+                    {
+                        "scientific_iteration": 2,
+                        "candidate_id": "candidate-02",
+                        "proposal_family": "pairwise:bpr",
+                        "proposal_signature": _digest("e"),
+                        "role": "terminal",
+                        "fingerprint": _digest("2"),
+                        "diagnostic": "declared material symbol did not change: main",
+                    },
+                ],
+                "counts_truncated": False,
+                "examples_truncated": False,
+            },
         },
     )
     reflected = SimpleNamespace(
@@ -1598,6 +1656,22 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
     )
     assert "Advanced WP7 branches were not entered" in facts.advanced_branch_disposition
     assert "not an advanced-branch failure" in facts.advanced_branch_disposition
+    assert facts.research_progress == (
+        "Research admission: branches attempted=3; proposal responses accepted=3; "
+        "implementation responses accepted=2; repair responses accepted=1; "
+        "rejected pre-execution=2; candidates admitted=1; training started=1; "
+        "inner evaluations completed=1; outer evaluations completed=0."
+    )
+    assert facts.research_rejections == (
+        "Research rejection roots: implementation/candidate_path_policy/"
+        f"forbidden_basename/baseline.py [{_digest('1')}] x2.",
+        "Research rejection terminals: repair/materiality/declared_symbol_unchanged/"
+        f"main [{_digest('2')}] x2.",
+        f"Research rejection example (root): {_digest('1')}; "
+        "reserved candidate filename is forbidden: baseline.py",
+        f"Research rejection example (terminal): {_digest('2')}; "
+        "declared material symbol did not change: main",
+    )
     limitations = production._bundle_known_limitations(
         generated=True,
         status=FinalStatus.VALIDATION_IMPROVED,
@@ -1662,6 +1736,65 @@ def test_provider_unavailable_report_records_zero_research_and_replay_calls(
     )
     assert facts.portfolio_count == 0
     assert facts.portfolio_cap_reason == "configured_provider_unavailable"
+    assert facts.research_outcome == (
+        "Research did not start because the configured provider was unavailable."
+    )
+
+    checkpoints[1].evidence["provider_usage"] = {
+        "model": "gpt-5.6-sol",
+        "input_tokens": 300,
+        "cached_input_tokens": 0,
+        "output_tokens": 120,
+        "reasoning_tokens": 60,
+        "total_tokens": 420,
+        "estimated_cost_usd": "0.0036",
+        "unaccounted_attempts": 0,
+        "transcript_count": 3,
+        "provider_wall_seconds": 30.0,
+    }
+
+    attempted = production._judge_progress_facts(outcome)
+
+    assert "Research-model attempts=3" in attempted.provider_usage
+    assert "provider=configured_provider_unavailable" in attempted.provider_usage
+    assert "total tokens=420" in attempted.provider_usage
+
+    checkpoints[1].evidence["portfolio_count"] = 0
+    checkpoints[1].evidence["portfolio_cap_reason"] = "runtime_provider_unavailable"
+    checkpoints[2].evidence["portfolio_cap_reason"] = "runtime_provider_unavailable"
+    checkpoints[0].evidence["provider_diagnostic"]["attempts"] = 3
+
+    runtime_failure = production._judge_progress_facts(outcome)
+
+    assert "provider=runtime_provider_failure" in runtime_failure.provider_usage
+    assert runtime_failure.research_outcome == (
+        "Research started, but the provider failed at runtime after durable attempts."
+    )
+
+    checkpoints[0].evidence = {
+        "admission_closed": True,
+        "reason": "repeated_pre_admission_failure",
+    }
+    checkpoints[1].evidence = {
+        "admission_closed": True,
+        "reason": "repeated_pre_admission_failure",
+        "portfolio_count": 0,
+        "portfolio_cap_reason": "repeated_pre_admission_failure",
+    }
+    checkpoints[2].evidence.update(
+        {
+            "admission_closed": True,
+            "reason": "repeated_pre_admission_failure",
+            "portfolio_cap_reason": "repeated_pre_admission_failure",
+        }
+    )
+
+    admission_closed = production._judge_progress_facts(outcome)
+
+    assert admission_closed.research_outcome == (
+        "Research admission closed before a candidate was admitted; controller reason="
+        "repeated_pre_admission_failure."
+    )
 
 
 def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
@@ -1754,6 +1887,140 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
     assert "total tokens=1700" in facts.provider_usage
     assert "estimated API cost USD=0.014" in facts.provider_usage
     assert "replay provider calls=0" in facts.provider_usage
+
+    usage.update(
+        {
+            "base_url": "https://fallback.example/v1",
+            "active_slot": "fallback",
+            "failover_count": 1,
+            "failover_events": [
+                {
+                    "operation": "implement",
+                    "from_slot": "main",
+                    "to_slot": "fallback",
+                    "failure": {
+                        "slot": "main",
+                        "code": "http",
+                        "operation": "implement",
+                        "attempts": 3,
+                        "status_code": 429,
+                    },
+                }
+            ],
+            "provider_chain": [
+                {
+                    "slot": "main",
+                    "model": "gpt-5.6-sol",
+                    "base_url": "https://main.example/v1",
+                    "credential_env": "INFERENCE_MAIN_API_KEY",
+                    "input_tokens": 1000,
+                    "cached_input_tokens": 100,
+                    "output_tokens": 300,
+                    "reasoning_tokens": 200,
+                    "total_tokens": 1300,
+                    "estimated_cost_usd": "0.010",
+                    "unaccounted_attempts": 0,
+                    "transcript_count": 4,
+                },
+                {
+                    "slot": "fallback",
+                    "model": "fallback-model",
+                    "base_url": "https://fallback.example/v1",
+                    "credential_env": "INFERENCE_FALLBACK_API_KEY",
+                    "input_tokens": 200,
+                    "cached_input_tokens": 100,
+                    "output_tokens": 200,
+                    "reasoning_tokens": 100,
+                    "total_tokens": 400,
+                    "estimated_cost_usd": "0.004",
+                    "unaccounted_attempts": 0,
+                    "transcript_count": 2,
+                },
+            ],
+        }
+    )
+
+    chained_facts = production._judge_progress_facts(outcome)
+
+    assert "active slot=fallback" in chained_facts.provider_usage
+    assert "failovers=1" in chained_facts.provider_usage
+    assert "active base URL=https://fallback.example/v1" in chained_facts.provider_usage
+
+    usage["retry_wait_seconds"] = 3.5
+    cast(list[dict[str, object]], usage["provider_chain"])[0]["retry_wait_seconds"] = 2.0
+    cast(list[dict[str, object]], usage["provider_chain"])[1]["retry_wait_seconds"] = 1.5
+
+    retry_facts = production._judge_progress_facts(outcome)
+
+    assert "retry wait seconds=3.5" in retry_facts.provider_usage
+
+
+def test_fallback_report_includes_research_admission_and_rejection_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts = production._JudgeProgressFacts(
+        provider_usage="Research-model attempts=6; replay provider calls=0.",
+        portfolio_count=0,
+        portfolio_cap=50,
+        portfolio_cap_reason="repeated_pre_admission_failure",
+        advanced_branch_disposition="Advanced branches were not entered.",
+        research_progress=(
+            "Research admission: branches attempted=3; proposal responses accepted=3; "
+            "implementation responses accepted=2; repair responses accepted=2; "
+            "rejected pre-execution=3; candidates admitted=0; training started=0; "
+            "inner evaluations completed=0; outer evaluations completed=0."
+        ),
+        research_outcome=(
+            "Research admission closed before a candidate was admitted; "
+            "controller reason=repeated_pre_admission_failure."
+        ),
+        research_rejections=(
+            "Research rejection roots: candidate_path_policy:forbidden_basename:baseline.py x3.",
+            "Research rejection terminals: materiality:declared_symbol_unchanged:main x2.",
+        ),
+    )
+    monkeypatch.setattr(production, "_judge_progress_facts", lambda _outcome: facts)
+    monkeypatch.setattr(
+        production,
+        "_baseline_mean",
+        lambda _qualification: MetricEvidence(
+            label="official-fm",
+            tier="qualified baseline",
+            gauc=0.6,
+            ndcg_at_5=0.4,
+            primary=0.5,
+            seeds=(0, 1, 2, 3, 4),
+            note="Official fallback.",
+        ),
+    )
+    monkeypatch.setattr(production, "_report_peak_rss_bytes", lambda *_args: 1024)
+
+    context = production._report_context(
+        candidate_id="official-fm-fallback-seed-4",
+        parent_id="official-fm-fallback-seed-4",
+        metrics=_metrics(0.6, 0.4),
+        qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
+        outcome=cast(
+            Any,
+            SimpleNamespace(
+                selection=None,
+                manual_interventions=0,
+                fallback_receipt_digest=_digest("b"),
+            ),
+        ),
+        generated=False,
+        failures=(),
+        confirmation=None,
+        campaign_wall_seconds=10.0,
+        launch_count=0,
+    )
+
+    assert context.failures_and_recoveries[:4] == (
+        facts.research_outcome,
+        facts.research_progress,
+        *facts.research_rejections,
+    )
+    assert "not agent-generated" in context.selection_rationale
 
 
 def test_current_runtime_reproof_rejects_source_or_lock_drift_and_is_path_independent(

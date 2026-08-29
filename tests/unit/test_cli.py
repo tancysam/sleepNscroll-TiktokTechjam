@@ -81,7 +81,16 @@ def test_provider_preflight_reports_live_availability_without_dispatching_api_ca
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-only-provider-preflight")
+    values = {
+        "INFERENCE_MAIN_API_KEY": "sk-test-main-provider-preflight",
+        "INFERENCE_MAIN_BASE_URL": "https://main.example/v1",
+        "INFERENCE_MAIN_MODEL": "main-model",
+        "INFERENCE_FALLBACK_API_KEY": "sk-test-fallback-provider-preflight",
+        "INFERENCE_FALLBACK_BASE_URL": "https://fallback.example/v1",
+        "INFERENCE_FALLBACK_MODEL": "fallback-model",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
 
     code = main(["provider", "preflight", "--config", str(ROOT / "configs/full-pure.toml")])
     output = capsys.readouterr()
@@ -92,22 +101,46 @@ def test_provider_preflight_reports_live_availability_without_dispatching_api_ca
     assert payload == {
         "api_request_sent": False,
         "config_digest": load_config(ROOT / "configs/full-pure.toml").digest,
-        "credential_env": "OPENAI_API_KEY",
+        "credential_env": None,
         "live_provider_used": True,
-        "model": "gpt-5.6-sol",
+        "model": None,
         "provider": "openai",
+        "provider_profiles": [
+            {
+                "base_url": "https://main.example/v1",
+                "credential_env": "INFERENCE_MAIN_API_KEY",
+                "model": "main-model",
+                "slot": "main",
+            },
+            {
+                "base_url": "https://fallback.example/v1",
+                "credential_env": "INFERENCE_FALLBACK_API_KEY",
+                "model": "fallback-model",
+                "slot": "fallback",
+            },
+        ],
         "run_kind": "autonomous",
         "schema_version": 1,
         "status": "available",
     }
-    assert "sk-test-only-provider-preflight" not in output.out
+    assert "sk-test-main-provider-preflight" not in output.out
+    assert "sk-test-fallback-provider-preflight" not in output.out
 
 
 def test_provider_preflight_missing_credential_is_redacted_and_nonzero(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    values = {
+        "INFERENCE_MAIN_API_KEY": "sk-test-main-provider-preflight",
+        "INFERENCE_MAIN_BASE_URL": "https://main.example/v1",
+        "INFERENCE_MAIN_MODEL": "main-model",
+        "INFERENCE_FALLBACK_BASE_URL": "https://fallback.example/v1",
+        "INFERENCE_FALLBACK_MODEL": "fallback-model",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("INFERENCE_FALLBACK_API_KEY", raising=False)
 
     code = main(["provider", "preflight", "--config", str(ROOT / "configs/full-pure.toml")])
     output = capsys.readouterr()
@@ -119,8 +152,8 @@ def test_provider_preflight_missing_credential_is_redacted_and_nonzero(
     assert diagnostic == {
         "category": "provider_unavailable",
         "code": "credential_missing",
-        "credential_env": "OPENAI_API_KEY",
-        "message": "The required OpenAI credential is unavailable.",
+        "credential_env": "INFERENCE_FALLBACK_API_KEY",
+        "message": "A required OpenAI-compatible credential is unavailable.",
         "provider": "openai",
         "retryable": True,
     }

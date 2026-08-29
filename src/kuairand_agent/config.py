@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
 
-SCHEMA_VERSION: Final = 2
-SUPPORTED_SCHEMA_VERSIONS: Final = frozenset({1, SCHEMA_VERSION})
+SCHEMA_VERSION: Final = 4
+SUPPORTED_SCHEMA_VERSIONS: Final = frozenset({1, 2, 3, SCHEMA_VERSION})
 HARD_MAX_LAUNCHES: Final = 50
 HARD_MAX_WALL_SECONDS: Final = 21_600
 HARD_MIN_FINALIZATION_RESERVE_SECONDS: Final = 3_600
@@ -99,12 +99,39 @@ class OpenAIResearchConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class OpenAIEndpointEnvConfig:
+    """Environment-variable selectors for one OpenAI-compatible provider endpoint."""
+
+    api_key_env: str
+    base_url_env: str
+    model_env: str
+    pricing: OpenAITokenPricingConfig
+    response_format: str = "json_schema"
+    max_tokens_parameter: str = "max_completion_tokens"
+    send_reasoning_effort: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIFailoverResearchConfig:
+    """Two dedicated provider profiles with one shared bounded call policy."""
+
+    main: OpenAIEndpointEnvConfig
+    fallback: OpenAIEndpointEnvConfig
+    reasoning_effort: str
+    timeout_seconds: float
+    max_response_bytes: int
+    max_output_tokens: int
+    max_malformed_retries: int
+    max_transport_retries: int
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchConfig:
     provider: str
     max_repairs_per_experiment: int
     run_kind: str = "demo"
     allow_scripted_demo: bool = False
-    openai: OpenAIResearchConfig | None = None
+    openai: OpenAIResearchConfig | OpenAIFailoverResearchConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +181,16 @@ class AgentConfig:
             "allow_scripted_demo": self.research.allow_scripted_demo,
         }
         if self.research.openai is not None:
-            result["openai"] = dataclasses.asdict(self.research.openai)
+            normalized_openai = dataclasses.asdict(self.research.openai)
+            if self.schema_version == 3 and isinstance(
+                self.research.openai, OpenAIFailoverResearchConfig
+            ):
+                for slot in ("main", "fallback"):
+                    endpoint = normalized_openai[slot]
+                    endpoint.pop("response_format")
+                    endpoint.pop("max_tokens_parameter")
+                    endpoint.pop("send_reasoning_effort")
+            result["openai"] = normalized_openai
         return result
 
     @property
@@ -215,12 +251,20 @@ def _boolean(table: Mapping[str, Any], key: str) -> bool:
 
 
 _PRICE_TEXT_RE: Final = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?$")
+_ENV_NAME_RE: Final = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 
 
 def _price_text(table: Mapping[str, Any], key: str) -> str:
     value = _string(table, key)
     if _PRICE_TEXT_RE.fullmatch(value) is None:
         raise ConfigError(f"{key} must be non-negative decimal text")
+    return value
+
+
+def _environment_name(table: Mapping[str, Any], key: str, location: str) -> str:
+    value = _string(table, key)
+    if _ENV_NAME_RE.fullmatch(value) is None:
+        raise ConfigError(f"{location} must be a portable uppercase environment name")
     return value
 
 
@@ -420,7 +464,7 @@ def parse_config(raw: Mapping[str, Any]) -> AgentConfig:
     allow_scripted_demo = (
         False if schema_version == 1 else _boolean(research_raw, "allow_scripted_demo")
     )
-    openai: OpenAIResearchConfig | None = None
+    openai: OpenAIResearchConfig | OpenAIFailoverResearchConfig | None = None
     openai_raw = research_raw.get("openai")
     if provider == "openai":
         if schema_version == 1:
@@ -428,18 +472,19 @@ def parse_config(raw: Mapping[str, Any]) -> AgentConfig:
         if not isinstance(openai_raw, Mapping):
             raise ConfigError("research.openai must be a TOML table for the OpenAI provider")
         openai_table = cast(Mapping[str, Any], openai_raw)
-        expected_openai = {
-            "model",
-            "base_url",
+        common_openai = {
             "reasoning_effort",
-            "api_key_env",
             "timeout_seconds",
             "max_response_bytes",
             "max_output_tokens",
             "max_malformed_retries",
             "max_transport_retries",
-            "pricing",
         }
+        expected_openai = (
+            common_openai | {"model", "base_url", "api_key_env", "pricing"}
+            if schema_version == 2
+            else common_openai | {"main", "fallback"}
+        )
         unknown_openai = set(openai_table) - expected_openai
         missing_openai = expected_openai - set(openai_table)
         if unknown_openai:
@@ -450,47 +495,133 @@ def parse_config(raw: Mapping[str, Any]) -> AgentConfig:
             raise ConfigError(
                 f"missing research.openai field(s): {', '.join(sorted(missing_openai))}"
             )
-        pricing_raw = _table(
-            openai_table,
-            "pricing",
-            {
-                "input_usd_per_million",
-                "cached_input_usd_per_million",
-                "output_usd_per_million",
-            },
-        )
         reasoning_effort = _string(openai_table, "reasoning_effort")
         if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise ConfigError("research.openai.reasoning_effort is unsupported")
-        openai = OpenAIResearchConfig(
-            model=_string(openai_table, "model"),
-            base_url=_string(openai_table, "base_url"),
-            reasoning_effort=reasoning_effort,
-            api_key_env=_string(openai_table, "api_key_env"),
-            timeout_seconds=_number(openai_table, "timeout_seconds", minimum=0.1, maximum=600.0),
-            max_response_bytes=_integer(
-                openai_table,
-                "max_response_bytes",
-                minimum=1024,
-                maximum=16 * 1024 * 1024,
-            ),
-            max_output_tokens=_integer(
-                openai_table, "max_output_tokens", minimum=1, maximum=200_000
-            ),
-            max_malformed_retries=_integer(
-                openai_table, "max_malformed_retries", minimum=0, maximum=1
-            ),
-            max_transport_retries=_integer(
-                openai_table, "max_transport_retries", minimum=0, maximum=3
-            ),
-            pricing=OpenAITokenPricingConfig(
+        timeout_seconds = _number(openai_table, "timeout_seconds", minimum=0.1, maximum=600.0)
+        max_response_bytes = _integer(
+            openai_table,
+            "max_response_bytes",
+            minimum=1024,
+            maximum=16 * 1024 * 1024,
+        )
+        max_output_tokens = _integer(openai_table, "max_output_tokens", minimum=1, maximum=200_000)
+        max_malformed_retries = _integer(
+            openai_table, "max_malformed_retries", minimum=0, maximum=1
+        )
+        max_transport_retries = _integer(
+            openai_table, "max_transport_retries", minimum=0, maximum=3
+        )
+
+        def pricing_config(table: Mapping[str, Any]) -> OpenAITokenPricingConfig:
+            pricing_raw = _table(
+                table,
+                "pricing",
+                {
+                    "input_usd_per_million",
+                    "cached_input_usd_per_million",
+                    "output_usd_per_million",
+                },
+            )
+            return OpenAITokenPricingConfig(
                 input_usd_per_million=_price_text(pricing_raw, "input_usd_per_million"),
                 cached_input_usd_per_million=_price_text(
                     pricing_raw, "cached_input_usd_per_million"
                 ),
                 output_usd_per_million=_price_text(pricing_raw, "output_usd_per_million"),
-            ),
-        )
+            )
+
+        if schema_version == 2:
+            openai = OpenAIResearchConfig(
+                model=_string(openai_table, "model"),
+                base_url=_string(openai_table, "base_url"),
+                reasoning_effort=reasoning_effort,
+                api_key_env=_environment_name(
+                    openai_table, "api_key_env", "research.openai.api_key_env"
+                ),
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=max_response_bytes,
+                max_output_tokens=max_output_tokens,
+                max_malformed_retries=max_malformed_retries,
+                max_transport_retries=max_transport_retries,
+                pricing=pricing_config(openai_table),
+            )
+        else:
+            endpoints: list[OpenAIEndpointEnvConfig] = []
+            environment_names: list[str] = []
+            for slot in ("main", "fallback"):
+                endpoint_fields = {"api_key_env", "base_url_env", "model_env", "pricing"}
+                if schema_version >= 4:
+                    endpoint_fields |= {
+                        "response_format",
+                        "max_tokens_parameter",
+                        "send_reasoning_effort",
+                    }
+                endpoint = _table(
+                    openai_table,
+                    slot,
+                    endpoint_fields,
+                )
+                api_key_env = _environment_name(
+                    endpoint, "api_key_env", f"research.openai.{slot}.api_key_env"
+                )
+                base_url_env = _environment_name(
+                    endpoint, "base_url_env", f"research.openai.{slot}.base_url_env"
+                )
+                model_env = _environment_name(
+                    endpoint, "model_env", f"research.openai.{slot}.model_env"
+                )
+                environment_names.extend((api_key_env, base_url_env, model_env))
+                endpoints.append(
+                    OpenAIEndpointEnvConfig(
+                        api_key_env=api_key_env,
+                        base_url_env=base_url_env,
+                        model_env=model_env,
+                        pricing=pricing_config(endpoint),
+                        response_format=(
+                            _string(endpoint, "response_format")
+                            if schema_version >= 4
+                            else "json_schema"
+                        ),
+                        max_tokens_parameter=(
+                            _string(endpoint, "max_tokens_parameter")
+                            if schema_version >= 4
+                            else "max_completion_tokens"
+                        ),
+                        send_reasoning_effort=(
+                            _boolean(endpoint, "send_reasoning_effort")
+                            if schema_version >= 4
+                            else True
+                        ),
+                    )
+                )
+                if endpoints[-1].response_format not in {"json_schema", "json_object"}:
+                    raise ConfigError(
+                        f"research.openai.{slot}.response_format must be "
+                        "'json_schema' or 'json_object'"
+                    )
+                if endpoints[-1].max_tokens_parameter not in {
+                    "max_completion_tokens",
+                    "max_tokens",
+                }:
+                    raise ConfigError(
+                        f"research.openai.{slot}.max_tokens_parameter must be "
+                        "'max_completion_tokens' or 'max_tokens'"
+                    )
+            if len(set(environment_names)) != len(environment_names):
+                raise ConfigError(
+                    "research.openai main and fallback must use six distinct environment names"
+                )
+            openai = OpenAIFailoverResearchConfig(
+                main=endpoints[0],
+                fallback=endpoints[1],
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=max_response_bytes,
+                max_output_tokens=max_output_tokens,
+                max_malformed_retries=max_malformed_retries,
+                max_transport_retries=max_transport_retries,
+            )
     elif openai_raw is not None:
         raise ConfigError("research.openai is only valid when research.provider is 'openai'")
     if run_kind == "autonomous" and provider != "openai":

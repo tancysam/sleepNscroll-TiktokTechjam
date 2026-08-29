@@ -18,6 +18,11 @@ from kuairand_agent.research.schemas import (
     ParentSnapshot,
     ParentSourceFile,
 )
+from kuairand_agent.research.source_policy import (
+    DEFAULT_CANDIDATE_SOURCE_POLICY,
+    CandidateManifestPolicyError,
+    CandidateSourcePolicy,
+)
 
 BASE_SOURCE = """\
 def score(value: float) -> float:
@@ -49,6 +54,34 @@ def package(path: str, content: str) -> GeneratedPackage:
         material_change_summary="Change the score function body.",
         material_symbols=("score",),
     )
+
+
+def test_default_source_policy_has_canonical_wire_identity_and_manifest_fingerprints() -> None:
+    policy = DEFAULT_CANDIDATE_SOURCE_POLICY
+
+    assert policy.final_entrypoint == "candidate.py"
+    assert policy.allowed_suffixes == (".json", ".md", ".py")
+    assert "baseline.py" in policy.forbidden_basenames
+    assert policy.overlay_semantics == "complete_file_overlay"
+    assert CandidateSourcePolicy.from_mapping(policy.to_wire()) == policy
+    assert len(policy.digest) == 64
+
+    with pytest.raises(CandidateManifestPolicyError) as forbidden:
+        policy.validate_manifest(("candidate.py", "baseline.py"))
+    assert forbidden.value.fingerprint == ("candidate_path_policy:forbidden_basename:baseline.py")
+
+    with pytest.raises(CandidateManifestPolicyError) as unsupported:
+        policy.validate_manifest(("candidate.py", "submission.csv"))
+    assert unsupported.value.fingerprint == ("candidate_path_policy:unsupported_suffix:.csv")
+
+
+def test_source_policy_requires_entrypoint_in_final_tree_but_allows_helper_only_overlay() -> None:
+    policy = DEFAULT_CANDIDATE_SOURCE_POLICY
+
+    policy.validate_manifest(("pairwise_fm.py",), parent_paths=("candidate.py",))
+    with pytest.raises(CandidateManifestPolicyError) as missing:
+        policy.validate_manifest(("pairwise_fm.py",), parent_paths=())
+    assert missing.value.fingerprint == "candidate_manifest:missing_entrypoint:candidate.py"
 
 
 def test_materialization_is_disposable_reproducible_and_parent_preserving(
