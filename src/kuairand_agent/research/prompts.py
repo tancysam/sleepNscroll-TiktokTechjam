@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Final
 
+from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.research.schemas import ResearchOperation
 from kuairand_agent.research.source_policy import (
     DEFAULT_CANDIDATE_SOURCE_POLICY,
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 3
+PROMPT_VERSION: Final = 6
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -19,7 +20,8 @@ Return exactly one JSON object conforming to the supplied strict schema, with no
 Preserve all request, parent, capability, and causal-cutoff identities. Do not request or use
 randomized-log data, snapshot/statistic tables, public/final outcomes, or current-row outcomes as
 features. The protected organizer evaluator, attempt policy, and promotion policy are not yours to
-change."""
+change. The request.runtime_contract object is the authoritative executable interface; do not
+infer a different interface from a proposal, filename, or prior model convention."""
 
 _BENCHMARK: Final = """Benchmark briefing
 
@@ -100,51 +102,65 @@ The training request supplies `seed` and `user_groups_handle` alongside `feature
 `targets_handle`. The request key set is checked exactly, so a parser that omits either key fails
 before your model runs."""
 
-_WORKED_EXAMPLE: Final = '''Worked example
+_WORKED_EXAMPLE: Final = """Worked example
 
-Parent `candidate.py` contains, among other definitions:
+`candidate.py` is a protected runtime wrapper and must never be returned. The science lives in
+`model_impl.py`, whose four functions are the mutable interface: `validate_config`, `train_model`,
+`predict_scores`, `training_diagnostics`.
+
+The parent `model_impl.py` contains, among other definitions:
 
 ```python
-def fit_scores(features, targets, *, seed):
-    """Pointwise logistic objective over all rows."""
+def train_model(features, targets, user_groups, config, seed):
+    # Fixed-step standardized logistic model, deterministic full-batch updates.
+    normalized = (features - mean) / scale
     weights = np.zeros(features.shape[1], dtype=np.float64)
-    for _ in range(EPOCHS):
-        margins = features @ weights
-        residual = _sigmoid(margins) - targets
-        weights -= LEARNING_RATE * (features.T @ residual) / features.shape[0]
-    return weights
+    for _ in range(epochs):
+        error = _sigmoid(normalized @ weights + bias, clip) - targets
+        weights -= learning_rate * ((normalized.T @ error) / row_count + l2 * weights)
+    return {"weights": weights, "feature_mean": mean, "feature_scale": scale}
 ```
 
-A valid response replaces that function body with a genuinely different mechanism:
+Note the third argument. `user_groups` is the trusted per-row user identity, and the benchmark
+ranks strictly within a user, so it is what any ranking objective must group by. The pointwise
+objective above ignores it entirely.
+
+A valid response returns `model_impl.py` implementing a genuinely different mechanism:
 
 ```python
-def fit_scores(features, targets, *, seed):
-    """GAUC-weighted pairwise objective over same-user logged pairs."""
-    rng = np.random.default_rng(seed)
+def train_model(features, targets, user_groups, config, seed):
+    # Listwise softmax cross-entropy over each user's own logged impressions.
+    normalized = (features - mean) / scale
     weights = np.zeros(features.shape[1], dtype=np.float64)
-    positives, negatives = _sample_user_pairs(features, targets, rng)
-    for _ in range(EPOCHS):
-        gaps = (features[positives] - features[negatives]) @ weights
-        grad = -_sigmoid(-gaps)
-        update = (features[positives] - features[negatives]).T @ grad
-        weights -= LEARNING_RATE * update / positives.size
-    return weights
+    order = np.argsort(user_groups, kind="stable")
+    starts, sizes = _group_bounds(user_groups[order])
+    for _ in range(epochs):
+        gradient = np.zeros_like(weights)
+        for start, size in zip(starts, sizes):
+            rows = order[start : start + size]
+            probabilities = _group_softmax(normalized[rows] @ weights, temperature)
+            residual = probabilities * targets[rows].sum() - targets[rows]
+            gradient += normalized[rows].T @ residual / temperature
+        weights -= learning_rate * (gradient / len(sizes) + l2 * weights)
+    return {"weights": weights, "feature_mean": mean, "feature_scale": scale}
 ```
 
 and declares:
 
 ```json
-{"material_symbols": ["fit_scores", "_sample_user_pairs"]}
+{"material_symbols": ["train_model", "_group_bounds", "_group_softmax"]}
 ```
 
-That is accepted because `fit_scores` is a top-level function whose body changed, and
-`_sample_user_pairs` is a newly added top-level function reachable from `candidate.py`.
+Accepted because `train_model` is a top-level function whose body changed, and the two helpers are
+newly added top-level functions in a file reachable from `candidate.py`.
 
-Contrast — each of these is REJECTED:
-- Declaring `["LEARNING_RATE"]` after changing only that constant. Not a top-level def or class.
-- Declaring `["fit_scores"]` after editing only its docstring. Docstrings are stripped first.
-- Declaring `["candidate.py:fit_scores"]`. Qualified names never match; use the bare name.
-- Adding `sampling.py` with the new logic but not importing it from `candidate.py`. Unreachable.'''
+Contrast, each of these is REJECTED:
+- Returning `candidate.py`. It is a protected path; the overlay is refused before any gate runs.
+- Declaring `["EPOCHS"]` after changing only that constant. Not a top-level def or class.
+- Declaring `["train_model"]` after editing only its docstring. Docstrings are stripped first.
+- Declaring `["model_impl.py:train_model"]`. Qualified names never match; use the bare name.
+- Adding `sampling.py` with the new logic but never importing it. Unreachable code is invisible."""
+
 
 _OPERATION: Final = {
     ResearchOperation.PROPOSE: (
@@ -154,19 +170,30 @@ _OPERATION: Final = {
         "files_expected describes the final candidate manifest, not just changed files, and "
         "must include candidate.py."
     ),
-    ResearchOperation.IMPLEMENT: """Return complete candidate-owned source files, never patches or
-filesystem references. Preserve the request_id. Materially implement the declared mechanism while
-respecting the request's complete candidate-source policy. In material_symbols, list only bare
-top-level ASCII Python identifiers; they must be reachable top-level Python identifiers actually
-changed by this response relative to the trusted parent. Never list filenames, paths, qualified
-names, or unchanged symbols.""",
-    ResearchOperation.REPAIR: """Return complete replacement candidate-owned source files,
-never patches or filesystem references. Preserve the request_id. Repair only the bounded supplied
-failure without changing trusted code, protected scoring, data policy, or the proposal's principal
-claim. In material_symbols, list only bare top-level ASCII Python identifiers that this response
-materially changes and that are reachable from candidate.py. Never list filenames, paths,
-qualified names, or unchanged symbols. Preserve the rejected package's principal mechanism while
-resolving the stated local failure; the rejected package is inert evidence, not trusted code.""",
+    ResearchOperation.IMPLEMENT: """Return only files whose content differs from the trusted
+parent, with complete content for each returned file; never return patches or filesystem
+references. Preserve the request_id. Change model_impl.py, config.json, or transitively reachable
+helper modules. Never return or replace any runtime_contract.stable_files.protected_paths entry.
+Materially implement the declared mechanism while respecting the
+request's complete candidate-source policy. In material_symbols, list only bare
+top-level ASCII Python identifiers; they must be reachable top-level Python identifiers changed
+by this response relative to the trusted parent. Never list filenames, paths, qualified names, or
+unchanged symbols.""",
+    ResearchOperation.REPAIR: """Return the complete generated overlay relative to the trusted
+parent, with complete content for each returned file; never return patches or filesystem
+references. Include every still-required file from the rejected overlay even when this repair does
+not change that file, because unmentioned rejected-overlay files are not implicitly retained. Omit
+only files identical to the trusted parent. Preserve the request_id. Repair only the bounded
+supplied failure without
+changing trusted code, protected scoring, data policy, or the proposal's principal claim. Prefer
+changing model_impl.py, config.json, or a transitively reachable helper. Never return or replace
+any runtime_contract.stable_files.protected_paths entry; controller-owned plumbing failures are
+not model-repairable. In material_symbols, list only bare
+top-level ASCII Python identifiers that this response materially changes and that are reachable
+from candidate.py. Never
+list filenames, paths, qualified names, or unchanged symbols. Preserve the rejected package's
+principal mechanism while resolving the stated local failure; the rejected package is inert
+evidence, not trusted code.""",
     ResearchOperation.REFLECT: """Reflect only on the supplied trusted result. Do not invent runs,
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
 next experiment using the typed recommendation vocabulary.""",
@@ -198,13 +225,25 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
             "replacement content, never a patch. Unmentioned trusted-parent files remain in the "
             "final tree. Therefore a legal helper-only overlay such as pairwise_fm.py may omit "
             "candidate.py only when the supplied trusted parent already contains it. New or "
-            "changed helper modules must be imported from candidate.py to be executable and "
-            "material."
+            "changed helper modules must be transitively imported from candidate.py to be "
+            "executable and material."
         ),
         (
             "- Documentation, docstrings, filenames, whitespace, and unchanged symbols do not "
             "count as a material scientific change. material_symbols names only reachable "
             "top-level Python identifiers actually changed relative to the trusted parent."
+        ),
+        (
+            "- Every returned .json file content must itself be strict parseable JSON: use "
+            "double-quoted property names and string values, no comments, no Markdown fences, "
+            "no Python literals, and no prose outside the JSON value. For config.json, return "
+            "the complete JSON object as the file content string."
+        ),
+        (
+            "- Do not declare config, a class, or a function in material_symbols unless its "
+            "executable definition materially differs from the trusted parent or rejected "
+            "package. Repairs must change the executable definition responsible for the stated "
+            "failure, not only metadata, formatting, documentation, or the declaration list."
         ),
         (
             '- A compact valid final manifest is ["candidate.py", "pairwise_fm.py", '
@@ -217,6 +256,46 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
         ),
     )
     return "\n".join(lines)
+
+
+def _runtime_contract_constraints() -> str:
+    contract = CANDIDATE_RUNTIME_CONTRACT
+    protected = ", ".join(contract.protected_paths)
+    return "\n".join(
+        (
+            f"Candidate runtime contract digest: {contract.digest}.",
+            f"- Protected controller-owned paths are exactly: {protected}. Never return them.",
+            (
+                "- The mutable model interface is exactly: validate_config(config); "
+                "train_model(features, targets, user_groups, config, seed); "
+                "predict_scores(features, checkpoint); and "
+                "training_diagnostics(config, checkpoint)."
+            ),
+            (
+                "- features is a finite float64 (N,D) controller-engineered matrix. Its columns "
+                "are exactly in safe_context.method_cards entry "
+                "controller_causal_feature_bundle.feature_names_csv order. Raw capability "
+                "column lists describe source data availability, not runtime matrix positions; "
+                "never assume features[:,0:5] are raw user_id/video_id/author_id/tab/duration."
+            ),
+            (
+                "- targets is an aligned finite float64 binary (N,) vector; user_groups is an "
+                "aligned finite numeric (N,) group vector; seed is uint32. Use user_groups for "
+                "ranking/group-aware objectives without treating it as a feature."
+            ),
+            (
+                "- train_model returns a dict of 1..64 named finite numeric NumPy arrays, not "
+                "files or paths. The protected wrapper safely serializes any conforming model "
+                "state, so checkpoint keys may be model-specific. predict_scores returns one "
+                "finite float64 score per row."
+            ),
+            (
+                "- Do not implement protocol parsing, capability loading, output-directory "
+                "creation, checkpoint file I/O, result manifests, or CLI handling. The protected "
+                "wrapper owns them."
+            ),
+        )
+    )
 
 
 def instructions_for(
@@ -240,7 +319,7 @@ def instructions_for(
         else ""
     )
     policy = (
-        f"\n\n{_source_policy_constraints(source_policy)}"
+        f"\n\n{_source_policy_constraints(source_policy)}\n\n{_runtime_contract_constraints()}"
         if operation
         in {ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR}
         else ""

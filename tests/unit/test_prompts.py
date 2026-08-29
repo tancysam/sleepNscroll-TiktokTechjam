@@ -161,9 +161,9 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 
 
 def test_prompt_version_matches_the_response_schema_name() -> None:
-    """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v3``."""
+    """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v6``."""
 
-    assert PROMPT_VERSION == 3
+    assert PROMPT_VERSION == 6
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])

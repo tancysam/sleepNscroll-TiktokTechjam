@@ -138,15 +138,15 @@ def test_hard_six_hour_ceiling_marks_work_expired() -> None:
     )
 
 
-def test_deadline_manifest_is_strict_and_reserve_is_at_least_one_hour() -> None:
+def test_deadline_manifest_is_strict_and_reserve_is_at_least_ten_minutes() -> None:
     clock = _clock()
     state = DeadlineState.start(clock)
     invalid = state.manifest()
     invalid["unexpected"] = 1
     with pytest.raises(DeadlineError, match="unknown"):
         DeadlineState.from_manifest(invalid)
-    with pytest.raises(DeadlineError, match="at least 3600"):
-        DeadlineState.start(clock, wall_clock_seconds=10_000, finalization_reserve_seconds=3_599)
+    with pytest.raises(DeadlineError, match="at least 600"):
+        DeadlineState.start(clock, wall_clock_seconds=3_600, finalization_reserve_seconds=599)
 
 
 def test_system_clock_has_stable_unprivileged_boot_identity_fallback(

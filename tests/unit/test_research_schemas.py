@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.research.schemas import (
     FailureCategory,
     GeneratedFile,
@@ -204,12 +205,19 @@ def test_agent_requests_round_trip_one_exact_candidate_source_policy() -> None:
         wire = request.to_wire()
         assert wire["source_policy"] == DEFAULT_CANDIDATE_SOURCE_POLICY.to_wire()
         assert wire["source_policy_digest"] == DEFAULT_CANDIDATE_SOURCE_POLICY.digest
+        assert wire["runtime_contract"] == CANDIDATE_RUNTIME_CONTRACT.to_wire()
+        assert wire["runtime_contract_digest"] == CANDIDATE_RUNTIME_CONTRACT.digest
         assert parser(wire) == request
 
         tampered = dict(wire)
         tampered["source_policy_digest"] = "0" * 64
         with pytest.raises(SchemaValidationError, match="source policy digest mismatch"):
             parser(tampered)
+
+        tampered_contract = dict(wire)
+        tampered_contract["runtime_contract_digest"] = "0" * 64
+        with pytest.raises(SchemaValidationError, match="runtime contract digest mismatch"):
+            parser(tampered_contract)
 
 
 def test_rejected_package_snapshot_preserves_forbidden_source_inertly_and_detects_tampering() -> (

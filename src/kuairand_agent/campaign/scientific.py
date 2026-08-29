@@ -37,7 +37,8 @@ SCIENTIFIC_SCHEMA_VERSION: Final = 1
 HARD_LAUNCH_LIMIT: Final = 50
 HARD_OUTER_PROMOTION_LIMIT: Final = 6
 HARD_WALL_CLOCK_SECONDS: Final = 21_600
-MIN_FINALIZATION_RESERVE_SECONDS: Final = 3_600
+MIN_FINALIZATION_RESERVE_SECONDS: Final = 600
+DEFAULT_FINALIZATION_RESERVE_SECONDS: Final = 3_600
 MATCHED_SEEDS: Final = (0, 1, 2)
 SAFE_REPORTING_PRECISION: Final = 4
 FOLD_DATES: Final = {
@@ -164,7 +165,7 @@ class ScientificCampaignConfig:
     screen_margin: float = 0.0
     elapsed_seconds_at_start: float = 0.0
     wall_clock_seconds: int = HARD_WALL_CLOCK_SECONDS
-    finalization_reserve_seconds: int = MIN_FINALIZATION_RESERVE_SECONDS
+    finalization_reserve_seconds: int = DEFAULT_FINALIZATION_RESERVE_SECONDS
     reporting_precision: int = field(init=False, default=SAFE_REPORTING_PRECISION)
     max_launches: int = field(init=False, default=HARD_LAUNCH_LIMIT)
     outer_promotion_limit: int = field(init=False, default=HARD_OUTER_PROMOTION_LIMIT)
@@ -202,7 +203,7 @@ class ScientificCampaignConfig:
             < self.wall_clock_seconds
         ):
             raise ScientificCampaignError(
-                "finalization_reserve_seconds must be at least 3600 and below the wall clock"
+                "finalization_reserve_seconds must be at least 600 and below the wall clock"
             )
         elapsed = _finite_nonnegative(self.elapsed_seconds_at_start, "elapsed_seconds_at_start")
         if elapsed > self.wall_clock_seconds:
