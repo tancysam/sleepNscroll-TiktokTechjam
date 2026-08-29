@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 4
 
 [benchmark]
 name = "kuairand-pure"
@@ -31,22 +31,39 @@ run_kind = "autonomous"
 allow_scripted_demo = false
 
 [research.openai]
-model = "gpt-5.6-sol"
-base_url = "https://api.openai.com/v1"
-# "high" rather than "xhigh". Reasoning effort applies uniformly to all four research operations
-# (provider.py:387-418 reads a single frozen config), so xhigh is paid on `implement` and
-# `repair` — which are code generation, not research — as well as on `propose`/`reflect`.
-# Total token consumption is scored under Feasibility, and a reasoning timeout at
-# timeout_seconds = 300.0 surfaces as an opaque transport failure rather than a clean rejection.
+# "high" rather than "xhigh": reasoning effort is applied uniformly to all four research
+# operations, so xhigh is paid on `implement` and `repair` -- which are code generation, not
+# research -- as well as on `propose`/`reflect`. Total token consumption is scored under
+# Feasibility. Raise this only with a measured reason.
 reasoning_effort = "high"
-api_key_env = "OPENAI_API_KEY"
-timeout_seconds = 300.0
+timeout_seconds = 600.0
 max_response_bytes = 8388608
 max_output_tokens = 65536
 max_malformed_retries = 1
 max_transport_retries = 2
 
-[research.openai.pricing]
+[research.openai.main]
+api_key_env = "INFERENCE_MAIN_API_KEY"
+base_url_env = "INFERENCE_MAIN_BASE_URL"
+model_env = "INFERENCE_MAIN_MODEL"
+response_format = "json_schema"
+max_tokens_parameter = "max_completion_tokens"
+send_reasoning_effort = true
+
+[research.openai.main.pricing]
+input_usd_per_million = "4.00"
+cached_input_usd_per_million = "0.40"
+output_usd_per_million = "20.00"
+
+[research.openai.fallback]
+api_key_env = "INFERENCE_FALLBACK_API_KEY"
+base_url_env = "INFERENCE_FALLBACK_BASE_URL"
+model_env = "INFERENCE_FALLBACK_MODEL"
+response_format = "json_schema"
+max_tokens_parameter = "max_completion_tokens"
+send_reasoning_effort = true
+
+[research.openai.fallback.pricing]
 input_usd_per_million = "4.00"
 cached_input_usd_per_million = "0.40"
 output_usd_per_million = "20.00"

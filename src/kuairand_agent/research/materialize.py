@@ -12,14 +12,12 @@ import ast
 import difflib
 import hashlib
 import os
-import re
 import shutil
 import stat
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Final
 
 from kuairand_agent.research.schemas import (
     GeneratedPackage,
@@ -29,61 +27,10 @@ from kuairand_agent.research.schemas import (
     canonical_digest,
     parse_json_object,
 )
-
-MAX_GENERATED_FILES: Final = 12
-MAX_GENERATED_FILE_BYTES: Final = 512 * 1024
-MAX_GENERATED_TOTAL_BYTES: Final = 1024 * 1024
-ALLOWED_SUFFIXES: Final = frozenset({".py", ".json", ".md"})
-_TRUSTED_ROOTS: Final = frozenset(
-    {
-        "kuairand_agent",
-        "kuairand-starter-kit",
-        "kuairand_starter_kit",
-        "tests",
-        "scripts",
-        "configs",
-        "docs",
-    }
+from kuairand_agent.research.source_policy import (
+    DEFAULT_CANDIDATE_SOURCE_POLICY,
+    CandidateManifestPolicyError,
 )
-_FORBIDDEN_BASENAMES: Final = frozenset(
-    {
-        "data.py",
-        "evaluate.py",
-        "baseline.py",
-        "submit.py",
-        "sitecustomize.py",
-        "usercustomize.py",
-        "conftest.py",
-        "pyproject.toml",
-    }
-)
-_FORBIDDEN_IMPORT_ROOTS: Final = frozenset(
-    {
-        "kuairand_agent",
-        "subprocess",
-        "socket",
-        "urllib",
-        "http",
-        "requests",
-        "httpx",
-        "aiohttp",
-        "ftplib",
-        "os",
-        "sys",
-        "shutil",
-        "glob",
-        "tempfile",
-        "ctypes",
-        "importlib",
-        "multiprocessing",
-        "pickle",
-        "marshal",
-        "builtins",
-        "webbrowser",
-    }
-)
-_FORBIDDEN_CALLS: Final = frozenset({"eval", "exec", "compile", "__import__", "breakpoint"})
-_PORTABLE_PATH_RE: Final = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\Z")
 
 
 class CandidateMaterializationError(ValueError):
@@ -128,29 +75,10 @@ class MaterialChangeEvidence:
 
 
 def _validate_path(value: str, *, generated: bool) -> PurePosixPath:
-    if type(value) is not str or not value or "\\" in value or "\x00" in value:
-        raise CandidateMaterializationError("candidate path must be a non-empty POSIX path")
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise CandidateMaterializationError("candidate path contains a control character")
-    if _PORTABLE_PATH_RE.fullmatch(value) is None:
-        raise CandidateMaterializationError(f"candidate path is not portable: {value!r}")
-    path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise CandidateMaterializationError(f"candidate path is unsafe: {value!r}")
-    if path.as_posix() != value:
-        raise CandidateMaterializationError(f"candidate path is not canonical: {value!r}")
-    if any(part.startswith(".") for part in path.parts):
-        raise CandidateMaterializationError(f"hidden candidate path is forbidden: {value!r}")
-    if path.parts[0] in _TRUSTED_ROOTS:
-        raise CandidateMaterializationError(f"trusted candidate path is forbidden: {value!r}")
-    if path.name in _FORBIDDEN_BASENAMES:
-        raise CandidateMaterializationError(f"reserved candidate filename is forbidden: {value!r}")
-    if path.suffix not in ALLOWED_SUFFIXES:
-        kind = "generated" if generated else "parent"
-        raise CandidateMaterializationError(
-            f"{kind} candidate file suffix is not allowed: {value!r}"
-        )
-    return path
+    try:
+        return DEFAULT_CANDIDATE_SOURCE_POLICY.validate_path(value, generated=generated)
+    except CandidateManifestPolicyError as exc:
+        raise CandidateMaterializationError(str(exc)) from exc
 
 
 def _validate_package(parent: ParentSnapshot, package: GeneratedPackage) -> None:
@@ -158,20 +86,23 @@ def _validate_package(parent: ParentSnapshot, package: GeneratedPackage) -> None
         raise CandidateMaterializationError("parent must be a ParentSnapshot")
     if not isinstance(package, GeneratedPackage):
         raise CandidateMaterializationError("package must be a GeneratedPackage")
-    if len(package.files) > MAX_GENERATED_FILES:
-        raise CandidateMaterializationError("generated package exceeds the file-count limit")
+    policy = DEFAULT_CANDIDATE_SOURCE_POLICY
+    try:
+        policy.validate_manifest(
+            (value.path for value in package.files),
+            parent_paths=(value.path for value in parent.files),
+        )
+    except CandidateManifestPolicyError as exc:
+        raise CandidateMaterializationError(str(exc)) from exc
     total = 0
-    for parent_file in parent.files:
-        _validate_path(parent_file.path, generated=False)
     for generated_file in package.files:
-        _validate_path(generated_file.path, generated=True)
         size = len(generated_file.content.encode("utf-8"))
-        if size > MAX_GENERATED_FILE_BYTES:
+        if size > policy.max_generated_file_bytes:
             raise CandidateMaterializationError(
                 f"generated file {generated_file.path!r} exceeds the byte limit"
             )
         total += size
-    if total > MAX_GENERATED_TOTAL_BYTES:
+    if total > policy.max_generated_total_bytes:
         raise CandidateMaterializationError("generated package exceeds the total byte limit")
 
 
@@ -365,12 +296,12 @@ def _validate_python(path: str, content: str) -> ast.Module:
                 continue
             imported = (node.module or "",)
         for name in imported:
-            if _import_root(name) in _FORBIDDEN_IMPORT_ROOTS:
+            if _import_root(name) in DEFAULT_CANDIDATE_SOURCE_POLICY.forbidden_import_roots:
                 raise CandidateStaticError(f"forbidden import {name!r} in {path!r}")
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in _FORBIDDEN_CALLS
+            and node.func.id in DEFAULT_CANDIDATE_SOURCE_POLICY.forbidden_calls
         ):
             raise CandidateStaticError(f"forbidden call {node.func.id!r} in {path!r}")
     return tree
@@ -392,8 +323,9 @@ def validate_candidate_static(candidate: MaterializedCandidate) -> StaticGateRes
             except SchemaValidationError as exc:
                 raise CandidateStaticError(f"invalid JSON in {value.path!r}: {exc}") from exc
             json_files.append(value.path)
-    if "candidate.py" not in python_files:
-        raise CandidateStaticError("candidate tree must contain the candidate.py entry point")
+    entrypoint = DEFAULT_CANDIDATE_SOURCE_POLICY.final_entrypoint
+    if entrypoint not in python_files:
+        raise CandidateStaticError(f"candidate tree must contain the {entrypoint} entry point")
     return StaticGateResult(tuple(python_files), tuple(json_files))
 
 

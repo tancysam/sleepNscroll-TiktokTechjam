@@ -20,12 +20,80 @@ UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research
   kuairand-agent --help
 ```
 
-`configs/full-pure.toml` is the production autonomous configuration. It uses the OpenAI Responses
-API with strict structured outputs and requires `OPENAI_API_KEY`. The convenience launcher loads
-that variable from an ignored `.env.local` when present. Provider calls generate only typed
-proposal, complete-file implementation/repair, and reflection records; they never receive shell,
-filesystem, evaluator, public-label, or final-outcome authority. The frozen model and pricing
-fields are explicit campaign identity rather than values inferred at runtime.
+`configs/full-pure.toml` is the production autonomous configuration. It uses two OpenAI-compatible
+Chat Completions profiles with strict structured output by default. Copy `.env.example` to the ignored
+`.env.local` and set all six production values:
+
+```dotenv
+INFERENCE_MAIN_API_KEY=
+INFERENCE_MAIN_BASE_URL=https://api.openai.com/v1
+INFERENCE_MAIN_MODEL=gpt-5.6-sol
+INFERENCE_FALLBACK_API_KEY=
+INFERENCE_FALLBACK_BASE_URL=
+INFERENCE_FALLBACK_MODEL=
+```
+
+Both base URLs must implement `POST {base_url}/chat/completions`. Both dedicated credentials are
+checked before a campaign starts. Each provider
+keeps bounded HTTP/transport and malformed-response retries. For HTTP `429`, the adapter honors a
+bounded `Retry-After` value when it fits within the remaining research time before the finalization
+reserve, otherwise uses bounded exponential backoff with jitter, and records retry-wait time
+separately from network latency. Every transport timeout is capped to that same remaining research
+window, and an exhausted shared deadline starts neither a new main call nor a fallback call. A
+second consecutive `429` ends that provider route so the same logical inference operation can use
+the fallback instead of immediately sending a third request to a throttled endpoint. If the main
+provider otherwise ends with a typed provider error, the operation is also attempted on fallback;
+fallback then remains active for later operations. If both profiles fail, the campaign reports
+provider-chain exhaustion rather than silently switching to scripted research. Configure each
+profile's actual token prices in its corresponding `pricing` table in `full-pure.toml`.
+
+Each profile also declares its non-secret Chat Completions dialect in `full-pure.toml`. Keep
+`response_format = "json_schema"`, `max_tokens_parameter = "max_completion_tokens"`, and
+`send_reasoning_effort = true` for providers/models implementing those current fields. For a
+provider that supports Chat Completions but only portable JSON mode, select `json_object`,
+`max_tokens`, and `false`; the exact operation schema is then included in the system message and
+the same strict local parser, malformed-response retry, source policy, and admission checks remain
+in force. Main and fallback can use different dialects.
+
+Provider calls generate only typed proposal, complete-file implementation/repair, and reflection
+records; they never receive shell, filesystem, evaluator, public-label, or final-outcome authority.
+Schema-v2 single-provider and schema-v3 two-provider configurations remain supported for replay
+and backward compatibility, but the production schema-v4 config never silently reuses
+`OPENAI_API_KEY`.
+
+## Candidate-source admission and repair contract
+
+The trusted controller exposes one digest-bound candidate-source policy to every proposal,
+implementation, and repair request and derives the delivered agent instructions from that exact
+policy. It requires the final candidate tree to contain `candidate.py`, allows only the declared
+candidate-owned suffixes and bounded helper files, and preserves every existing forbidden
+basename, path root, import, call, and size guardrail. In particular, generated `baseline.py` and
+evaluator/submission artifacts such as `submission.csv` are forbidden. Responses contain complete
+replacement contents for every returned file rather than patches; documentation, filenames,
+docstrings, whitespace, and unchanged symbols do not count as an executable scientific change.
+
+Proposed file manifests are checked before implementation. An invalid manifest enters a bounded
+typed correction path and cannot consume candidate execution or training. Provider JSON acceptance
+alone is never candidate admission: generated packages still pass local path, static-policy,
+reachable-symbol, and executable-materiality validation before they can become a lineage node.
+
+When an implementation or repair package fails before materialization, the next repair request
+contains a bounded, inert, digest-verified snapshot of the exact rejected provider package, kept
+separate from the trusted parent. The research agent can therefore preserve its own scientific
+mechanism while moving it into legal candidate-owned files. The rejected package is never executed
+or published, every repair is applied freshly over the trusted parent, and all local admission
+checks rerun from scratch. Resume verifies the persisted request/response causal chain and does not
+repeat an already accepted provider call.
+
+Rejected initial-admission branches persist both the root and terminal failure fingerprints in an
+immutable per-iteration hash-chained journal. Resume reconstructs that journal and fails closed if
+an entry or link was changed; provider failure cannot erase already journaled initial-admission
+evidence. The first failure receives one bounded correction, a scientific family is blocked after
+its second pre-admission rejection, and the third occurrence of one identical root fingerprint
+closes initial admission as `repeated_pre_admission_failure`. The controller retains the official FM
+incumbent and finalizes rather than spending the remaining deadline repeating the same invalid
+request. Proposal novelty signatures also block prose-only duplicates and cap one untrained
+scientific family at two pre-admission attempts until trusted training/evaluation evidence advances.
 
 `configs/scripted-demo.toml` is a deterministic demo configuration and requires the explicit
 `allow_scripted_demo = true` acknowledgement. `configs/default.toml` and `configs/smoke.toml` are
@@ -59,8 +127,8 @@ kuairand-agent contract verify-starter [--starter-dir PATH]
 and official-FM qualification, creates a no-overwrite durable campaign, runs the bounded
 research policy selected by the explicit run kind, and finalizes the retained eligible lineage.
 An autonomous run repeatedly proposes, implements, evaluates, and reflects until a frozen
-convergence, iteration, launch, outer-promotion, reserve, or deadline terminal condition. It never silently resumes or
-replaces an existing run directory.
+convergence, iteration, launch, outer-promotion, repeated-pre-admission, reserve, or deadline
+terminal condition. It never silently resumes or replaces an existing run directory.
 
 `resume` verifies the original immutable campaign identity, reconciles unfinished subprocesses,
 continues only while the original launch/time policies permit, and then finalizes. It does not
@@ -208,8 +276,13 @@ UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research
 ```
 
 The final JSON result reports the selected candidate, fallback count, closed bundle root, bundle
-manifest SHA-256, submission SHA-256, organizer-check evidence, and replay evidence. A baseline
-result is reported as `baseline_reproduced`; the agent never fabricates an improvement label.
+manifest SHA-256, submission SHA-256, organizer-check evidence, and replay evidence. Research
+evidence separately counts attempted branches, accepted proposal/implementation/repair responses,
+pre-execution rejections, candidate admissions, training starts, and completed inner/outer
+evaluations. It also preserves bounded root/terminal rejection summaries, provider-route switches,
+and retry-wait evidence, so an accepted provider response cannot be described as trained or
+evaluated. A baseline result is reported as `baseline_reproduced` and explicitly remains the
+protected official FM fallback, not an agent-generated improvement.
 
 ## Replay a closed final bundle
 

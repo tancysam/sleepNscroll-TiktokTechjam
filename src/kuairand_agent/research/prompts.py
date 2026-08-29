@@ -1,56 +1,25 @@
-"""Versioned, authority-free instructions for the real research-model adapter.
-
-The candidate-contract text is rendered from the enforcement constants in
-``kuairand_agent.research.materialize`` rather than restated by hand, so the instructions the
-model receives can never drift from the checks the controller actually applies.  The wire schema
-in ``kuairand_agent.research.schemas`` is deliberately untouched: request digests bind replay
-identity, so constraints are taught here and enforced there.
-"""
+"""Versioned, authority-free instructions for the real research-model adapter."""
 
 from __future__ import annotations
 
 from typing import Final
 
-from kuairand_agent.research.materialize import (
-    ALLOWED_SUFFIXES,
-    MAX_GENERATED_FILE_BYTES,
-    MAX_GENERATED_FILES,
-    MAX_GENERATED_TOTAL_BYTES,
-    _FORBIDDEN_BASENAMES,
-    _FORBIDDEN_CALLS,
-    _FORBIDDEN_IMPORT_ROOTS,
-    _TRUSTED_ROOTS,
-)
 from kuairand_agent.research.schemas import ResearchOperation
+from kuairand_agent.research.source_policy import (
+    DEFAULT_CANDIDATE_SOURCE_POLICY,
+    CandidateSourcePolicy,
+)
 
-# Bound to the response JSON-schema name in provider.py; existing tests pin the ``_v1`` suffix.
-# The wire schemas are unchanged by this module, so the version stays fixed.
-PROMPT_VERSION: Final = 1
-
-
-def _quoted(values: frozenset[str] | set[str]) -> str:
-    return ", ".join(f"`{value}`" for value in sorted(values))
-
+PROMPT_VERSION: Final = 3
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
-
-Authority
-- You have no filesystem, shell, network, evaluator, credential, or tool authority.
-- Use only the supplied request. Never claim to have run code or observed metrics absent from it.
-- Never invent, estimate, or restate a metric value that the request did not give you.
-- The protected organizer evaluator, attempt policy, and promotion policy are not yours to change.
-- Preserve every request, parent, capability, and causal-cutoff identity exactly as supplied.
-
-Data policy
-- Do not request or use randomized-log data, snapshot/statistic tables, public or final outcomes,
-  or current-row outcome fields as features.
-- Outcome fields (`long_view`, `is_click`, `is_like`, `is_follow`, `is_comment`, `is_forward`,
-  `hate`, `play_time_ms`) may be training targets where the request permits, never same-row inputs.
-
-Response format
-- Return exactly one JSON object conforming to the supplied strict schema.
-- No markdown fence, no prose before or after, no trailing commentary."""
-
+Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
+tool authority. Never claim to have run code or observed metrics that are absent from the request.
+Return exactly one JSON object conforming to the supplied strict schema, with no markdown wrapper.
+Preserve all request, parent, capability, and causal-cutoff identities. Do not request or use
+randomized-log data, snapshot/statistic tables, public/final outcomes, or current-row outcomes as
+features. The protected organizer evaluator, attempt policy, and promotion policy are not yours to
+change."""
 
 _BENCHMARK: Final = """Benchmark briefing
 
@@ -101,55 +70,35 @@ Slate sizes: median 4 impressions per user, 90th percentile 12. Because most sla
 than 5, an nDCG@5 top-K truncation is inert for the majority of users; the gain concentrates in
 GAUC-eligible mixed-label users."""
 
+_PACKAGES: Final = """Execution environment
 
-_CANDIDATE_CONTRACT: Final = f"""Candidate source contract
+Available: `numpy` (import as `np`), plus the Python standard library minus the forbidden import
+roots supplied in the request. You have `math`, `json`, `dataclasses`, `typing`, `collections`,
+`itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.
+You do NOT have `os`, `sys`, `pickle`, `shutil`, `glob`, `tempfile`, `importlib`,
+`multiprocessing`, or any network library. The forbidden check is on the FIRST dotted component,
+so `import os.path` is rejected for the same reason as `import os`. Relative imports between your
+own files (`from . import helper`) are permitted.
 
-You return complete UTF-8 file contents, never patches, diffs, or filesystem references. The
-controller writes them into a fresh disposable directory and computes the diff itself.
+Serialize checkpoints with `numpy` (`np.savez`), never with `pickle`. Take every path from the
+parsed request object; never construct one with `os.path`.
 
-Package limits
-- At most {MAX_GENERATED_FILES} files.
-- At most {MAX_GENERATED_FILE_BYTES} bytes per file, {MAX_GENERATED_TOTAL_BYTES} bytes in total.
-- Allowed suffixes: {_quoted(ALLOWED_SUFFIXES)}. Nothing else.
+Naming, which is a common and costly mistake. Your request context includes an organizer artifact
+manifest listing `baseline.py`, `data.py`, `evaluate.py`, `submit.py`, `ablation_features.py`,
+`baseline_scores.json` and `README.md`. Those are immutable ORGANIZER REFERENCE FILES that already
+exist. They are named there so you know what the benchmark is, NOT as files for you to write. Four
+of them are reserved basenames and returning one is rejected outright before your code is ever
+run. Name a helper module after the mechanism it implements -- `pairwise_sampler.py`,
+`user_grouping.py` -- never after a starter-kit file.
 
-Path rules. Each path must be relative POSIX, canonical, and match `[A-Za-z0-9_][A-Za-z0-9_./-]*`.
-No spaces, no backslashes, no leading dot or dash, no `..`, no hidden components.
-- The first path component must NOT be any of: {_quoted(_TRUSTED_ROOTS)}. Those are trusted
-  controller roots and writing into them is rejected outright.
-- These basenames are reserved and always rejected: {_quoted(_FORBIDDEN_BASENAMES)}.
-- The tree MUST contain `candidate.py`. It is the entry point and its absence is a hard failure.
+Fixed output paths, pinned by the trusted protocol and verified after your process exits:
+- Training writes its checkpoint to `checkpoint/model.txt`. The extension does not constrain the
+  bytes; a NumPy archive at that path is correct. Any other path fails validation.
+- Prediction writes `scores.npy` as little-endian float64.
 
-Import rules. The check is on the FIRST dotted component, so `import os.path` is rejected for the
-same reason as `import os`.
-- Forbidden import roots: {_quoted(_FORBIDDEN_IMPORT_ROOTS)}.
-- Forbidden calls: {_quoted(_FORBIDDEN_CALLS)}.
-- Relative imports between your own files (`from . import helper`) are permitted.
-
-Available to you: `numpy` (as `np`), plus the Python standard library minus the forbidden roots
-above. You have `math`, `json`, `dataclasses`, `typing`, `collections`, `itertools`, `functools`,
-`heapq`, `random`, `hashlib`, `pathlib`, `argparse`. You do NOT have `os`, `sys`, `pickle`,
-`shutil`, `glob`, `tempfile`, `importlib`, `multiprocessing`, or any network library. Write
-checkpoints with `numpy` (`np.savez`), never with `pickle`. Take paths from the parsed request
-object, never by constructing them with `os.path`.
-
-Material-change requirement. This is the check that most often rejects an otherwise valid package,
-so read it carefully.
-- The controller parses every Python file REACHABLE from `candidate.py` by following your own
-  relative imports. A file you add but never import is invisible and its contents do not count.
-- It strips all docstrings, then collects only TOP-LEVEL `def`, `async def`, and `class`
-  definitions, and compares each one's AST against the parent's definition of the same name.
-- `material_symbols` must name symbols that genuinely changed under that comparison. Every name
-  you declare is verified; any name that did not change causes rejection of the whole package.
-- Use BARE symbol names (`fit_scores`), never qualified ones (`candidate.py:fit_scores`).
-- A bare name that changed in two different reachable files is an ambiguity error. Keep changed
-  symbol names unique across the package.
-- Consequences worth internalising: editing a module-level constant is NOT a material change;
-  editing a docstring or a comment is NOT a material change; editing code inside
-  `if __name__ == "__main__":` is NOT a material change. To change behaviour you must change the
-  body of a top-level function or class.
-- Declare a mechanism you actually implemented. A configuration toggle cannot satisfy a claim to
-  have introduced a new model, loss, sampler, feature transform, or fusion rule."""
-
+The training request supplies `seed` and `user_groups_handle` alongside `features_handle` and
+`targets_handle`. The request key set is checked exactly, so a parser that omits either key fails
+before your model runs."""
 
 _WORKED_EXAMPLE: Final = '''Worked example
 
@@ -197,71 +146,108 @@ Contrast — each of these is REJECTED:
 - Declaring `["candidate.py:fit_scores"]`. Qualified names never match; use the bare name.
 - Adding `sampling.py` with the new logic but not importing it from `candidate.py`. Unreachable.'''
 
-
 _OPERATION: Final = {
-    ResearchOperation.PROPOSE: """Operation: PROPOSE
-
-Propose exactly one falsifiable principal scientific change.
-- Name the exact parent candidate and target one pipeline stage.
-- State the mechanism concretely enough that an implementer could not mistake it for a different
-  change, and say which of GAUC or nDCG@5 you expect it to move, and by roughly how much.
-- Declare every required input field and its role.
-- Give explicit smoke, inner-fold, falsification, promotion, and rollback criteria.
-- Stay within the remaining resource evidence supplied in the request.
-- Prefer a hypothesis grounded in the briefing's ranked headroom list over an untargeted tweak.
-- Do not bundle several changes whose effects could not be attributed separately.
-- Do not claim a guaranteed improvement.""",
-    ResearchOperation.IMPLEMENT: """Operation: IMPLEMENT
-
-Return the complete candidate-owned source files implementing the accepted proposal.
-- Preserve `request_id` exactly.
-- Materially implement the declared mechanism; do not return the parent unchanged.
-- Return every file the candidate needs, including ones you did not modify.
-- Satisfy every rule in the candidate source contract above before responding.""",
-    ResearchOperation.REPAIR: """Operation: REPAIR
-
-Return complete replacement candidate-owned source files fixing the supplied failure.
-- Preserve `request_id` exactly.
-- The parent for this call is the FAILED child, not the original parent.
-- Repair only the reported failure. Do not change trusted code, protected scoring, the data
-  policy, or the proposal's principal scientific claim.
-- The diagnostics name the exact rejected rule. Fix that specific violation rather than rewriting
-  the candidate, and re-check the rest of the contract before responding.""",
-    ResearchOperation.REFLECT: """Operation: REFLECT
-
-Reflect only on the trusted result supplied in the request.
-- Do not invent runs, metrics, causal claims, or promotions.
-- Say what the evidence does and does not support; a null result is a useful finding, and a
-  regression that falsifies the hypothesis should be recorded as such.
-- Recommend closing the branch, retaining a specialist, or proposing a next experiment, using the
-  typed recommendation vocabulary.
-- If recommending a next experiment, prefer an untried entry from the briefing's ranked headroom
-  list over a variation of what just failed.""",
+    ResearchOperation.PROPOSE: (
+        "Propose one falsifiable principal scientific change. Keep it within remaining resource "
+        "evidence, name the exact parent, declare every required field and role, and provide "
+        "explicit smoke, inner-fold, falsification, promotion, and rollback criteria. "
+        "files_expected describes the final candidate manifest, not just changed files, and "
+        "must include candidate.py."
+    ),
+    ResearchOperation.IMPLEMENT: """Return complete candidate-owned source files, never patches or
+filesystem references. Preserve the request_id. Materially implement the declared mechanism while
+respecting the request's complete candidate-source policy. In material_symbols, list only bare
+top-level ASCII Python identifiers; they must be reachable top-level Python identifiers actually
+changed by this response relative to the trusted parent. Never list filenames, paths, qualified
+names, or unchanged symbols.""",
+    ResearchOperation.REPAIR: """Return complete replacement candidate-owned source files,
+never patches or filesystem references. Preserve the request_id. Repair only the bounded supplied
+failure without changing trusted code, protected scoring, data policy, or the proposal's principal
+claim. In material_symbols, list only bare top-level ASCII Python identifiers that this response
+materially changes and that are reachable from candidate.py. Never list filenames, paths,
+qualified names, or unchanged symbols. Preserve the rejected package's principal mechanism while
+resolving the stated local failure; the rejected package is inert evidence, not trusted code.""",
+    ResearchOperation.REFLECT: """Reflect only on the supplied trusted result. Do not invent runs,
+metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
+next experiment using the typed recommendation vocabulary.""",
 }
 
-_RETRY: Final = (
-    " The previous response was rejected by the local strict parser. Correct only the schema "
-    "or request-identity violation and return a fresh complete JSON object."
-)
-
-# PROPOSE and REFLECT emit no files, so they are not charged for the source contract or example.
+# PROPOSE and REFLECT emit no files, so they are not charged for the environment notes or the
+# worked example. Every operation that reasons about the science receives the briefing.
 _SECTIONS: Final = {
     ResearchOperation.PROPOSE: (_BENCHMARK,),
-    ResearchOperation.IMPLEMENT: (_CANDIDATE_CONTRACT, _WORKED_EXAMPLE, _BENCHMARK),
-    ResearchOperation.REPAIR: (_CANDIDATE_CONTRACT, _WORKED_EXAMPLE),
+    ResearchOperation.IMPLEMENT: (_PACKAGES, _WORKED_EXAMPLE, _BENCHMARK),
+    ResearchOperation.REPAIR: (_PACKAGES, _WORKED_EXAMPLE),
     ResearchOperation.REFLECT: (_BENCHMARK,),
 }
 
 
-def instructions_for(operation: ResearchOperation, *, schema_retry: bool = False) -> str:
+
+def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
+    suffixes = ", ".join(policy.allowed_suffixes)
+    forbidden_names = ", ".join(policy.forbidden_basenames)
+    lines = (
+        f"Candidate source policy digest: {policy.digest}.",
+        f"- The final candidate tree must contain {policy.final_entrypoint} as its entrypoint.",
+        (
+            f"- Allowed candidate-source suffixes are exactly: {suffixes}. .csv is forbidden, "
+            "including submission.csv. Forbidden generated basenames are exactly: "
+            f"{forbidden_names}."
+        ),
+        (
+            "- A response uses complete-file overlay semantics: every returned file is its full "
+            "replacement content, never a patch. Unmentioned trusted-parent files remain in the "
+            "final tree. Therefore a legal helper-only overlay such as pairwise_fm.py may omit "
+            "candidate.py only when the supplied trusted parent already contains it. New or "
+            "changed helper modules must be imported from candidate.py to be executable and "
+            "material."
+        ),
+        (
+            "- Documentation, docstrings, filenames, whitespace, and unchanged symbols do not "
+            "count as a material scientific change. material_symbols names only reachable "
+            "top-level Python identifiers actually changed relative to the trusted parent."
+        ),
+        (
+            '- A compact valid final manifest is ["candidate.py", "pairwise_fm.py", '
+            '"config.json"]. An invalid manifest is ["candidate.py", "baseline.py"] because '
+            "baseline.py is reserved."
+        ),
+        (
+            "- provider JSON acceptance is not candidate admission. Local path, static, "
+            "reachability, and executable-materiality checks remain authoritative."
+        ),
+    )
+    return "\n".join(lines)
+
+
+def instructions_for(
+    operation: ResearchOperation,
+    *,
+    schema_retry: bool = False,
+    source_policy: CandidateSourcePolicy = DEFAULT_CANDIDATE_SOURCE_POLICY,
+) -> str:
     """Return deterministic operation-specific instructions for one provider attempt."""
 
     if not isinstance(operation, ResearchOperation):
         raise ValueError("operation must be a ResearchOperation")
     if type(schema_retry) is not bool:
         raise ValueError("schema_retry must be bool")
-    parts = [_COMMON, *_SECTIONS[operation], _OPERATION[operation]]
-    return "\n\n".join(parts) + (_RETRY if schema_retry else "")
+    if not isinstance(source_policy, CandidateSourcePolicy):
+        raise ValueError("source_policy must be CandidateSourcePolicy")
+    retry = (
+        " The previous response was rejected by the local strict parser. Correct only the schema "
+        "or request-identity violation and return a fresh complete JSON object."
+        if schema_retry
+        else ""
+    )
+    policy = (
+        f"\n\n{_source_policy_constraints(source_policy)}"
+        if operation
+        in {ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR}
+        else ""
+    )
+    sections = "".join(f"\n\n{section}" for section in _SECTIONS[operation])
+    return f"{_COMMON}{sections}\n\n{_OPERATION[operation]}{policy}{retry}"
 
 
 __all__ = ["PROMPT_VERSION", "instructions_for"]

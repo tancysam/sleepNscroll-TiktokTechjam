@@ -1,18 +1,318 @@
 # Remediation plan: Fulfil the Autonomous ML Research Agent aim
 
-Status: core local implementation complete; live repair/recovery and official evidence pending
-Date: 2026-08-28
+Status: previous autonomous run admitted no generated candidate; corrective P0/P1 code is
+implemented and verified locally; live P2 gates remain pending explicit authorization
+Date: 2026-08-29
 Required benchmark: KuaiRand-Pure
-Current verdict: the production code now supports an explicitly autonomous live-provider run,
-durable provider-created source lineage, repeated scientific iterations, leakage-safe EDA,
-provider accounting, exact resource caps, and secret-free preflight. The project aim is still
-**not empirically fulfilled**: no paid official live campaign has been launched from this version,
-so there is no new evidence of a validation-primary improvement greater than `0.002`, no clean
-replay of a new winning bundle, and no organizer hidden-test result.
+Current verdict: the production code launched an autonomous live-provider campaign, but the run
+never admitted generated candidate source to smoke or training. It retained the official FM
+fallback with validation primary `0.6020370721817017`; therefore it did not beat the baseline and
+did not test any agent-generated scientific improvement. The run's immediate blocker was an
+inconsistent candidate-generation contract across prompts, typed requests, materialization, and
+repair—not an evaluation result showing that the proposed model ideas were worse. The local
+corrective code now addresses that contract failure; a live admission canary has not yet verified
+the correction against a paid provider.
 
-## Implementation snapshot (2026-08-28)
+## Previous-run failure investigation and corrective plan (2026-08-29)
 
-Completed locally:
+This section is the authoritative remediation plan for `runs/full-pure-20260829-05`. It supersedes
+older statements below that the live repair path had not yet been exercised. No guardrail,
+benchmark feature, provider capability, resource limit, evaluator protection, or recovery feature
+may be removed to make the run pass. The repair must make the agent-facing contract agree with the
+existing trusted enforcement.
+
+### A. What actually failed
+
+The final HTTP `429` was real, but it was the last and secondary failure. The campaign had already
+spent 23 complete propose/implement/repair cycles without admitting one candidate to execution.
+The immutable diagnostic artifact records 74 provider-attempt transcripts: 24 proposals,
+26 implementation attempts, and 24 repair attempts. The campaign then finalized safely with the
+baseline after `12,531.681` seconds of wall time, below the six-hour cap.
+
+The deterministic failure chain was:
+
+1. Every accepted proposal expected a generated file named `baseline.py`. The first proposal also
+   expected `submission.csv`, although generated source allows only `.py`, `.json`, and `.md`.
+2. The proposal request and proposal system prompt contained no generated-file policy. The
+   implementation request exposed allowed suffixes, file count, and byte limits, but omitted the
+   forbidden basenames enforced by materialization, including `baseline.py`.
+3. All 23 accepted implementation packages therefore reached the local materializer before being
+   rejected with `reserved candidate filename is forbidden: 'baseline.py'`. The filename guardrail
+   worked correctly and must remain in force.
+4. A failure before materialization leaves no `attempted_candidate`. The repair controller then
+   supplied the original FM seed as `failed_child`; all 23 repair requests contained exactly the
+   same seed digest and only `README.md`, `candidate.py`, and `config.json`. They did not contain
+   the rejected implementation package in which the agent had written its proposed algorithm.
+5. The repair system prompt said to preserve the principal scientific claim, but the request made
+   that impossible at source level. Offline replay of all 23 accepted repairs found zero executable
+   algorithm changes: 18 left `candidate.py` byte-identical, while the other five changed only
+   module-docstring whitespace, which the material-change guard correctly ignores.
+6. Each branch's campaign record retained only the terminal material-symbol diagnostic, not the
+   initial recurring `baseline.py` violation. Later proposal requests therefore did not receive the
+   shared root cause. With no normalized failure fingerprint or repetition circuit breaker, all
+   24 proposals continued to expect `baseline.py`; 20 were variants of the same pairwise/BPR
+   family. No training metric ever became available to guide the scientific loop.
+7. The 24th implementation call ended in three consecutive HTTP `429` responses. This stopped the
+   repeated invalid-generation loop, but provider availability was not the reason the preceding
+   23 candidates failed admission. Provider failover alone cannot fix this run pattern.
+
+### B. Root-cause verdict
+
+| Rank | Hypothesis | Evidence from the captured run | Verdict |
+| --- | --- | --- | --- |
+| 1 | The agent instructions and typed request did not disclose the actual candidate-file contract | Proposal had no policy; implementation exposed suffixes but not forbidden basenames; all 24 proposals named `baseline.py` | Confirmed primary cause |
+| 2 | Repair lost the rejected implementation it was supposed to preserve | All 23 repair requests supplied the same original seed digest; none supplied the rejected generated package | Confirmed primary cause |
+| 3 | Repeated failures were not fed back or stopped at the root-cause level | Records retained only the final material-symbol error; `baseline.py` recurred 23 times with no circuit breaker | Confirmed amplifier |
+| 4 | Prompt wording alone caused the material-symbol failures | Repair wording correctly prohibited unchanged symbols, but the model lacked the rejected source needed to change them | Contributing, not sufficient |
+| 5 | Provider throttling prevented a competitive candidate from training | The `429` occurred only after 23 candidates had already failed local admission | Confirmed terminal/secondary cause |
+
+The correction is deliberately layered. System prompts must be explicit enough for the research
+agent to act correctly, while typed validation must reject an invalid plan before an expensive
+implementation call. A safety property must never depend on prompt compliance alone.
+
+### C. Local implementation status and evidence (2026-08-29)
+
+The corrective code is now implemented locally without removing the materializer, static-policy,
+materiality, evaluator, provider, budget, or fallback protections. The rows below record what is
+implemented; they are not evidence that a live agent-generated candidate has trained or beaten the
+official FM baseline.
+
+| Work slice | Implemented behavior | Focused local evidence |
+| --- | --- | --- |
+| P0: captured regression and one source policy | One immutable candidate-source policy now owns the required `candidate.py` entrypoint, suffixes, forbidden basenames/roots/imports/calls, and byte/file limits. Materialization and all three typed agent requests use the same digest-checked policy. The captured `baseline.py`/unsupported-`.csv` failure shape is covered without weakening enforcement. | Source-policy, materializer, request-schema, prompt, provider, and compatibility checks passed; the complete unit suite reported `1,207 passed, 12 skipped`. The skips were existing environment-dependent data, optional-device, and live-key gates. |
+| P0: delivered instructions and early proposal correction | Propose, implement, and repair instructions are generated from the exact request policy. A policy-invalid proposal is rejected or corrected before `implement`; provider parsing uses the existing bounded malformed-response correction path, and controller admission independently remains authoritative. | Provider/factory/schema checks reported `58 passed, 1 skipped`; prompt snapshot checks reported `7 passed`; the live-key test remained intentionally skipped. |
+| P0: rejected-package repair fidelity | Every generated-package repair carries an inert, bounded, digest-verified snapshot of the causative rejected response, separately from the trusted parent. Each repair is applied freshly over that parent, and the final package must still pass path, static, reachability, and executable-materiality checks. Rehydration verifies the exact causal chain without another model call. | Production-lineage repair checks reported `18 passed`; related runtime integrations reported `19 passed`; the legacy research-loop repair/admission integrations reported `9 passed`. |
+| P0: root feedback and circuit breaker | Rejected initial-admission branches retain typed root and terminal observations, normalized fingerprints, proposal family/signature, and bounded diagnostics in an immutable per-iteration journal. Resume reconstructs and verifies its hash chain and fails closed on tampering. The live runtime blocks a proposal family after its second pre-admission rejection and closes on the third occurrence of an identical root fingerprint using `repeated_pre_admission_failure`, while preserving the incumbent and rejection evidence across provider failure. | Runtime and resilience tests cover journal reconstruction/tamper rejection, exact third-identical-root closure, second-same-family blocking, provider-failure preservation, bounded rejection summaries, and strict nine-key stage counts. The focused campaign-control suite reported `23 passed`; after the Chat Completions migration, the repository-wide suite reported `1,400 passed, 21 skipped`. |
+| P1: proposal novelty | Proposal signatures normalize the trusted parent/evidence cursor, mechanism/objective family, required fields, enabled inputs, and legal manifest. Prose-only changes do not evade duplication, and no more than two pre-admission attempts from one family are allowed until trusted training/evaluation evidence advances the cursor. | Duplicate-proposal, family-cap, and positive-control evaluation tests are included in the `9 passed` research-loop slice and the production-lineage/runtime suites above. |
+| P1: Chat Completions and deadline-aware provider throttling | Both main and fallback now dispatch through `POST {base_url}/chat/completions`, with strict `json_schema` output by default and explicit per-profile compatibility controls for `json_object`, `max_tokens`, and omission of `reasoning_effort`. Typed local validation and every downstream guardrail remain unchanged. Provider transport retains bounded `Retry-After` evidence, applies bounded server-directed or exponential-jitter waits only within the remaining research time before the finalization reserve, caps every transport timeout to that same remaining window, records wait time separately from network latency, and ends the current provider route after the second consecutive `429` so the main/fallback chain can switch. An exhausted shared deadline prevents both a new main request and spurious fallback activation. | Provider tests cover the Chat Completions request/envelope/usage contract, strict and portable JSON modes, delta-seconds and HTTP-date waits, fallback after the second `429`, deterministic backoff, denied waits at the research boundary, transport-timeout capping, zero-call deadline exhaustion, sticky fallback, and usage accounting. The historical Responses-named Python classes remain compatibility aliases and cannot dispatch to `/responses`. |
+| P1: truthful no-admission reporting | Research evidence now records nine distinct progress stages, the durable root/terminal rejection summary and examples, provider-chain switches, retry waits, and actual provider usage. Finalization distinguishes provider response acceptance, candidate admission, training, inner evaluation, and outer evaluation, and identifies the official FM fallback as non-agent-generated. | Finalization adapter checks reported `34 passed`; adapter plus runtime resilience/fallback orchestration reported `48 passed`; repository-wide Ruff, Ruff format, strict mypy, and `git diff --check` passed. |
+
+P2 remains intentionally pending. No live admission canary, paid autonomous campaign, matched-seed
+baseline comparison, hidden-test evaluation, or organizer submission has been run or claimed from
+these code changes. The consolidated offline suite and deterministic fake-provider vertical slices
+now pass. The next authorized action is one fresh live admission canary. A full six-hour campaign
+remains separately gated on that canary and explicit API-spend/runtime authorization.
+
+### D. Corrective work packages and acceptance gates
+
+#### P0. Freeze the captured failure as a deterministic regression
+
+Before changing behavior, add a secret-free fixture distilled from the immutable transcript. It
+must reproduce this exact sequence without network access:
+
+- a proposal whose `files_expected` includes `baseline.py` and an unsupported `.csv` file;
+- an implementation package containing a scientifically material module under the forbidden name;
+- a pre-materialization filename rejection;
+- a repair attempt that must preserve the material implementation while converting it to a legal
+  candidate package.
+
+Acceptance gates:
+
+- The regression exercises the captured contract mismatch and fails if the corrected admission or
+  repair behavior regresses.
+- The fixture contains no API key, provider response ID, encrypted reasoning, dataset row, or
+  protected outcome.
+- Test runtime remains short enough for the default unit suite.
+
+#### P0. Create one candidate-source policy and expose it everywhere
+
+Define one immutable `CandidateSourcePolicy` owned by the trusted controller. It must be the single
+source of truth for:
+
+- required entrypoint (`candidate.py`);
+- allowed suffixes;
+- forbidden basenames, including `baseline.py`;
+- forbidden import roots and calls;
+- maximum changed-file count and total UTF-8 bytes;
+- complete-package/replacement semantics; and
+- the rule that candidate packages may not emit evaluator or submission artifacts such as
+  `submission.csv`.
+
+Materialization must continue enforcing the policy. Proposal, implementation, and repair requests
+must carry a value-only policy manifest plus a canonical digest derived from the same object. Do
+not copy an independently maintained filename list into each layer.
+
+Add controller-side proposal admission before `implement`:
+
+- validate every `files_expected` path against the policy;
+- require `candidate.py` in the proposed output contract;
+- reject forbidden basenames, unsupported suffixes, absolute/non-canonical paths, duplicates, and
+  reserved output artifacts;
+- return a bounded, typed proposal-correction request instead of spending an implementation call;
+- record the rejected proposal and normalized policy fingerprint durably.
+
+Acceptance gates:
+
+- A proposal containing `baseline.py` or `submission.csv` is corrected or rejected before any
+  implementation call.
+- A legal helper such as `pairwise_fm.py` remains allowed; no existing safe extension point is
+  removed.
+- Request and policy digests round-trip and reject tampering.
+- The materializer remains authoritative even if a provider ignores the prompt.
+
+#### P0. Rewrite the delivered system instructions from that policy
+
+Update the actual propose, implement, and repair system instructions, not only documentation.
+Generate the constraint block from `CandidateSourcePolicy` so prompt text cannot drift from local
+enforcement.
+
+The delivered instructions must state, in direct terms:
+
+- `candidate.py` is the required entrypoint;
+- `baseline.py` and every other reserved basename are forbidden generated filenames;
+- only the listed suffixes are allowed and `.csv` outputs are forbidden;
+- responses contain complete replacement candidate-owned files, never patches;
+- changed scientific code may live in legal helper modules imported by `candidate.py`;
+- `material_symbols` must name reachable top-level Python identifiers actually changed relative to
+  the trusted parent; filenames, documentation, docstrings, and unchanged symbols do not count;
+- on repair, preserve the rejected package's principal mechanism while resolving the stated local
+  failure; and
+- provider JSON acceptance is not candidate admission—local policy and materiality checks still
+  decide admission.
+
+Include one compact valid manifest example and one invalid example (`baseline.py`) without giving
+the agent a hand-authored scientific solution.
+
+Acceptance gates:
+
+- Captured outbound requests for all three operations contain the same policy digest and the exact
+  required/forbidden file facts.
+- Prompt snapshot tests fail if policy enforcement changes without regenerated instructions.
+- A fake model can follow the prompt to produce an allowed multi-file package without privileged
+  controller or evaluator access.
+
+#### P0. Preserve rejected source in the repair contract
+
+Add a bounded `RejectedPackageSnapshot` to `RepairRequest`. When validation fails before a
+candidate directory is materialized, the snapshot must contain the provider-created file paths,
+contents, content digests, package digest, and declared material symbols, subject to the same
+file-count and byte limits. Keep the trusted parent snapshot separately so the repair can compare
+against it. Never publish the invalid package as an executable lineage node.
+
+Repair semantics must be explicit: return a complete legal replacement package for the trusted
+parent while preserving the rejected package's principal scientific mechanism. After repair,
+materiality is still measured against the trusted parent, and static policy is rerun from scratch.
+
+Acceptance gates:
+
+- The captured `baseline.py` regression is repaired into legal candidate-owned source, for example
+  `candidate.py` plus an allowed helper module, without controller-authored algorithm substitution.
+- The repaired package passes path validation, static validation, executable reachability, and
+  material-change validation.
+- A repair that only edits README text, a docstring, whitespace, or a declared-but-unchanged symbol
+  remains rejected.
+- Rehydration reproduces the same repair request and package without duplicate provider calls.
+
+#### P0. Add normalized failure feedback and a circuit breaker
+
+Persist two diagnostics for every rejected branch:
+
+- the initial/root admission failure; and
+- the final failure after bounded repair.
+
+Normalize them into stable fingerprints such as
+`candidate_path_policy:forbidden_basename:baseline.py` and
+`materiality:declared_symbol_unchanged:main`. Include counts and the most recent bounded examples in
+the next safe research context.
+
+Use this exact repetition policy:
+
+1. First policy violation: issue one bounded proposal/package correction.
+2. Second identical root fingerprint in consecutive attempts: reject that manifest/mechanism
+   family and require a structurally different legal manifest before implementation.
+3. Third identical root fingerprint in the campaign: stop initial portfolio preparation with
+   `repeated_pre_admission_failure`, preserve the incumbent, and finalize. Do not spend the
+   remaining six-hour or iteration budget repeating the same invalid request.
+
+Acceptance gates:
+
+- The captured recurring failure can consume at most three bounded corrective attempts, not
+  23 propose/implement/repair cycles.
+- Root and terminal failures both survive interruption, resume, provider failure, and finalization.
+- A different actionable failure is not collapsed into the same fingerprint.
+
+#### P1. Enforce proposal novelty before implementation
+
+Create a normalized proposal signature from the parent digest, principal mechanism, objective/loss
+family, enabled inputs, required fields, and legal file manifest. Near-duplicate proposals should
+be rejected or reframed before source generation when no new training evidence justifies them.
+
+Until one member of a scientific family reaches training, allow at most two pre-admission attempts
+from that family. This prevents twenty paraphrased pairwise/BPR plans from consuming the campaign
+without evidence while still allowing a measured revision after an actual result.
+
+Acceptance gates:
+
+- Semantic duplicates with different prose produce the same novelty family.
+- Pairwise, listwise, feature, calibration, and optimization changes remain distinguishable.
+- Once a candidate trains, its metrics and reflection—not a hard-coded scientific preference—decide
+  whether another family member is warranted.
+
+#### P1. Make rate-limit handling provider-aware and deadline-aware
+
+Retain the main/fallback inference configuration. For HTTP `429`:
+
+- preserve the first provider attempt and usage evidence;
+- honor a bounded `Retry-After` value when present and when campaign/finalization time permits;
+- otherwise use exponential backoff with jitter;
+- switch to the fallback provider after the second consecutive rate limit, rather than sending
+  three near-immediate requests to the same throttled endpoint; and
+- keep request identity, schema validation, transcript durability, and total retry limits unchanged
+  across providers.
+
+Acceptance gates:
+
+- A fake main provider returning repeated `429` responses fails over to the fallback without
+  duplicating an accepted logical operation.
+- An unavailable fallback still preserves the incumbent and complete failure ledger.
+- Retry waits cannot cross the six-hour cap or consume finalization reserve.
+
+#### P1. Report what happened even when no lineage is admitted
+
+Persist the rejected-branch ledger independently of successful portfolio construction. The final
+report must include provider calls/attempts, token and cost evidence, root and terminal failure
+counts, affected manifests, repair counts, provider switches, elapsed time, and whether any
+candidate reached smoke, training, inner evaluation, or outer evaluation.
+
+Acceptance gates:
+
+- A provider failure during initial portfolio preparation no longer produces a misleading
+  `Research-model calls=0` report when durable transcripts exist.
+- The report distinguishes `provider_response_accepted`, `candidate_admitted`, `training_started`,
+  and `evaluation_completed`.
+- Baseline fallback remains explicit and cannot be presented as an agent-generated result.
+
+#### P2. Stage the rerun through objective gates
+
+Do not start another six-hour campaign immediately after the code changes. Advance through these
+gates in order:
+
+1. Run the captured secret-free regression and focused unit tests.
+2. Run the full static/type/default test gates.
+3. Run a deterministic fake-provider vertical slice through proposal, implementation, material
+   admission, smoke, repair, resume, and evidence reporting.
+4. Run one live admission canary with a fresh no-overwrite run ID. The agent flow—not a human or
+   controller-authored candidate—must independently propose and generate one package that passes
+   source-policy and materiality checks. Stop before a full campaign if it repeats a normalized
+   pre-admission failure.
+5. Only after the canary passes, launch the autonomous official campaign with both providers
+   configured and the existing monitoring/deadline policy.
+
+The full rerun is ready only when all of the following are true:
+
+- zero proposal manifests violate the disclosed source policy;
+- at least one agent-generated candidate reaches smoke and training without manual code repair;
+- repair preserves rejected scientific source when invoked;
+- no identical root failure exceeds the circuit-breaker threshold;
+- provider usage and rejection evidence remain correct after failover or interruption;
+- the campaign respects every existing leakage, resource, promotion, convergence, replay, and
+  finalization guardrail; and
+- baseline comparison is based on completed official evaluation, not provider acceptance or local
+  materialization alone.
+
+## Historical pre-run implementation snapshot (2026-08-28)
+
+Completed locally before `runs/full-pure-20260829-05`:
 
 - Schema-v2 run identity distinguishes `autonomous`, `demo`, and `test`; autonomous requires the
   live OpenAI provider, while a full-data scripted demo requires explicit acknowledgement.
@@ -52,7 +352,9 @@ Verification completed after implementation:
 - Archived campaign resource-receipt acceptance: passed.
 - Ruff check/format, mypy over `src` and `tests`, and launcher shell syntax: passed.
 
-Still required before claiming that the project aim is fulfilled:
+At that pre-run point, the following was still required before claiming that the project aim was
+fulfilled. The 2026-08-29 investigation above is authoritative where later runtime evidence has
+superseded an item:
 
 1. Wire the bounded `ResearchModel.repair` path into the full live production driver for
    same-iteration static/execution failures. The provider-independent research loop already owns

@@ -64,10 +64,16 @@ from kuairand_agent.research.schemas import (
     Proposal,
     ProposalRequest,
     ReflectionRequest,
+    RejectedPackageSnapshot,
     RepairRequest,
     ResearchOperation,
     canonical_digest,
     canonical_json_bytes,
+)
+from kuairand_agent.research.source_policy import (
+    CandidateManifestPolicyError,
+    classify_method_family,
+    proposal_novelty_signature,
 )
 
 _DIGEST_RE: Final = __import__("re").compile(r"[0-9a-f]{64}\Z")
@@ -845,6 +851,9 @@ class ResearchCampaignLoop:
         metadata = self.generated_root.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ResearchLoopError("generated_root must be a real directory")
+        self._training_evidence_cursor = safe_context.digest
+        self._proposal_signatures: set[str] = set()
+        self._family_implementation_admissions: dict[str, int] = {}
 
     def _put_json(self, value: Mapping[str, object]) -> ArtifactSpec:
         ref = self.artifacts.put_bytes(canonical_json_bytes(dict(value)), kind=ArtifactKind.OTHER)
@@ -1143,7 +1152,7 @@ class ResearchCampaignLoop:
                         else "close failed child"
                     ),
                 )
-                if repair_count >= maximum_repairs or child is None:
+                if repair_count >= maximum_repairs:
                     return None, repair_count, state, diagnostic
                 if state != "REPAIRING":
                     self.ledger.transition(
@@ -1154,7 +1163,11 @@ class ResearchCampaignLoop:
                         reason="generated child failed static policy; enter bounded repair",
                     )
                     state = "REPAIRING"
-                failed_snapshot = snapshot_materialized_candidate(child, candidate_id=candidate_id)
+                failed_snapshot = (
+                    snapshot_materialized_candidate(child, candidate_id=candidate_id)
+                    if child is not None
+                    else original_parent
+                )
                 repair_count += 1
                 repair_request = RepairRequest.create(
                     request_id=f"{experiment_id}-repair-{repair_count}",
@@ -1165,6 +1178,9 @@ class ResearchCampaignLoop:
                     diagnostics=diagnostic,
                     remaining_repairs=maximum_repairs - repair_count + 1,
                     safe_context=context,
+                    rejected_package=RejectedPackageSnapshot.from_generated_package(
+                        current_package
+                    ),
                 )
                 try:
                     repaired = self.model.repair(repair_request)
@@ -1185,7 +1201,7 @@ class ResearchCampaignLoop:
                     repair_request.to_wire(),
                     repaired.to_wire(),
                 )
-                current_parent = failed_snapshot
+                current_parent = original_parent
                 current_package = repaired
                 continue
 
@@ -1337,6 +1353,53 @@ class ResearchCampaignLoop:
         updated = current.update_after_iteration(eligible_outer_primary)
         self.ledger.update_convergence(updated)
 
+    def _close_pre_admission_rejection(
+        self,
+        *,
+        iteration: int,
+        experiment_id: str,
+        proposal: Proposal,
+        parent: ParentSnapshot,
+        state: str,
+        diagnostic: str,
+        fingerprint: str,
+    ) -> tuple[IterationResult, ParentSnapshot]:
+        self._failure(
+            experiment_id=experiment_id,
+            ordinal=0,
+            category=FailureCategory.STATIC_POLICY.value,
+            diagnostic=diagnostic,
+            repair_action="request a legal and novel proposal",
+        )
+        self.ledger.transition(
+            experiment_id,
+            state,
+            "FAILED",
+            operation=ResearchOperation.PROPOSE.value,
+            reason="proposal failed controller admission before implementation",
+            metadata={"admission_fingerprint": fingerprint},
+        )
+        self._close(
+            experiment_id=experiment_id,
+            state="FAILED",
+            eligible_outer_primary=None,
+            operation="close",
+            reason="close rejected proposal without invoking implementation",
+        )
+        return (
+            IterationResult(
+                iteration,
+                experiment_id,
+                proposal.proposal_id,
+                None,
+                "failed",
+                0,
+                None,
+                diagnostic,
+            ),
+            parent,
+        )
+
     def _run_iteration(
         self,
         *,
@@ -1375,6 +1438,64 @@ class ResearchCampaignLoop:
             reason="persist accepted typed proposal and complete transcript",
         )
         state = "PROPOSED"
+        try:
+            legal_manifest = proposal_request.source_policy.validate_manifest(
+                proposal.files_expected,
+                parent_paths=(),
+            )
+        except CandidateManifestPolicyError as exc:
+            policy_diagnostic = f"{exc.fingerprint}: {exc}"
+            return self._close_pre_admission_rejection(
+                iteration=iteration,
+                experiment_id=experiment_id,
+                proposal=proposal,
+                parent=parent,
+                state=state,
+                diagnostic=policy_diagnostic,
+                fingerprint=exc.fingerprint,
+            )
+        method_family = classify_method_family(proposal.mechanism, proposal.objective)
+        signature = proposal_novelty_signature(
+            parent_digest=parent.digest,
+            method_family=method_family,
+            mechanism=proposal.mechanism,
+            objective=proposal.objective,
+            sampling=proposal.sampling,
+            required_source_fields=(value.source_field for value in proposal.required_fields),
+            legal_manifest=legal_manifest,
+            evidence_cursor=self._training_evidence_cursor,
+        )
+        if signature in self._proposal_signatures:
+            fingerprint = f"proposal_novelty:duplicate:{method_family}"
+            return self._close_pre_admission_rejection(
+                iteration=iteration,
+                experiment_id=experiment_id,
+                proposal=proposal,
+                parent=parent,
+                state=state,
+                diagnostic=(
+                    f"{fingerprint}: normalized proposal duplicate has no new trusted "
+                    "training evidence"
+                ),
+                fingerprint=fingerprint,
+            )
+        family_admissions = self._family_implementation_admissions.get(method_family, 0)
+        if family_admissions >= 2:
+            fingerprint = f"proposal_novelty:family_pretraining_limit:{method_family}"
+            return self._close_pre_admission_rejection(
+                iteration=iteration,
+                experiment_id=experiment_id,
+                proposal=proposal,
+                parent=parent,
+                state=state,
+                diagnostic=(
+                    f"{fingerprint}: two proposals from this scientific family already "
+                    "reached implementation without trusted training evidence"
+                ),
+                fingerprint=fingerprint,
+            )
+        self._proposal_signatures.add(signature)
+        self._family_implementation_admissions[method_family] = family_admissions + 1
         ready, repairs, state, diagnostic = self._prepare_candidate(
             experiment_id=experiment_id,
             proposal=proposal,
@@ -1487,6 +1608,16 @@ class ResearchCampaignLoop:
             )
 
         assert evaluation is not None
+
+        self._training_evidence_cursor = canonical_digest(
+            {
+                "schema_version": 1,
+                "previous_cursor": self._training_evidence_cursor,
+                "candidate_source_digest": ready.candidate.source_digest,
+                "trusted_evaluation": evaluation.summary.to_wire(),
+            }
+        )
+        self._family_implementation_admissions[method_family] = 0
 
         self.ledger.transition(
             experiment_id,

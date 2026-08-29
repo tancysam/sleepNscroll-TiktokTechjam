@@ -357,7 +357,9 @@ def test_progress_ledger_is_append_only_and_exact_retries_are_free(tmp_path: Pat
     assert second.sequence == 2
     assert second.previous_digest == first.digest
     assert reopened.checkpoints() == (first, second)
-    assert tuple(path.name for path in (tmp_path / "progress").iterdir()) == (
+    # Path.iterdir() yields filesystem order, which ext4 does not return sorted;
+    # the ledger contract is the checkpoint set and its sequence, not directory order.
+    assert tuple(sorted(path.name for path in (tmp_path / "progress").iterdir())) == (
         "checkpoint-00000001.json",
         "checkpoint-00000002.json",
     )

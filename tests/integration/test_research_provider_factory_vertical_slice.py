@@ -100,30 +100,24 @@ def _response(payload: dict[str, object], response_id: str) -> bytes:
     return json.dumps(
         {
             "id": response_id,
-            "object": "response",
-            "status": "completed",
+            "object": "chat.completion",
             "model": "gpt-5.4",
-            "error": None,
-            "incomplete_details": None,
-            "output": [
+            "choices": [
                 {
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": json.dumps(payload, separators=(",", ":")),
-                            "annotations": [],
-                        }
-                    ],
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(payload, separators=(",", ":")),
+                        "refusal": None,
+                    },
                 }
             ],
             "usage": {
-                "input_tokens": 100,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": 50,
-                "output_tokens_details": {"reasoning_tokens": 5},
+                "prompt_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens": 50,
+                "completion_tokens_details": {"reasoning_tokens": 5},
                 "total_tokens": 150,
             },
         },

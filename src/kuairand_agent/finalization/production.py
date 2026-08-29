@@ -2734,7 +2734,8 @@ def _selection_report_language(
     if status is not FinalStatus.BASELINE_REPRODUCED:
         raise ProductionFinalizationError("an official-FM report must be baseline_reproduced")
     return (
-        "Immutable official FM seed 4 was the best remaining fully replayable incumbent.",
+        "Immutable official FM seed 4 was the best remaining fully replayable incumbent; "
+        "it is the protected baseline fallback and is not agent-generated.",
         (),
     )
 
@@ -2746,6 +2747,242 @@ class _JudgeProgressFacts:
     portfolio_cap: int | None
     portfolio_cap_reason: str
     advanced_branch_disposition: str
+    research_progress: str = (
+        "Research admission stage counts are unavailable in this historical bundle."
+    )
+    research_outcome: str = "Research outcome details are unavailable in this historical bundle."
+    research_rejections: tuple[str, ...] = ()
+
+
+_RESEARCH_STAGE_COUNT_FIELDS: Final = (
+    "branches_attempted",
+    "proposal_responses_accepted",
+    "implementation_responses_accepted",
+    "repair_responses_accepted",
+    "branches_rejected_pre_execution",
+    "candidates_admitted",
+    "training_started",
+    "inner_evaluations_completed",
+    "outer_evaluations_completed",
+)
+
+
+def _research_progress_summary(science: Mapping[str, object]) -> str:
+    raw = science.get("research_stage_counts")
+    if raw is None:
+        return "Research admission stage counts are unavailable in this historical bundle."
+    if not isinstance(raw, Mapping) or set(raw) != set(_RESEARCH_STAGE_COUNT_FIELDS):
+        raise ProductionFinalizationError("research stage counts are malformed")
+    counts: dict[str, int] = {}
+    for name in _RESEARCH_STAGE_COUNT_FIELDS:
+        value = raw[name]
+        if type(value) is not int or value < 0:
+            raise ProductionFinalizationError("research stage counts are malformed")
+        counts[name] = value
+    if not (
+        counts["proposal_responses_accepted"] <= counts["branches_attempted"]
+        and counts["implementation_responses_accepted"] <= counts["proposal_responses_accepted"]
+        and counts["branches_rejected_pre_execution"] <= counts["branches_attempted"]
+        and counts["candidates_admitted"] <= counts["branches_attempted"]
+        and counts["inner_evaluations_completed"] <= counts["training_started"]
+        and counts["outer_evaluations_completed"] <= counts["training_started"]
+        and counts["inner_evaluations_completed"] + counts["outer_evaluations_completed"]
+        <= counts["training_started"]
+    ):
+        raise ProductionFinalizationError("research stage counts are inconsistent")
+    return (
+        f"Research admission: branches attempted={counts['branches_attempted']}; "
+        "proposal responses accepted="
+        f"{counts['proposal_responses_accepted']}; implementation responses accepted="
+        f"{counts['implementation_responses_accepted']}; repair responses accepted="
+        f"{counts['repair_responses_accepted']}; rejected pre-execution="
+        f"{counts['branches_rejected_pre_execution']}; candidates admitted="
+        f"{counts['candidates_admitted']}; training started={counts['training_started']}; "
+        f"inner evaluations completed={counts['inner_evaluations_completed']}; "
+        f"outer evaluations completed={counts['outer_evaluations_completed']}."
+    )
+
+
+def _research_outcome_summary(
+    *,
+    lineage: Mapping[str, object],
+    science: Mapping[str, object],
+    cap_reason: str,
+) -> str:
+    if cap_reason == "configured_provider_unavailable":
+        return "Research did not start because the configured provider was unavailable."
+    if cap_reason == "runtime_provider_unavailable":
+        return "Research started, but the provider failed at runtime after durable attempts."
+    admission_closed = science.get("admission_closed", lineage.get("admission_closed"))
+    if admission_closed is not None and type(admission_closed) is not bool:
+        raise ProductionFinalizationError("research admission closure evidence is malformed")
+    if admission_closed:
+        reason = science.get("reason", lineage.get("reason", cap_reason))
+        if type(reason) is not str or not reason or reason != cap_reason:
+            raise ProductionFinalizationError("research admission closure evidence is inconsistent")
+        return (
+            "Research admission closed before a candidate was admitted; "
+            f"controller reason={reason}."
+        )
+    return f"Research portfolio completed with controller reason={cap_reason}."
+
+
+def _bounded_rejection_text(value: object, location: str, *, maximum: int) -> str:
+    text = _text(value, location)
+    if len(text) > maximum:
+        raise ProductionFinalizationError(f"{location} exceeds its supported bound")
+    return text
+
+
+def _research_rejection_lines(science: Mapping[str, object]) -> tuple[str, ...]:
+    raw = science.get("research_rejection_summary")
+    if raw is None:
+        return ()
+    expected_fields = {
+        "branches_rejected_pre_execution",
+        "root_counts",
+        "terminal_counts",
+        "examples",
+        "counts_truncated",
+        "examples_truncated",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != expected_fields:
+        raise ProductionFinalizationError("research rejection summary is malformed")
+    rejected = _bounded_int(
+        raw["branches_rejected_pre_execution"],
+        "research rejected branch count",
+        maximum=1_000_000,
+    )
+    stage_counts = science.get("research_stage_counts")
+    if isinstance(stage_counts, Mapping) and (
+        stage_counts.get("branches_rejected_pre_execution") != rejected
+    ):
+        raise ProductionFinalizationError(
+            "research rejection summary differs from research stage counts"
+        )
+    if type(raw["counts_truncated"]) is not bool or type(raw["examples_truncated"]) is not bool:
+        raise ProductionFinalizationError("research rejection truncation evidence is malformed")
+
+    count_fields = {"fingerprint", "stage", "category", "code", "subject", "count"}
+    rendered_counts: dict[str, list[str]] = {"root": [], "terminal": []}
+    known_fingerprints: dict[str, set[str]] = {"root": set(), "terminal": set()}
+    for role, field_name in (("root", "root_counts"), ("terminal", "terminal_counts")):
+        entries = raw[field_name]
+        if not isinstance(entries, list) or len(entries) > 8:
+            raise ProductionFinalizationError("research rejection counts exceed their bound")
+        ordering: list[tuple[int, str]] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, Mapping) or set(entry) != count_fields:
+                raise ProductionFinalizationError("research rejection count is malformed")
+            fingerprint = _bounded_rejection_text(
+                entry["fingerprint"],
+                f"research {role} rejection {index} fingerprint",
+                maximum=512,
+            )
+            _digest(fingerprint, f"research {role} rejection {index} fingerprint")
+            stage = _bounded_rejection_text(
+                entry["stage"], f"research {role} rejection {index} stage", maximum=128
+            )
+            category = _bounded_rejection_text(
+                entry["category"],
+                f"research {role} rejection {index} category",
+                maximum=128,
+            )
+            code = _bounded_rejection_text(
+                entry["code"], f"research {role} rejection {index} code", maximum=128
+            )
+            subject = _bounded_rejection_text(
+                entry["subject"],
+                f"research {role} rejection {index} subject",
+                maximum=256,
+            )
+            count = _bounded_int(
+                entry["count"],
+                f"research {role} rejection {index} count",
+                maximum=1_000_000,
+            )
+            if count == 0:
+                raise ProductionFinalizationError("research rejection count must be positive")
+            if fingerprint in known_fingerprints[role]:
+                raise ProductionFinalizationError("research rejection fingerprint is duplicated")
+            known_fingerprints[role].add(fingerprint)
+            ordering.append((count, fingerprint))
+            rendered_counts[role].append(
+                f"{stage}/{category}/{code}/{subject} [{fingerprint}] x{count}"
+            )
+        if ordering != sorted(ordering, key=lambda item: (-item[0], item[1])):
+            raise ProductionFinalizationError("research rejection counts are not canonical")
+
+    examples = raw["examples"]
+    if not isinstance(examples, list) or len(examples) > 6:
+        raise ProductionFinalizationError("research rejection examples exceed their bound")
+    lines: list[str] = []
+    for role, title in (("root", "roots"), ("terminal", "terminals")):
+        values = rendered_counts[role]
+        if values:
+            truncation = (
+                " Top counts only; additional counts were truncated."
+                if raw["counts_truncated"]
+                else ""
+            )
+            lines.append(f"Research rejection {title}: {'; '.join(values)}.{truncation}")
+    example_fields = {
+        "scientific_iteration",
+        "candidate_id",
+        "proposal_family",
+        "proposal_signature",
+        "role",
+        "fingerprint",
+        "diagnostic",
+    }
+    for index, entry in enumerate(examples):
+        if not isinstance(entry, Mapping) or set(entry) != example_fields:
+            raise ProductionFinalizationError("research rejection example is malformed")
+        iteration = _bounded_int(
+            entry["scientific_iteration"],
+            f"research rejection example {index} iteration",
+            maximum=1_000_000,
+        )
+        if iteration == 0:
+            raise ProductionFinalizationError("research rejection iteration must be positive")
+        _bounded_rejection_text(
+            entry["candidate_id"],
+            f"research rejection example {index} candidate",
+            maximum=256,
+        )
+        _bounded_rejection_text(
+            entry["proposal_family"],
+            f"research rejection example {index} proposal family",
+            maximum=256,
+        )
+        proposal_signature = entry["proposal_signature"]
+        if proposal_signature is not None:
+            _digest(
+                proposal_signature,
+                f"research rejection example {index} proposal signature",
+            )
+        role = entry["role"]
+        if role not in {"root", "terminal"}:
+            raise ProductionFinalizationError("research rejection example role is malformed")
+        fingerprint = _bounded_rejection_text(
+            entry["fingerprint"],
+            f"research rejection example {index} fingerprint",
+            maximum=512,
+        )
+        _digest(fingerprint, f"research rejection example {index} fingerprint")
+        if fingerprint not in known_fingerprints[cast(str, role)]:
+            raise ProductionFinalizationError(
+                "research rejection example lacks a retained fingerprint count"
+            )
+        diagnostic = _bounded_rejection_text(
+            entry["diagnostic"],
+            f"research rejection example {index} diagnostic",
+            maximum=2_048,
+        )
+        lines.append(f"Research rejection example ({role}): {fingerprint}; {diagnostic}")
+    if raw["examples_truncated"]:
+        lines.append("Additional research rejection examples were retained in the durable ledger.")
+    return tuple(lines)
 
 
 def _bundle_known_limitations(
@@ -2805,7 +3042,12 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
             _digest(call.get("response_digest"), f"provider call {index} response")
             operations.append(operation.upper())
     elif isinstance(lineage.get("provider_diagnostic"), Mapping):
-        provider = "configured_provider_unavailable"
+        provider_diagnostic = cast(Mapping[str, object], lineage["provider_diagnostic"])
+        provider = (
+            "runtime_provider_failure"
+            if "attempts" in provider_diagnostic
+            else "configured_provider_unavailable"
+        )
 
     reflection_request = reflected.get("reflection_request_digest")
     reflection_response = reflected.get("reflection_response_digest")
@@ -2818,9 +3060,9 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
             raise ProductionFinalizationError("reflection call differs from retained outcome")
         operations.append("REFLECT")
     operation_summary = "+".join(operations) if operations else "none"
-    if live_provider_used:
-        usage = science.get("provider_usage")
-        expected_usage_fields = {
+    usage = science.get("provider_usage")
+    if live_provider_used or isinstance(usage, Mapping):
+        legacy_usage_fields = {
             "model",
             "input_tokens",
             "cached_input_tokens",
@@ -2832,9 +3074,23 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
             "transcript_count",
             "provider_wall_seconds",
         }
-        if not isinstance(usage, Mapping) or set(usage) != expected_usage_fields:
+        chain_usage_fields = {
+            "base_url",
+            "active_slot",
+            "failover_count",
+            "failover_events",
+            "provider_chain",
+        }
+        retry_usage_fields = {"retry_wait_seconds"}
+        usage_fields = frozenset(usage) if isinstance(usage, Mapping) else frozenset()
+        if not isinstance(usage, Mapping) or usage_fields not in {
+            frozenset(legacy_usage_fields),
+            frozenset(legacy_usage_fields | retry_usage_fields),
+            frozenset(legacy_usage_fields | chain_usage_fields),
+            frozenset(legacy_usage_fields | chain_usage_fields | retry_usage_fields),
+        }:
             raise ProductionFinalizationError("live provider usage evidence is malformed")
-        integer_fields = expected_usage_fields - {
+        integer_fields = legacy_usage_fields - {
             "model",
             "estimated_cost_usd",
             "provider_wall_seconds",
@@ -2852,6 +3108,133 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
         ):
             raise ProductionFinalizationError("live provider wall time is malformed")
         call_count = cast(int, usage["transcript_count"])
+        retry_wait = usage.get("retry_wait_seconds", 0.0)
+        if (
+            isinstance(retry_wait, bool)
+            or not isinstance(retry_wait, (int, float))
+            or not math.isfinite(float(retry_wait))
+            or retry_wait < 0
+        ):
+            raise ProductionFinalizationError("provider retry wait is malformed")
+        provider_route = ""
+        if chain_usage_fields.issubset(usage_fields):
+            base_url = _text(usage["base_url"], "active provider base URL")
+            active_slot = _text(usage["active_slot"], "active provider slot")
+            failover_count = usage["failover_count"]
+            failover_events = usage["failover_events"]
+            provider_chain = usage["provider_chain"]
+            if (
+                active_slot not in {"main", "fallback"}
+                or type(failover_count) is not int
+                or failover_count < 0
+                or not isinstance(failover_events, list)
+                or len(failover_events) != failover_count
+                or not isinstance(provider_chain, list)
+                or not 1 <= len(provider_chain) <= 2
+            ):
+                raise ProductionFinalizationError("provider-chain usage evidence is malformed")
+            for event in failover_events:
+                if not isinstance(event, Mapping) or set(event) != {
+                    "operation",
+                    "from_slot",
+                    "to_slot",
+                    "failure",
+                }:
+                    raise ProductionFinalizationError("provider failover event is malformed")
+                failure = event["failure"]
+                if (
+                    _text(event["operation"], "provider failover operation")
+                    not in {"propose", "implement", "repair", "reflect"}
+                    or event["from_slot"] != "main"
+                    or event["to_slot"] != "fallback"
+                    or not isinstance(failure, Mapping)
+                    or set(failure) != {"slot", "code", "operation", "attempts", "status_code"}
+                    or failure["slot"] != "main"
+                    or type(failure["attempts"]) is not int
+                    or failure["attempts"] < 0
+                ):
+                    raise ProductionFinalizationError("provider failover event is malformed")
+            chain_integer_fields = {
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "total_tokens",
+                "unaccounted_attempts",
+                "transcript_count",
+            }
+            expected_chain_fields = chain_integer_fields | {
+                "slot",
+                "model",
+                "base_url",
+                "credential_env",
+                "estimated_cost_usd",
+            }
+            if "retry_wait_seconds" in usage_fields:
+                expected_chain_fields.add("retry_wait_seconds")
+            chain_totals = {name: 0 for name in chain_integer_fields}
+            chain_retry_wait = 0.0
+            slots: list[str] = []
+            for index, profile in enumerate(provider_chain):
+                if not isinstance(profile, Mapping) or set(profile) != expected_chain_fields:
+                    raise ProductionFinalizationError(
+                        "provider-chain profile usage evidence is malformed"
+                    )
+                slot = _text(profile["slot"], f"provider-chain profile {index} slot")
+                _text(profile["model"], f"provider-chain profile {index} model")
+                _text(profile["base_url"], f"provider-chain profile {index} base URL")
+                _text(
+                    profile["credential_env"],
+                    f"provider-chain profile {index} credential environment",
+                )
+                _text(
+                    profile["estimated_cost_usd"],
+                    f"provider-chain profile {index} estimated cost",
+                )
+                if slot not in {"main", "fallback"} or slot in slots:
+                    raise ProductionFinalizationError("provider-chain profile slots are malformed")
+                slots.append(slot)
+                for name in chain_integer_fields:
+                    value = profile[name]
+                    if type(value) is not int or value < 0:
+                        raise ProductionFinalizationError(
+                            "provider-chain profile token counts are malformed"
+                        )
+                    chain_totals[name] += value
+                if "retry_wait_seconds" in usage_fields:
+                    profile_retry_wait = profile["retry_wait_seconds"]
+                    if (
+                        isinstance(profile_retry_wait, bool)
+                        or not isinstance(profile_retry_wait, (int, float))
+                        or not math.isfinite(float(profile_retry_wait))
+                        or profile_retry_wait < 0
+                    ):
+                        raise ProductionFinalizationError("provider-chain retry wait is malformed")
+                    chain_retry_wait += float(profile_retry_wait)
+            if slots[0] != "main" or (len(slots) == 2 and slots != ["main", "fallback"]):
+                raise ProductionFinalizationError("provider-chain profile order is malformed")
+            for name in chain_integer_fields:
+                if chain_totals[name] != usage[name]:
+                    raise ProductionFinalizationError(
+                        "provider-chain totals differ from aggregate provider usage"
+                    )
+            if "retry_wait_seconds" in usage_fields and not math.isclose(
+                chain_retry_wait,
+                float(retry_wait),
+                rel_tol=0.0,
+                abs_tol=0.000002 * len(provider_chain),
+            ):
+                raise ProductionFinalizationError(
+                    "provider-chain retry wait differs from aggregate provider usage"
+                )
+            if active_slot not in slots:
+                raise ProductionFinalizationError("active provider slot is absent from the chain")
+            if failover_count > 1 or (active_slot == "main") != (failover_count == 0):
+                raise ProductionFinalizationError("provider failover state is inconsistent")
+            provider_route = (
+                f"; active slot={active_slot}; failovers={failover_count}; "
+                f"active base URL={base_url}"
+            )
         provider_usage = (
             f"Research-model attempts={call_count}; provider={provider}; model={model}; "
             f"input tokens={usage['input_tokens']} (cached={usage['cached_input_tokens']}); "
@@ -2859,7 +3242,9 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
             f"(reasoning={usage['reasoning_tokens']}); total tokens={usage['total_tokens']}; "
             f"estimated API cost USD={estimated_cost}; "
             f"provider wall seconds={provider_wall}; "
-            f"unaccounted attempts={usage['unaccounted_attempts']}; replay provider calls=0."
+            f"retry wait seconds={retry_wait}; "
+            f"unaccounted attempts={usage['unaccounted_attempts']}"
+            f"{provider_route}; replay provider calls=0."
         )
     else:
         provider_usage = (
@@ -2899,6 +3284,13 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
         portfolio_cap=portfolio_cap,
         portfolio_cap_reason=cap_reason,
         advanced_branch_disposition=advanced,
+        research_progress=_research_progress_summary(science),
+        research_outcome=_research_outcome_summary(
+            lineage=lineage,
+            science=science,
+            cap_reason=cap_reason,
+        ),
+        research_rejections=_research_rejection_lines(science),
     )
 
 
@@ -2989,11 +3381,17 @@ def _report_context(
         status=(confirmation.status.value if confirmation is not None else "baseline_reproduced"),
         outer_primary=selected.primary,
     )
-    failure_lines = tuple(
+    finalization_failure_lines = tuple(
         f"{item.candidate_id} failed {item.stage} ({item.exception_type}; "
         f"diagnostic SHA-256 {item.diagnostic_sha256}); incumbent protection remained active."
         for item in failures
     ) or ("No production finalization fallback was required.",)
+    failure_lines = (
+        judge_facts.research_outcome,
+        judge_facts.research_progress,
+        *judge_facts.research_rejections,
+        *finalization_failure_lines,
+    )
     limitations = [
         "Hidden-test improvement is unverified until organizer scoring.",
         "The signed terminal production outcome reports one inclusive finalization resource "
