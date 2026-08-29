@@ -116,6 +116,7 @@ class ExperimentNarrative:
     status: str
     inner_primary: float | None = None
     outer_primary: float | None = None
+    failures_and_recoveries: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.iteration) is not int or self.iteration <= 0:
@@ -131,6 +132,15 @@ class ExperimentNarrative:
             self,
             "attributions",
             _unique_lines(self.attributions, "attributions"),
+        )
+        object.__setattr__(
+            self,
+            "failures_and_recoveries",
+            _unique_lines(
+                self.failures_and_recoveries,
+                "experiment failures_and_recoveries",
+                allow_empty=True,
+            ),
         )
         for name in ("inner_primary", "outer_primary"):
             value = getattr(self, name)
@@ -328,6 +338,11 @@ def render_final_report(
         f"Mechanism: {item.mechanism}\n\n"
         f"Material executable-source changes:\n\n{_bullets(item.material_changes)}\n\n"
         f"Source attributions:\n\n{_bullets(item.attributions)}"
+        + (
+            f"\n\nErrors and recoveries:\n\n{_bullets(item.failures_and_recoveries)}"
+            if item.failures_and_recoveries
+            else ""
+        )
         for item in context.experiments
     )
     limitations = context.known_limitations or ("No additional engineering limitation recorded.",)

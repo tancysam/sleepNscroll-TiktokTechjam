@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 from kuairand_agent.finalization.organizer_check import (
@@ -197,3 +198,51 @@ def test_reproduce_script_is_frozen_explicit_and_never_calls_an_llm(tmp_path: Pa
     path = write_reproduce_script(tmp_path / "reproduce.sh", instructions)
     assert path.stat().st_mode & 0o111
     assert path.read_text(encoding="utf-8") == script
+
+
+def test_report_renders_every_iteration_and_its_recovery_events() -> None:
+    """A multi-iteration campaign must render as a multi-iteration trajectory.
+
+    The finalizer previously emitted one hardcoded narrative regardless of how many iterations
+    ran, so the per-iteration run log -- a required submission deliverable -- could not be
+    produced at all.
+    """
+
+    context = replace(
+        _context(),
+        experiments=(
+            ExperimentNarrative(
+                iteration=1,
+                experiment_id="candidate-01",
+                parent_id="official-fm",
+                hypothesis="Pairwise sampling aligns training with GAUC.",
+                mechanism="Sample same-user pairs.",
+                material_changes=("Changed top-level symbol: fit_scores",),
+                attributions=("organizer briefing",),
+                status="rejected",
+            ),
+            ExperimentNarrative(
+                iteration=2,
+                experiment_id="candidate-02",
+                parent_id="candidate-01",
+                hypothesis="Listwise softmax over the user's impressions.",
+                mechanism="Softmax cross-entropy per user.",
+                material_changes=("Changed top-level symbol: fit_scores",),
+                attributions=("organizer briefing",),
+                status="promoted",
+                outer_primary=0.605,
+                failures_and_recoveries=(
+                    "Iteration 2 (candidate-02): 1 bounded repair round-trip was required.",
+                ),
+            ),
+        ),
+    )
+
+    rendered = render_final_report(context, replay=_replay(), organizer_check=_check())
+
+    assert "### Iteration 1: candidate-01" in rendered
+    assert "### Iteration 2: candidate-02" in rendered
+    assert "Listwise softmax" in rendered
+    # The recovery block appears only for the iteration that actually recovered.
+    assert rendered.count("Errors and recoveries:") == 1
+    assert "1 bounded repair round-trip was required" in rendered

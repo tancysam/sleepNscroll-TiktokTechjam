@@ -113,6 +113,11 @@ from kuairand_agent.finalization.finalize import (
     FinalizationResult,
     run_finalization,
 )
+from kuairand_agent.finalization.iteration_evidence import (
+    IterationEvidenceError,
+    collect_iteration_narratives,
+    count_recorded_iterations,
+)
 from kuairand_agent.finalization.organizer_check import (
     OrganizerCheckEvidence,
     check_final_submission,
@@ -2539,6 +2544,8 @@ def _generated_replay_candidate(
         report_context=_report_context(
             candidate_id=selection.candidate_id,
             parent_id=outcome.fallback_candidate_id,
+            run_dir=outcome.run_dir,
+            campaign_id=outcome.campaign_id,
             metrics=metrics,
             qualification=qualification,
             outcome=outcome,
@@ -2661,6 +2668,8 @@ def _fallback_replay_candidate(
         report_context=_report_context(
             candidate_id=candidate_id,
             parent_id=candidate_id,
+            run_dir=outcome.run_dir,
+            campaign_id=outcome.campaign_id,
             metrics=metrics,
             qualification=qualification,
             outcome=outcome,
@@ -3311,10 +3320,25 @@ def _report_peak_rss_bytes(
     return max(qualification_peak, confirmation.retained_training_peak_rss_bytes)
 
 
+def _candidate_outcome_status(outcome: FullCampaignOutcome) -> dict[str, str]:
+    """Map candidate id to its measured campaign outcome for the trajectory table.
+
+    The selection plan is the only outcome-bearing structure reachable here without
+    reopening the campaign store, so an iteration the selector never promoted keeps the
+    neutral default supplied by the collector."""
+
+    selection = outcome.selection
+    if selection is None:
+        return {}
+    return {selection.candidate_id: "promoted"}
+
+
 def _report_context(
     *,
     candidate_id: str,
     parent_id: str,
+    run_dir: Path,
+    campaign_id: str,
     metrics: Mapping[str, object],
     qualification: OfficialFMQualificationEvidence,
     outcome: FullCampaignOutcome,
@@ -3351,6 +3375,20 @@ def _report_context(
             else "Immutable official fallback seed."
         ),
     )
+    # The campaign durably records one lineage file per admitted iteration and one
+    # hash-chained journal entry per rejected branch.  Prefer that real trajectory; the
+    # literal below remains only for runs that never reached research at all.
+    try:
+        recovered = collect_iteration_narratives(
+            run_dir,
+            campaign_id=campaign_id,
+            fallback_parent_id=parent_id,
+            candidate_outcomes=_candidate_outcome_status(outcome),
+        )
+    except IterationEvidenceError as exc:
+        raise ProductionFinalizationError(
+            "durable per-iteration research evidence is unreadable"
+        ) from exc
     experiment = ExperimentNarrative(
         iteration=1,
         experiment_id=candidate_id,
@@ -3390,6 +3428,7 @@ def _report_context(
         judge_facts.research_outcome,
         judge_facts.research_progress,
         *judge_facts.research_rejections,
+        *recovered.failure_lines,
         *finalization_failure_lines,
     )
     limitations = [
@@ -3444,7 +3483,7 @@ def _report_context(
         },
         baselines=(_baseline_mean(qualification),),
         selected=selected,
-        experiments=(experiment,),
+        experiments=(recovered.narratives or (experiment,)),
         inner_fold_evidence=inner_evidence,
         seed_confirmation=seed_confirmation,
         failures_and_recoveries=failure_lines,
@@ -3580,7 +3619,10 @@ def _bundle_metadata(
         },
         campaign_totals={
             "attempt_count": launch_count,
-            "scientific_iteration_count": (1 if outcome.scientific_result_digest else 0),
+            "scientific_iteration_count": (
+                count_recorded_iterations(outcome.run_dir)
+                or (1 if outcome.scientific_result_digest else 0)
+            ),
             "launch_count": launch_count,
             "elapsed_seconds": float(campaign_wall_seconds),
             "manual_intervention_count": outcome.manual_interventions,

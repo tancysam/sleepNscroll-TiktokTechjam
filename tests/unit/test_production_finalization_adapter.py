@@ -331,6 +331,7 @@ def test_generated_bundle_rejects_tampered_protected_bootstrap_point() -> None:
 
 def test_generated_resource_provenance_separates_selected_training_from_report_envelope(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     candidate_peaks = (948_830_208, 941_211_648, 948_617_216)
     fm_peaks = (1_843_101_696, 1_700_000_000, 1_650_000_000)
@@ -427,6 +428,7 @@ def test_generated_resource_provenance_separates_selected_training_from_report_e
         environment_digest=environment_digest,
     )
     outcome = SimpleNamespace(
+        run_dir=tmp_path,
         selection=SimpleNamespace(representative_seed=0),
         scientific_result_digest=_digest("a"),
         manual_interventions=0,
@@ -1957,6 +1959,7 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
 
 def test_fallback_report_includes_research_admission_and_rejection_evidence(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     facts = production._JudgeProgressFacts(
         provider_usage="Research-model attempts=6; replay provider calls=0.",
@@ -1998,6 +2001,8 @@ def test_fallback_report_includes_research_admission_and_rejection_evidence(
     context = production._report_context(
         candidate_id="official-fm-fallback-seed-4",
         parent_id="official-fm-fallback-seed-4",
+        run_dir=tmp_path,
+        campaign_id="campaign-report-context",
         metrics=_metrics(0.6, 0.4),
         qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
         outcome=cast(

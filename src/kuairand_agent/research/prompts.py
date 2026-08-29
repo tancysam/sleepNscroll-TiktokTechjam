@@ -182,7 +182,6 @@ _SECTIONS: Final = {
 }
 
 
-
 def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
     suffixes = ", ".join(policy.allowed_suffixes)
     forbidden_names = ", ".join(policy.forbidden_basenames)

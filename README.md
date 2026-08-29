@@ -26,11 +26,11 @@ Chat Completions profiles with strict structured output by default. Copy `.env.e
 
 ```dotenv
 INFERENCE_MAIN_API_KEY=
-INFERENCE_MAIN_BASE_URL=https://api.openai.com/v1
-INFERENCE_MAIN_MODEL=gpt-5.6-sol
+INFERENCE_MAIN_BASE_URL=https://openrouter.ai/api/v1
+INFERENCE_MAIN_MODEL=deepseek/deepseek-v4-pro-0813
 INFERENCE_FALLBACK_API_KEY=
-INFERENCE_FALLBACK_BASE_URL=
-INFERENCE_FALLBACK_MODEL=
+INFERENCE_FALLBACK_BASE_URL=https://api.tokenrouter.com/v1
+INFERENCE_FALLBACK_MODEL=deepseek/deepseek-v4-pro-0813
 ```
 
 Both base URLs must implement `POST {base_url}/chat/completions`. Both dedicated credentials are

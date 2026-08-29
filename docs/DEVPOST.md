@@ -44,8 +44,8 @@ rule is what makes the run log trustworthy evidence rather than a transcript of 
 
 **We deliberately did not use an agent framework.** No LangChain, no LiteLLM, no orchestration
 library, not even the `openai` SDK. Provider calls are `urllib.request` from the standard library
-against the Responses API with strict structured outputs. The two runtime dependencies are `numpy`
-and `psutil`. This was a considered choice: AIDE's own published benchmarking found that plain
+against an OpenAI-compatible Chat Completions endpoint with strict JSON-schema structured
+outputs. The two runtime dependencies are `numpy` and `psutil`. This was a considered choice: AIDE's own published benchmarking found that plain
 tree search over code outperformed a LangChain-based agent on this class of task, and every
 framework layer we skipped is a layer that cannot silently take authority we did not intend to
 grant.
@@ -112,7 +112,7 @@ We would rather report a small honest number than a large unverifiable one.
 
 | | |
 |---|---|
-| OpenAI **Responses API** | `gpt-5.6-sol`, with strict JSON-schema structured outputs and a configured reasoning effort. Called directly over `urllib.request` — no vendor SDK and no agent framework. Per-call input, cached-input, output, reasoning and total tokens are recorded, with cost derived from pricing pinned in configuration rather than inferred at runtime. |
+| **OpenAI-compatible Chat Completions**, two profiles | A frozen main/fallback provider chain over `POST {base_url}/chat/completions` with strict JSON-schema structured outputs. We run `deepseek/deepseek-v4-pro-0813`, served by OpenRouter as the main profile and TokenRouter as the fallback; a terminal typed failure switches to the fallback exactly once and stays there, so a known-bad endpoint is not retried for every later operation. Called directly over `urllib.request` — no vendor SDK and no agent framework. Each profile carries its own dedicated credential variable and its own pinned pricing block, and per-call input, cached-input, output, reasoning and total tokens are recorded. Choosing an open-weights model behind a provider chain, rather than a frontier model behind one endpoint, was a deliberate cost and availability decision. |
 | Zenodo | One-time hash-verified dataset acquisition (record 10439422). Not called at runtime. |
 
 No other network access exists anywhere in the system. Generated candidate code cannot reach the

@@ -111,6 +111,30 @@ records `provider = scripted` and zero API calls.
 | Scientific iterations | PENDING |
 | Manual interventions | PENDING |
 
+### 3.4 Independent qualification on a second platform
+
+Reproduced by a second team member on Linux x86-64, from a separately downloaded and
+hash-verified copy of the dataset, using `runs/maki-qualification`. Six charged launches in
+**3 min 56 s** on CPU.
+
+| Seed | GAUC | nDCG@5 | primary | replay bit-exact |
+|---|---|---|---|---|
+| 0 | 0.6671334 | 0.5358057 | 0.6014695 | yes |
+| 1 | 0.6673948 | 0.5361270 | 0.6017609 | yes |
+| 2 | 0.6670642 | 0.5351164 | 0.6010903 | yes |
+| 3 | 0.6674611 | 0.5355451 | 0.6015031 | yes |
+| 4 | 0.6679478 | 0.5361264 | 0.6020371 | yes |
+
+Five-seed mean validation primary **0.6015722**, which rounds to **0.6016** -- the organizers'
+published validation figure exactly. Observed seed standard deviation **0.000316**, tighter than
+the published 0.0008, which makes epsilon = 0.002 roughly six standard deviations on this
+hardware rather than 2.5.
+
+This matters twice over. It confirms the pipeline is correct on a second, independent platform
+rather than only on the machine that built it; and it establishes the local baseline that any
+candidate produced on that machine must be compared against -- see section 6.4, because the two
+platforms do not agree to the last bit.
+
 ## 4. Resource consumption
 
 ### GPU time: **0.00 GPU-hours**
@@ -194,6 +218,29 @@ Stated plainly, because the gap matters more than the architecture:
    the baseline to within noise (§3.1). We have not shown a validation-primary delta above
    ε = 0.002.
 3. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
+
+### 6.4 Bit-exact replay is platform-bound
+
+The organizer FM is float32, and float32 arithmetic does not round identically across CPU
+architectures; Adam then compounds the difference from the first update. Running the same
+hash-pinned code, on the same hash-verified data, at the same seed, on Apple Silicon (`arm64` /
+`Darwin`) and on Linux `x86-64` produces **different checkpoint bytes**:
+
+| | expected golden | observed on x86-64 |
+|---|---|---|
+| first-update mean loss | 0.693239152431488 | 0.6932390928268433 |
+| bias bytes | `7dbf0134` | `8ac10134` |
+| V and W SHA-256 | frozen | differ |
+
+Both platforms reproduce the published validation primary to four decimals (section 3.4), so this
+is a reproducibility limit, not a correctness one. The system handles it explicitly rather than
+silently: `campaign/provenance.py` records `platform.system`, `release` and `machine` in the
+environment identity, and replay compares prediction digests exactly, so a cross-platform replay
+fails closed instead of publishing a mismatched result.
+
+The practical consequence, stated because it affects anyone reproducing this work: a final bundle
+can be replayed bit-exactly only on the platform class that produced it. We therefore build the
+submitted bundle on Linux `x86-64`, the platform a reviewer is most likely to have.
 
 ## 7. Artifact index
 
