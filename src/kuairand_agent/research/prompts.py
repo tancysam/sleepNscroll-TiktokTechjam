@@ -167,10 +167,12 @@ _OPERATION: Final = {
         "Propose one falsifiable principal scientific change. Keep it within remaining resource "
         "evidence, name the exact parent, declare every required field and role, and provide "
         "explicit smoke, inner-fold, falsification, promotion, and rollback criteria. "
-        "files_expected lists exactly the files the implementation will RETURN. Protected "
-        "runtime paths are inherited from the trusted parent automatically: never list or "
-        "return candidate.py. A typical manifest is [model_impl.py] alone, or "
-        "[model_impl.py, config.json] when the configuration schema also changes."
+        "files_expected is the manifest of the FINAL candidate tree, not the list of "
+        "files the implementation will return. It is validated and must include "
+        "candidate.py, which the final tree inherits unchanged from the trusted "
+        "parent. A typical manifest is [candidate.py, model_impl.py, config.json]. "
+        "The implementation step then returns only the subset it actually changes, "
+        "and never returns candidate.py itself."
     ),
     ResearchOperation.IMPLEMENT: """Return only files whose content differs from the trusted
 parent, with complete content for each returned file; never return patches or filesystem
@@ -257,9 +259,12 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
             "malformed response before any gate runs, and costs an attempt."
         ),
         (
-            "- Change model_impl.py, config.json, or helper modules you add and import. Never "
-            "return candidate.py: it is a protected runtime wrapper, it is retained from the "
-            "parent automatically, and returning it is refused before any other check."
+            "- The proposal's files_expected manifest lists the final tree and therefore "
+            "includes candidate.py. Your response is an overlay, not that manifest: return "
+            "only the files you change. Change model_impl.py, config.json, or helper "
+            "modules you add and import. Never return candidate.py itself: it is a "
+            "protected runtime wrapper, retained from the parent automatically, and "
+            "returning it is refused before any other check."
         ),
         (
             "- provider JSON acceptance is not candidate admission. Local path, static, "

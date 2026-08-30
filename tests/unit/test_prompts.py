@@ -182,8 +182,8 @@ def test_instructions_reject_a_foreign_source_policy() -> None:
         instructions_for(ResearchOperation.IMPLEMENT, source_policy=object())  # type: ignore[arg-type]
 
 
-def test_propose_never_asks_for_a_protected_path() -> None:
-    """PROPOSE and IMPLEMENT must not contradict each other about candidate.py.
+def test_propose_manifest_and_implement_overlay_stay_distinguishable() -> None:
+    """PROPOSE and IMPLEMENT talk about two different things; say which is which.
 
     A live campaign lost its first branch to exactly this. PROPOSE said files_expected "must
     include candidate.py"; IMPLEMENT forbids returning any protected path, and candidate.py is
@@ -195,9 +195,10 @@ def test_propose_never_asks_for_a_protected_path() -> None:
     Nothing validates files_expected, so only this test stops the wording drifting back.
     """
 
-    rendered = instructions_for(ResearchOperation.PROPOSE)
-    assert "must include candidate.py" not in rendered
-    assert "never list or return candidate.py" in " ".join(rendered.split())
+    rendered = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
+    assert "must include candidate.py" in rendered
+    assert "not the list of files the implementation will return" in rendered
+    assert "never returns candidate.py itself" in rendered
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)

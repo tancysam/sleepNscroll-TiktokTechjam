@@ -71,25 +71,24 @@ def test_model_generation_prompt_defines_one_general_model_interface() -> None:
     assert "The protected wrapper owns them" in instructions
 
 
-def test_proposal_prompt_requires_a_legal_returnable_manifest() -> None:
-    """files_expected must describe what the response RETURNS, not the final tree.
+def test_proposal_prompt_requires_a_legal_final_manifest() -> None:
+    """files_expected is the FINAL TREE manifest, and the entrypoint is validated.
 
-    This test previously asserted that PROPOSE tells the model files_expected "must include
-    candidate.py". That instruction contradicted IMPLEMENT, which forbids returning any
-    protected path -- and candidate.py is the protected path. A live campaign lost its first
-    branch to it: the model listed candidate.py as instructed, returned it, and was rejected at
-    materialization with "generated package cannot replace protected runtime file(s):
-    candidate.py" after exhausting both repairs.
+    provider._parse calls source_policy.validate_manifest(proposal.files_expected,
+    require_final_entrypoint=True) with no parent_paths, so files_expected IS the final tree and
+    omitting candidate.py fails validation on every proposal.
 
-    The final tree does contain candidate.py, because overlay semantics retain unmentioned
-    parent files. The response must not.
+    The failure that made this look like a contradiction was at the other end: the model treated
+    files_expected as the list of files to return, returned candidate.py, and was refused at
+    materialization because it is a protected path. Both statements are true and they describe
+    different things -- the manifest is the resulting tree, the response is an overlay over it.
     """
 
     instructions = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
 
-    assert "files_expected lists exactly the files the implementation will RETURN" in instructions
-    assert "never list or return candidate.py" in instructions
-    assert "must include candidate.py" not in instructions
+    assert "files_expected is the manifest of the FINAL candidate tree" in instructions
+    assert "must include candidate.py" in instructions
+    assert "never returns candidate.py itself" in instructions
 
 
 def test_delivered_prompt_uses_the_exact_request_policy_digest() -> None:
