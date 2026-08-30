@@ -53,19 +53,18 @@ _PRICE_RE: Final = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?\Z")
 _REASONING_EFFORTS: Final = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai"})
 # Hosts that ignore both ``reasoning_effort`` and the gateway ``reasoning`` object, and
-# instead expose an explicit thinking budget. Measured against api.tokenrouter.com: the
-# OpenAI-style controls left 92% of completion tokens as reasoning and drove implement calls
-# past the configured timeout, while an explicit budget is honoured exactly.
-_THINKING_BUDGET_HOSTS: Final = frozenset({"api.tokenrouter.com"})
-_THINKING_BUDGET_TOKENS: Final = {
-    "none": 0,
-    "minimal": 0,
-    "low": 4096,
-    "medium": 16384,
-    "high": 32768,
-    "xhigh": 49152,
-    "max": 65536,
-}
+# instead expose a ``thinking`` switch.  Measured against api.tokenrouter.com on real
+# request payloads: neither OpenAI-style control has any effect, and ``budget_tokens`` is
+# advisory only -- a 4096 budget still returned 11k-26k reasoning tokens.  Reasoning is
+# billed as completion tokens, so on this host it consumed most of ``max_output_tokens``
+# and the generated files arrived truncated: unterminated string literals, an empty
+# config.json, and one response that repeated the same path twelve times.  Disabling it
+# returned the same request in 12s instead of 334s with the full output budget intact.
+#
+# The switch is therefore treated as binary here.  Efforts at or below ``low`` disable
+# thinking outright; higher efforts enable it and accept that the budget is not enforced.
+_THINKING_SWITCH_HOSTS: Final = frozenset({"api.tokenrouter.com"})
+_THINKING_DISABLED_EFFORTS: Final = frozenset({"none", "minimal", "low"})
 _SECRET_PATTERN: Final = re.compile(r"(?i)(?:bearer\s+|sk-(?:proj-)?)[A-Za-z0-9_.-]{8,}")
 
 
@@ -819,15 +818,11 @@ class OpenAIChatCompletionsModel:
                     "effort": self.config.reasoning_effort,
                     "exclude": True,
                 }
-            elif hostname in _THINKING_BUDGET_HOSTS:
-                # This host silently ignores both OpenAI-style controls, so the configured
-                # effort must be expressed as an explicit budget or the model reasons
-                # without bound and the call exceeds its timeout.
-                budget = _THINKING_BUDGET_TOKENS.get(self.config.reasoning_effort, 4096)
+            elif hostname in _THINKING_SWITCH_HOSTS:
                 payload["thinking"] = (
-                    {"type": "enabled", "budget_tokens": budget}
-                    if budget > 0
-                    else {"type": "disabled"}
+                    {"type": "disabled"}
+                    if self.config.reasoning_effort in _THINKING_DISABLED_EFFORTS
+                    else {"type": "enabled"}
                 )
             else:
                 payload["reasoning_effort"] = self.config.reasoning_effort
