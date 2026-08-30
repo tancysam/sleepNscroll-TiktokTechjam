@@ -398,8 +398,10 @@ def _normalize_resource_evidence(
         raise ProductionFinalizationError("resource_evidence schema or coverage is not exact")
     hard = normalized["hard_wall_seconds"]
     reserve = normalized["finalization_reserve_seconds"]
-    if hard != 21_600 or reserve != 3_600:
-        raise ProductionFinalizationError("production resource evidence changed hard time limits")
+    if type(hard) is not int or not 60 <= hard <= 21_600:
+        raise ProductionFinalizationError("production resource hard wall is invalid")
+    if type(reserve) is not int or not 600 <= reserve < hard:
+        raise ProductionFinalizationError("production resource finalization reserve is invalid")
 
     def seconds(name: str) -> float:
         raw = normalized[name]
@@ -3062,6 +3064,27 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
     operation_summary = "+".join(operations) if operations else "none"
     usage = science.get("provider_usage")
     if live_provider_used or isinstance(usage, Mapping):
+        def valid_context_limits(value: object) -> bool:
+            if value is None:
+                return True
+            if not isinstance(value, Mapping) or set(value) != {
+                "context_length",
+                "max_completion_tokens",
+                "source",
+            }:
+                return False
+            context_length = value["context_length"]
+            maximum = value["max_completion_tokens"]
+            source = value["source"]
+            return (
+                type(context_length) is int
+                and 1 <= context_length <= 10_000_000
+                and type(maximum) is int
+                and 1 <= maximum <= context_length
+                and type(source) is str
+                and 1 <= len(source) <= 128
+            )
+
         legacy_usage_fields = {
             "model",
             "input_tokens",
@@ -3083,12 +3106,16 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
         }
         retry_usage_fields = {"retry_wait_seconds"}
         usage_fields = frozenset(usage) if isinstance(usage, Mapping) else frozenset()
-        if not isinstance(usage, Mapping) or usage_fields not in {
+        usage_fields_without_limits = usage_fields - {"context_limits"}
+        if not isinstance(usage, Mapping) or usage_fields_without_limits not in {
             frozenset(legacy_usage_fields),
             frozenset(legacy_usage_fields | retry_usage_fields),
             frozenset(legacy_usage_fields | chain_usage_fields),
             frozenset(legacy_usage_fields | chain_usage_fields | retry_usage_fields),
-        }:
+        } or (
+            "context_limits" in usage_fields
+            and not valid_context_limits(usage["context_limits"])
+        ):
             raise ProductionFinalizationError("live provider usage evidence is malformed")
         integer_fields = legacy_usage_fields - {
             "model",
@@ -3176,9 +3203,18 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
             chain_retry_wait = 0.0
             slots: list[str] = []
             for index, profile in enumerate(provider_chain):
-                if not isinstance(profile, Mapping) or set(profile) != expected_chain_fields:
+                if not isinstance(profile, Mapping) or set(profile) not in {
+                    frozenset(expected_chain_fields),
+                    frozenset(expected_chain_fields | {"context_limits"}),
+                }:
                     raise ProductionFinalizationError(
                         "provider-chain profile usage evidence is malformed"
+                    )
+                if "context_limits" in profile and not valid_context_limits(
+                    profile["context_limits"]
+                ):
+                    raise ProductionFinalizationError(
+                        "provider-chain profile context limits are malformed"
                     )
                 slot = _text(profile["slot"], f"provider-chain profile {index} slot")
                 _text(profile["model"], f"provider-chain profile {index} model")
@@ -4565,6 +4601,13 @@ def _outcome_from_bundle(
     status = _derive_bundle_status(bundle.manifest)
     if request.campaign_id != research.campaign_id:
         raise ProductionFinalizationError("campaign and research outcome identity differ")
+    if (
+        resource_evidence.get("hard_wall_seconds")
+        != request.config.benchmark.wall_clock_seconds
+        or resource_evidence.get("finalization_reserve_seconds")
+        != request.config.runner.finalization_reserve_seconds
+    ):
+        raise ProductionFinalizationError("production resource evidence changed configured limits")
     return ProductionFinalizationOutcome(
         run_dir=run_dir,
         campaign_id=request.campaign_id,
@@ -4640,6 +4683,13 @@ def _load_production_outcome(
         or outcome.bundle_root != (run_dir / _FINAL_BUNDLE_RELATIVE_PATH).resolve(strict=True)
     ):
         raise ProductionFinalizationError("production outcome differs from campaign identity")
+    if (
+        outcome.resource_evidence.get("hard_wall_seconds")
+        != request.config.benchmark.wall_clock_seconds
+        or outcome.resource_evidence.get("finalization_reserve_seconds")
+        != request.config.runner.finalization_reserve_seconds
+    ):
+        raise ProductionFinalizationError("production resource evidence changed configured limits")
     bundle = _verify_closed_bundle(outcome.bundle_root)
     if (
         bundle.manifest_sha256 != outcome.bundle_manifest_sha256

@@ -9,7 +9,6 @@ the generated candidate runner without trusting or importing it in the controlle
 
 from __future__ import annotations
 
-import difflib
 import hashlib
 import re
 import stat
@@ -34,14 +33,13 @@ from kuairand_agent.research.materialize import (
     CandidateStaticError,
     MaterialChangeEvidence,
     MaterializedCandidate,
-    _normalized_tree,
-    _reachable_python_files,
-    _top_level_symbols,
+    describe_materialized_candidate,
     materialize_candidate,
     require_material_executable_change,
     snapshot_materialized_candidate,
     sanitize_generated_package,
     validate_candidate_static,
+    validate_model_generated_overlay,
 )
 from kuairand_agent.research.schemas import (
     FailureCategory,
@@ -318,7 +316,11 @@ def load_parent_snapshot(parent_dir: Path, *, candidate_id: str) -> ParentSnapsh
         raise ProductionResearchError("candidate parent directory is unavailable") from exc
     if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
         raise ProductionResearchError("candidate parent must be a real directory")
-    observed = tuple(path for path in sorted(root.rglob("*")) if path.is_file())
+    observed = tuple(
+        path
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and "__pycache__" not in path.relative_to(root).parts
+    )
     if not 1 <= len(observed) <= 12:
         raise ProductionResearchError("candidate parent must contain between 1 and 12 files")
     files: list[ParentSourceFile] = []
@@ -558,48 +560,9 @@ def _describe_expected_candidate(
     package: GeneratedPackage,
     destination: Path,
 ) -> MaterializedCandidate:
-    """Recompute the materializer's logical result without touching the existing tree."""
+    """Recompute the materializer's normalized logical result without filesystem writes."""
 
-    parent_content = {value.path: value.content for value in parent.files}
-    child_content = dict(parent_content)
-    child_content.update({value.path: value.content for value in package.files})
-    changed_paths = tuple(
-        path
-        for path in sorted(set(parent_content) | set(child_content))
-        if parent_content.get(path) != child_content.get(path)
-    )
-    fragments: list[str] = []
-    for path in changed_paths:
-        fragments.extend(
-            difflib.unified_diff(
-                parent_content.get(path, "").splitlines(keepends=True),
-                child_content.get(path, "").splitlines(keepends=True),
-                fromfile=f"a/{path}",
-                tofile=f"b/{path}",
-                lineterm="\n",
-            )
-        )
-    unified_diff = "".join(fragments)
-    files = tuple(
-        ParentSourceFile.create(path, content) for path, content in sorted(child_content.items())
-    )
-    source_digest = canonical_digest(
-        {
-            "schema_version": 1,
-            "files": [{"path": value.path, "sha256": value.sha256} for value in files],
-        }
-    )
-    return MaterializedCandidate(
-        destination=destination,
-        parent_digest=parent.digest,
-        package_digest=package.digest,
-        material_symbols=package.material_symbols,
-        files=files,
-        changed_paths=changed_paths,
-        unified_diff=unified_diff,
-        source_digest=source_digest,
-        diff_digest=hashlib.sha256(unified_diff.encode("utf-8")).hexdigest(),
-    )
+    return describe_materialized_candidate(parent, package, destination)
 
 
 def _verify_exact_generated_tree(candidate: MaterializedCandidate) -> None:
@@ -1230,6 +1193,12 @@ def prepare_or_rehydrate_live_lineage(
     candidate: MaterializedCandidate
     if rehydrating:
         destination = generated_root / candidate_id
+        try:
+            validate_model_generated_overlay(package)
+        except CandidateMaterializationError as exc:
+            raise ProductionResearchError(
+                "persisted live package violates the runtime contract"
+            ) from exc
         candidate = _describe_expected_candidate(parent, package, destination)
         _verify_exact_generated_tree(candidate)
         validate_candidate_static(candidate)
@@ -1242,6 +1211,7 @@ def prepare_or_rehydrate_live_lineage(
             destination = generated_root / candidate_id
             attempted_candidate: MaterializedCandidate | None = None
             try:
+                validate_model_generated_overlay(package)
                 attempted_candidate = materialize_candidate(parent, package, destination)
                 candidate = attempted_candidate
                 validate_candidate_static(candidate)

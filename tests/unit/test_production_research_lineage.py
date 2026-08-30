@@ -66,8 +66,8 @@ class _LiveFixtureModel:
             mechanism="Add one reachable Python function without changing the command contract.",
             expected_metric_effects=("GAUC", "nDCG@5"),
             parent_candidate_id=request.parent_candidate_id,
-            principal_change="Add a reachable executable function to candidate.py.",
-            files_expected=("candidate.py",),
+            principal_change="Add a reachable executable function to model_impl.py.",
+            files_expected=("candidate.py", "config.json", "model_impl.py"),
             required_fields=(
                 RequiredField("trusted/features", "inference_input", "Use approved features."),
             ),
@@ -90,14 +90,14 @@ class _LiveFixtureModel:
     def implement(self, request: ImplementationRequest) -> GeneratedPackage:
         self.calls.append("implement")
         parent_source = next(
-            item.content for item in request.parent.files if item.path == "candidate.py"
+            item.content for item in request.parent.files if item.path == "model_impl.py"
         )
         return GeneratedPackage(
             request_id=request.request_id,
             response_id="live-fixture-source-v1",
             files=(
                 GeneratedFile(
-                    "candidate.py",
+                    "model_impl.py",
                     parent_source
                     + "\n\ndef live_variant_marker():\n"
                     + "    return 'live-provider-generated'\n",
@@ -118,14 +118,14 @@ class _InvalidLiveFixtureModel(_LiveFixtureModel):
     def implement(self, request: ImplementationRequest) -> GeneratedPackage:
         self.calls.append("implement")
         parent_source = next(
-            item.content for item in request.parent.files if item.path == "candidate.py"
+            item.content for item in request.parent.files if item.path == "model_impl.py"
         )
         return GeneratedPackage(
             request_id=request.request_id,
             response_id="live-fixture-forbidden-import-v1",
             files=(
                 GeneratedFile(
-                    "candidate.py",
+                    "model_impl.py",
                     parent_source
                     + "\n\nimport os\n\ndef invalid_live_variant_marker():\n"
                     + "    return os.getcwd()\n",
@@ -161,7 +161,7 @@ def pairwise_rank_score(positive_score, negative_score):
     def implement(self, request: ImplementationRequest) -> GeneratedPackage:
         self.calls.append("implement")
         parent_source = next(
-            item.content for item in request.parent.files if item.path == "candidate.py"
+            item.content for item in request.parent.files if item.path == "model_impl.py"
         )
         package = GeneratedPackage(
             request_id=request.request_id,
@@ -174,7 +174,7 @@ def pairwise_rank_score(positive_score, negative_score):
                 ),
                 GeneratedFile("pairwise_helper.py", self.HELPER_SOURCE),
                 GeneratedFile(
-                    "candidate.py",
+                    "model_impl.py",
                     parent_source
                     + "\n\nfrom pairwise_helper import pairwise_rank_score\n\n"
                     + "def repaired_live_variant_marker():\n"
@@ -202,7 +202,7 @@ def pairwise_rank_score(positive_score, negative_score):
             request_id=request.request_id,
             response_id="live-fixture-reserved-filename-repaired-v1",
             files=(
-                GeneratedFile("candidate.py", rejected_files["candidate.py"]),
+                GeneratedFile("model_impl.py", rejected_files["model_impl.py"]),
                 GeneratedFile("pairwise_helper.py", rejected_files["pairwise_helper.py"]),
             ),
             material_change_summary="Preserve the rejected scientific change in legal files.",
@@ -218,8 +218,8 @@ class _ExhaustingRepairModel(_RepairingReservedFilenameModel):
             response_id="live-fixture-exhausted-repair-v1",
             files=(
                 GeneratedFile(
-                    "candidate.py",
-                    request.failed_child.file("candidate.py").content,
+                    "model_impl.py",
+                    request.failed_child.file("model_impl.py").content,
                 ),
             ),
             material_change_summary="Return no executable change.",
@@ -248,7 +248,7 @@ class _TwiceRepairingReservedFilenameModel(_RepairingReservedFilenameModel):
                 response_id="live-fixture-still-reserved-v1",
                 files=(
                     GeneratedFile("baseline.py", rejected_files["baseline.py"]),
-                    GeneratedFile("candidate.py", rejected_files["candidate.py"]),
+                    GeneratedFile("model_impl.py", rejected_files["model_impl.py"]),
                     GeneratedFile("pairwise_helper.py", rejected_files["pairwise_helper.py"]),
                 ),
                 material_change_summary="First repair retained the forbidden launcher.",
@@ -262,7 +262,7 @@ class _TwiceRepairingReservedFilenameModel(_RepairingReservedFilenameModel):
             request_id=request.request_id,
             response_id="live-fixture-second-repair-legal-v1",
             files=(
-                GeneratedFile("candidate.py", rejected_files["candidate.py"]),
+                GeneratedFile("model_impl.py", rejected_files["model_impl.py"]),
                 GeneratedFile("pairwise_helper.py", rejected_files["pairwise_helper.py"]),
             ),
             material_change_summary="Second repair removes the forbidden launcher.",
@@ -281,14 +281,14 @@ class _RepairingMaterializedPoisonModel(_LiveFixtureModel):
     def implement(self, request: ImplementationRequest) -> GeneratedPackage:
         self.calls.append("implement")
         self.parent_source = next(
-            item.content for item in request.parent.files if item.path == "candidate.py"
+            item.content for item in request.parent.files if item.path == "model_impl.py"
         )
         return GeneratedPackage(
             request_id=request.request_id,
             response_id="live-fixture-materialized-poison-v1",
             files=(
                 GeneratedFile(
-                    "candidate.py",
+                    "model_impl.py",
                     self.parent_source + "\n\nimport poison_helper\n",
                 ),
                 GeneratedFile(
@@ -309,7 +309,7 @@ class _RepairingMaterializedPoisonModel(_LiveFixtureModel):
             response_id="live-fixture-materialized-poison-repaired-v1",
             files=(
                 GeneratedFile(
-                    "candidate.py",
+                    "model_impl.py",
                     self.parent_source
                     + "\n\ndef clean_repair_marker():\n    return 'clean-parent-overlay'\n",
                 ),
@@ -348,14 +348,14 @@ def test_rejected_live_package_does_not_persist_immutable_lineage_record(
     assert rejection.root_failure.category == "static_policy"
     assert rejection.root_failure.code == "forbidden_import"
     assert rejection.root_failure.subject == "os"
-    assert rejection.root_failure.diagnostic == "forbidden import 'os' in 'candidate.py'"
+    assert rejection.root_failure.diagnostic == "forbidden import 'os' in 'model_impl.py'"
     assert rejection.root_failure.to_wire() == {
         "stage": "static_validation",
         "category": "static_policy",
         "code": "forbidden_import",
         "subject": "os",
         "fingerprint": rejection.root_failure.fingerprint,
-        "diagnostic": "forbidden import 'os' in 'candidate.py'",
+        "diagnostic": "forbidden import 'os' in 'model_impl.py'",
     }
     assert len(rejection.root_failure.fingerprint) == 64
     assert rejection.proposal_family == "binary-long-view-ranking"
@@ -480,6 +480,7 @@ def test_live_lineage_routes_reserved_filename_through_agent_repair_and_rehydrat
         "README.md",
         "candidate.py",
         "config.json",
+        "model_impl.py",
         "pairwise_helper.py",
     }
     assert len(model.repair_requests) == 1
@@ -599,7 +600,7 @@ def test_repair_package_is_freshly_applied_over_trusted_parent(tmp_path: Path) -
     assert model.calls == ["propose", "implement", "repair"]
     assert lineage.materialized.parent_digest == parent.digest
     assert "poison_helper.py" not in {entry.path for entry in lineage.source_snapshot.entries}
-    assert lineage.material_change.changed_symbols == ("candidate.py:clean_repair_marker",)
+    assert lineage.material_change.changed_symbols == ("model_impl.py:clean_repair_marker",)
 
 
 def test_live_lineage_exposes_exhausted_repairs_as_one_rejected_research_branch(
@@ -652,7 +653,7 @@ def test_live_lineage_materializes_and_rehydrates_without_recalling_model(
     assert first.provider == "openai"
     assert first.candidate_id.startswith("candidate-01-")
     assert first.materialized.source_digest != parent.digest
-    assert first.material_change.changed_symbols == ("candidate.py:live_variant_marker",)
+    assert first.material_change.changed_symbols == ("model_impl.py:live_variant_marker",)
     assert artifacts.verify_directory(first.source_snapshot) == first.source_snapshot
 
     resumed = prepare_or_rehydrate_live_lineage(

@@ -110,7 +110,7 @@ def test_normalization_and_digest_are_deterministic() -> None:
             "finalization reserve",
         ),
         (
-            lambda raw: raw["runner"].update({"finalization_reserve_seconds": 3_599}),
+            lambda raw: raw["runner"].update({"finalization_reserve_seconds": 599}),
             "finalization_reserve_seconds",
         ),
     ],
@@ -120,6 +120,17 @@ def test_hard_caps_types_and_unknown_fields_fail(mutator: Any, message: str) -> 
     mutator(raw)
     with pytest.raises(ConfigError, match=message):
         parse_config(raw)
+
+
+def test_one_hour_sprint_with_ten_minute_finalization_reserve_is_valid() -> None:
+    raw = decoded_default()
+    raw["benchmark"]["wall_clock_seconds"] = 3_600
+    raw["runner"]["finalization_reserve_seconds"] = 600
+
+    config = parse_config(raw)
+
+    assert config.benchmark.wall_clock_seconds == 3_600
+    assert config.runner.finalization_reserve_seconds == 600
 
 
 def test_temporal_folds_must_be_train_derived_and_ordered() -> None:

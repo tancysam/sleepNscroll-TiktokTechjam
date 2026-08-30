@@ -23,7 +23,7 @@ from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Final, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from kuairand_agent.research.interface import ResearchModelError
 from kuairand_agent.research.prompts import PROMPT_VERSION, instructions_for
@@ -52,6 +52,7 @@ _MODEL_RE: Final = re.compile(
 _ENV_RE: Final = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
 _PRICE_RE: Final = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?\Z")
 _REASONING_EFFORTS: Final = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+_GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai", "api.tokenrouter.com"})
 _SECRET_PATTERN: Final = re.compile(r"(?i)(?:bearer\s+|sk-(?:proj-)?)[A-Za-z0-9_.-]{8,}")
 
 
@@ -64,6 +65,7 @@ class ProviderErrorCode(StrEnum):
     INCOMPLETE = "incomplete"
     REFUSAL = "refusal"
     MALFORMED_RESPONSE = "malformed_response"
+    CONTEXT_LIMIT = "context_limit"
 
 
 class OpenAIProviderError(ResearchModelError):
@@ -275,6 +277,29 @@ class OpenAIChatCompletionsConfig:
 OpenAIResponsesConfig = OpenAIChatCompletionsConfig
 
 
+@dataclass(frozen=True, slots=True)
+class ModelContextLimits:
+    """Provider-advertised model limits used to size requests without model-name tables."""
+
+    context_length: int
+    max_completion_tokens: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if type(self.context_length) is not int or not 1 <= self.context_length <= 10_000_000:
+            raise ValueError("context_length must be a positive bounded integer")
+        if (
+            type(self.max_completion_tokens) is not int
+            or not 1 <= self.max_completion_tokens <= self.context_length
+        ):
+            raise ValueError("max_completion_tokens must fit within context_length")
+        if type(self.source) is not str or not self.source or len(self.source) > 128:
+            raise ValueError("model-limit source must be bounded non-empty text")
+
+
+ModelLimitResolver = Callable[[OpenAIChatCompletionsConfig, str], ModelContextLimits | None]
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -427,6 +452,106 @@ class UrllibResponsesTransport:
             socket.setdefaulttimeout(previous_timeout)
 
 
+class ProviderModelLimitResolver:
+    """Discover limits from OpenRouter or an informative OpenAI-compatible models endpoint.
+
+    OpenRouter has an authoritative per-model contract. Other gateways are queried through
+    ``/models`` and used only when the selected record exposes exact positive ``context_length``
+    and ``max_completion_tokens`` fields. Otherwise the configured conservative ceiling remains.
+    """
+
+    def __call__(
+        self, config: OpenAIChatCompletionsConfig, secret: str
+    ) -> ModelContextLimits | None:
+        hostname = (urlsplit(config.base_url).hostname or "").lower()
+        if hostname == "openrouter.ai":
+            author, separator, slug = config.model.partition("/")
+            if not separator or not author or not slug:
+                return None
+            safe_author = quote(author, safe="._-")
+            safe_slug = quote(slug, safe="._-:")
+            metadata_url = f"{config.base_url}/model/{safe_author}/{safe_slug}"
+            maximum_bytes = 256 * 1024
+        else:
+            metadata_url = f"{config.base_url}/models"
+            maximum_bytes = 2 * 1024 * 1024
+        request = urllib.request.Request(
+            metadata_url,
+            headers={
+                "Authorization": f"Bearer {secret}",
+                "Accept": "application/json",
+                "User-Agent": "kuairand-agent/0.1.0",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=min(config.timeout_seconds, 10.0)
+            ) as response:
+                if int(response.status) != 200:
+                    return None
+                body = _bounded_read(response, maximum_bytes)
+            envelope = parse_json_object(body.decode("utf-8", errors="strict"))
+        except (
+            OSError,
+            TimeoutError,
+            UnicodeError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            SchemaValidationError,
+            ResponseTooLargeError,
+        ):
+            return None
+        raw_data = envelope.get("data")
+        data: Mapping[str, object] | None = None
+        if isinstance(raw_data, Mapping):
+            data = cast(Mapping[str, object], raw_data)
+        elif isinstance(raw_data, list):
+            data = next(
+                (
+                    cast(Mapping[str, object], item)
+                    for item in raw_data
+                    if isinstance(item, Mapping) and item.get("id") == config.model
+                ),
+                None,
+            )
+        if data is None:
+            return None
+        top_provider = data.get("top_provider")
+        provider_data = top_provider if isinstance(top_provider, Mapping) else {}
+        context_values = tuple(
+            value
+            for value in (data.get("context_length"), provider_data.get("context_length"))
+            if type(value) is int and value > 0
+        )
+        completion_values = tuple(
+            value
+            for value in (
+                data.get("max_completion_tokens"),
+                provider_data.get("max_completion_tokens"),
+            )
+            if type(value) is int and value > 0
+        )
+        if not context_values or not completion_values:
+            return None
+        context_length = min(context_values)
+        maximum = min(completion_values)
+        if maximum > context_length:
+            return None
+        return ModelContextLimits(
+            context_length=context_length,
+            max_completion_tokens=maximum,
+            source=(
+                "openrouter-model-metadata"
+                if hostname == "openrouter.ai"
+                else "openai-compatible-model-metadata"
+            ),
+        )
+
+
+OpenRouterModelLimitResolver = ProviderModelLimitResolver
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderUsage:
     input_tokens: int = 0
@@ -450,6 +575,9 @@ class ProviderTranscript:
     retry_wait_seconds: float
     json_bytes: bytes = field(repr=False)
     digest: str
+
+
+TranscriptSink = Callable[[ProviderTranscript], None]
 
 
 def _redact(value: object, secret: str) -> object:
@@ -538,6 +666,8 @@ class OpenAIChatCompletionsModel:
         transport: ResponsesTransport | None = None,
         retry_policy: RetryPolicy | None = None,
         retry_runtime: RetryRuntime | None = None,
+        model_limit_resolver: ModelLimitResolver | None = None,
+        transcript_sink: TranscriptSink | None = None,
     ) -> None:
         if not isinstance(config, OpenAIChatCompletionsConfig):
             raise ValueError("config must be OpenAIChatCompletionsConfig")
@@ -545,12 +675,20 @@ class OpenAIChatCompletionsModel:
         self._transport = UrllibResponsesTransport() if transport is None else transport
         self._retry_policy = RetryPolicy() if retry_policy is None else retry_policy
         self._retry_runtime = RetryRuntime() if retry_runtime is None else retry_runtime
+        self._model_limit_resolver = model_limit_resolver
+        self._transcript_sink = transcript_sink
         if not isinstance(self._retry_policy, RetryPolicy):
             raise ValueError("retry_policy must be RetryPolicy")
         if not isinstance(self._retry_runtime, RetryRuntime):
             raise ValueError("retry_runtime must be RetryRuntime")
+        if self._model_limit_resolver is not None and not callable(self._model_limit_resolver):
+            raise ValueError("model_limit_resolver must be callable or None")
+        if self._transcript_sink is not None and not callable(self._transcript_sink):
+            raise ValueError("transcript_sink must be callable or None")
         self._transcripts: list[ProviderTranscript] = []
         self._total_usage = ProviderUsage()
+        self._context_limits: ModelContextLimits | None = None
+        self._context_limits_resolved = False
 
     @property
     def transcripts(self) -> tuple[ProviderTranscript, ...]:
@@ -559,6 +697,25 @@ class OpenAIChatCompletionsModel:
     @property
     def total_usage(self) -> ProviderUsage:
         return self._total_usage
+
+    @property
+    def context_limits(self) -> ModelContextLimits | None:
+        return self._context_limits
+
+    def _resolve_context_limits(self, secret: str) -> ModelContextLimits | None:
+        if self._context_limits_resolved:
+            return self._context_limits
+        self._context_limits_resolved = True
+        if self._model_limit_resolver is None:
+            return None
+        try:
+            limits = self._model_limit_resolver(self.config, secret)
+        except Exception:
+            return None
+        if limits is not None and not isinstance(limits, ModelContextLimits):
+            raise ValueError("model_limit_resolver returned invalid limits")
+        self._context_limits = limits
+        return limits
 
     def _credential(self, operation: ResearchOperation) -> str:
         key = os.environ.get(self.config.api_key_env)
@@ -572,7 +729,11 @@ class OpenAIChatCompletionsModel:
         return key
 
     def _payload(
-        self, operation: ResearchOperation, request: Request, retry: bool
+        self,
+        operation: ResearchOperation,
+        request: Request,
+        retry: bool,
+        context_limits: ModelContextLimits | None = None,
     ) -> dict[str, object]:
         request_text = canonical_json_bytes(
             {"operation": operation.value, "request": request.to_wire()}
@@ -623,9 +784,48 @@ class OpenAIChatCompletionsModel:
             "tool_choice": "none",
             "parallel_tool_calls": False,
         }
-        payload[self.config.max_tokens_parameter] = self.config.max_output_tokens
-        if self.config.send_reasoning_effort and self.config.reasoning_effort != "none":
-            payload["reasoning_effort"] = self.config.reasoning_effort
+        output_limit = self.config.max_output_tokens
+        if context_limits is not None:
+            prompt_bytes = len(canonical_json_bytes(payload))
+            # A tokenizer-independent upper bound: a text token cannot encode less than one input
+            # byte. The fixed allowance covers chat framing that is absent from the JSON body.
+            estimated_prompt_tokens = prompt_bytes + 512
+            available_context = context_limits.context_length - estimated_prompt_tokens
+            output_limit = min(
+                output_limit,
+                context_limits.max_completion_tokens,
+                available_context,
+            )
+            if output_limit < 1:
+                raise OpenAIProviderError(
+                    ProviderErrorCode.CONTEXT_LIMIT,
+                    "provider-advertised context cannot fit the bounded research request",
+                    operation=operation,
+                )
+        payload[self.config.max_tokens_parameter] = output_limit
+        hostname = (urlsplit(self.config.base_url).hostname or "").lower()
+        if self.config.send_reasoning_effort:
+            if hostname in _GATEWAY_REASONING_HOSTS:
+                payload["reasoning"] = {
+                    "effort": self.config.reasoning_effort,
+                    "exclude": True,
+                }
+            else:
+                payload["reasoning_effort"] = self.config.reasoning_effort
+        if hostname == "openrouter.ai":
+            if "max_completion_tokens" in payload:
+                payload["max_tokens"] = payload.pop("max_completion_tokens")
+            # OpenRouter's ``require_parameters`` filter compares every supplied optional
+            # parameter with endpoint capability metadata.  These four fields are merely their
+            # Chat Completions defaults and are not advertised by otherwise compatible strict-
+            # schema endpoints, so sending them can incorrectly eliminate every route.
+            for defaulted_parameter in ("n", "store", "stream", "parallel_tool_calls"):
+                payload.pop(defaulted_parameter, None)
+            payload["provider"] = {
+                "allow_fallbacks": True,
+                "require_parameters": True,
+            }
+>>>>>>> origin/codex/candidate-stable
         return payload
 
     def _record(
@@ -657,19 +857,20 @@ class OpenAIChatCompletionsModel:
             "response": _redact(response, secret),
         }
         content = canonical_json_bytes(wire)
-        self._transcripts.append(
-            ProviderTranscript(
-                operation=operation,
-                attempt=attempt,
-                request_digest=request_digest,
-                response_sha256=response_sha256,
-                outcome=outcome,
-                latency_seconds=latency_seconds,
-                retry_wait_seconds=retry_wait_seconds,
-                json_bytes=content,
-                digest=hashlib.sha256(content).hexdigest(),
-            )
+        transcript = ProviderTranscript(
+            operation=operation,
+            attempt=attempt,
+            request_digest=request_digest,
+            response_sha256=response_sha256,
+            outcome=outcome,
+            latency_seconds=latency_seconds,
+            retry_wait_seconds=retry_wait_seconds,
+            json_bytes=content,
+            digest=hashlib.sha256(content).hexdigest(),
         )
+        self._transcripts.append(transcript)
+        if self._transcript_sink is not None:
+            self._transcript_sink(transcript)
 
     def _output_text(self, envelope: Mapping[str, object]) -> tuple[str, str]:
         if envelope.get("error") is not None:
@@ -793,6 +994,7 @@ class OpenAIChatCompletionsModel:
 
     def _call(self, operation: ResearchOperation, request: Request) -> Response:
         secret = self._credential(operation)
+        context_limits = self._resolve_context_limits(secret)
         malformed_retries = 0
         transport_retries = 0
         consecutive_rate_limits = 0
@@ -807,7 +1009,12 @@ class OpenAIChatCompletionsModel:
                     attempts=attempt,
                 )
             attempt += 1
-            payload = self._payload(operation, request, malformed_retries > 0)
+            payload = self._payload(
+                operation,
+                request,
+                malformed_retries > 0,
+                context_limits,
+            )
             body = canonical_json_bytes(payload)
             transport_request = TransportRequest(
                 url=self.config.chat_completions_url,
@@ -1150,6 +1357,8 @@ class OpenAIFailoverModel:
 
 
 __all__ = [
+    "ModelContextLimits",
+    "ModelLimitResolver",
     "OpenAIChatCompletionsConfig",
     "OpenAIChatCompletionsModel",
     "OpenAIFailoverModel",
@@ -1157,9 +1366,11 @@ __all__ = [
     "OpenAIProviderError",
     "OpenAIResponsesConfig",
     "OpenAIResponsesModel",
+    "OpenRouterModelLimitResolver",
     "ProviderErrorCode",
     "ProviderFailoverEvent",
     "ProviderFailure",
+    "ProviderModelLimitResolver",
     "ProviderTranscript",
     "ProviderUsage",
     "ResponseTooLargeError",
@@ -1168,6 +1379,7 @@ __all__ = [
     "RetryPolicy",
     "RetryRuntime",
     "TokenPricing",
+    "TranscriptSink",
     "TransportRequest",
     "TransportResponse",
     "UrllibResponsesTransport",

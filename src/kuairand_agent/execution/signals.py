@@ -1,8 +1,9 @@
 """Main-thread signal bridge for cooperative, evidence-preserving cancellation.
 
-The installed POSIX handlers deliberately do one thing only: set a caller-owned
-``threading.Event``.  Process supervision, journal writes, cleanup, and state transitions remain
-in ordinary Python control flow after the handler returns.
+The first handled signal sets a caller-owned ``threading.Event``. A repeated signal escalates to
+``KeyboardInterrupt`` so an operator can interrupt a blocking provider call instead of waiting for
+its full socket timeout. Process supervision, journal writes, cleanup, and state transitions remain
+in ordinary Python control flow after the first handler returns.
 """
 
 from __future__ import annotations
@@ -61,8 +62,13 @@ def cancellation_on_signals(
         raise SignalCancellationError("signal cancellation must be installed on the main thread")
     selected = _signals(handled_signals)
     prior: list[tuple[signal.Signals, _SignalHandler]] = []
+    signal_received = False
 
     def request_cancellation(_signum: int, _frame: FrameType | None) -> None:
+        nonlocal signal_received
+        if signal_received:
+            raise KeyboardInterrupt("second cancellation signal interrupted blocked work")
+        signal_received = True
         cancellation.set()
 
     try:
