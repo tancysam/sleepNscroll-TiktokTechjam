@@ -28,6 +28,12 @@ from kuairand_agent.data.acquire import (
 from kuairand_agent.data.audit import DataAuditError, audit_dataset, write_audit_report
 from kuairand_agent.data.canonical import CanonicalDataError, load_canonical_dataset
 from kuairand_agent.execution.signals import cancellation_on_signals
+from kuairand_agent.finalization.iteration_log import (
+    IterationLogError,
+    build_iteration_log,
+    render_jsonl,
+    render_markdown,
+)
 from kuairand_agent.scoring.submission import AlignmentRow, SubmissionError, read_submission
 
 EXIT_INVALID: Final = 2
@@ -399,6 +405,32 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _iteration_log(args: argparse.Namespace) -> int:
+    """Emit the required per-iteration run log from a campaign's own durable records."""
+
+    try:
+        entries = build_iteration_log(
+            _absolute_cli_path(args.run_dir),
+            project_root=Path.cwd().resolve(strict=True),
+        )
+    except (IterationLogError, OSError) as exc:
+        print(f"ITERATION_LOG_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    rendered = render_jsonl(entries) if args.format == "jsonl" else render_markdown(entries)
+    if args.output is None:
+        print(rendered, end="" if args.format == "jsonl" else "\n")
+        return 0
+    destination = _absolute_cli_path(args.output)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(rendered, encoding="utf-8")
+    except OSError as exc:
+        print(f"ITERATION_LOG_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    print(f"{destination}: {len(entries)} iteration(s)")
+    return 0
+
+
 def _resume(args: argparse.Namespace) -> int:
     """Reconcile abandoned executions and continue the original durable campaign."""
 
@@ -590,6 +622,14 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--run-dir", required=True, type=Path)
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=_status, command_path=("status",))
+
+    iteration_log = commands.add_parser(
+        "iteration-log", help="emit the per-iteration run log required by the starter kit"
+    )
+    iteration_log.add_argument("--run-dir", required=True, type=Path)
+    iteration_log.add_argument("--format", choices=("md", "jsonl"), default="md")
+    iteration_log.add_argument("--output", type=Path)
+    iteration_log.set_defaults(handler=_iteration_log, command_path=("iteration-log",))
 
     finalize = commands.add_parser("finalize", help="stop research and finalize deterministically")
     finalize.add_argument("--run-dir", required=True, type=Path)
