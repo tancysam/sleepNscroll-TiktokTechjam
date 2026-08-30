@@ -36,11 +36,23 @@ def _digest(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-def _proposal(iteration: int, *, parent: str = "official-fm-fallback-seed-4") -> Proposal:
+def _proposal(
+    iteration: int,
+    *,
+    parent: str = "official-fm-fallback-seed-4",
+    hypothesis: str | None = None,
+    mechanism: str | None = None,
+) -> Proposal:
     return Proposal(
         proposal_id=f"proposal-{iteration:02d}",
-        hypothesis=f"Iteration {iteration} replaces the pointwise objective with a pairwise one.",
-        mechanism=f"Sample same-user pairs and optimise softplus over the margin, run {iteration}.",
+        hypothesis=(
+            hypothesis
+            or f"Iteration {iteration} replaces the pointwise objective with a pairwise one."
+        ),
+        mechanism=(
+            mechanism
+            or f"Sample same-user pairs and optimise softplus over the margin, run {iteration}."
+        ),
         expected_metric_effects=("GAUC",),
         parent_candidate_id=parent,
         principal_change="Replace the training objective.",
@@ -86,9 +98,11 @@ def _write_lineage(
     candidate_id: str | None = None,
     repair_calls: tuple[object, ...] = (),
     symbols: tuple[str, ...] = ("fit_scores",),
+    hypothesis: str | None = None,
+    mechanism: str | None = None,
 ) -> Path:
     generated_root.mkdir(parents=True, exist_ok=True)
-    proposal = _proposal(iteration)
+    proposal = _proposal(iteration, hypothesis=hypothesis, mechanism=mechanism)
     package = _package(iteration, symbols=symbols)
     payload = {
         "schema_version": 1,
@@ -152,6 +166,34 @@ def test_every_admitted_iteration_becomes_a_narrative_in_order(tmp_path: Path) -
     assert first.parent_id == "official-fm-fallback-seed-4"
     assert "Changed top-level symbol: fit_scores" in first.material_changes
     assert any("Organizer briefing" in item for item in first.attributions)
+
+
+def test_model_authored_text_is_collapsed_to_one_line(tmp_path: Path) -> None:
+    """A multi-line hypothesis must not make a finished campaign unfinalizable.
+
+    ``schemas._text`` accepts newlines up to 16,384 characters and ``report._text`` rejects any
+    string containing one, so four provider-authored fields cross a boundary that would raise
+    during report construction.  Lineage records are written read-only, so the only recovery from
+    one bad hypothesis would be editing files by hand after the run.
+    """
+
+    _write_lineage(
+        _generated_root(tmp_path),
+        1,
+        hypothesis="Replace the pointwise objective.\n\n  Step 1: sample pairs.\tStep 2: fit.",
+        mechanism="Optimise softplus\nover the margin.",
+    )
+
+    evidence = collect_iteration_narratives(
+        tmp_path, campaign_id=CAMPAIGN, fallback_parent_id="parent"
+    )
+    narrative = evidence.narratives[0]
+
+    assert narrative.hypothesis == (
+        "Replace the pointwise objective. Step 1: sample pairs. Step 2: fit."
+    )
+    assert "\n" not in narrative.mechanism
+    assert "Optimise softplus over the margin." in narrative.mechanism
 
 
 def test_expected_metric_effects_reach_the_mechanism_text(tmp_path: Path) -> None:

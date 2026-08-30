@@ -33,7 +33,7 @@ from kuairand_agent.finalization.production import (
     ProductionFinalizationOutcome,
 )
 from kuairand_agent.finalization.recipe import GeneratedLambdaRankReplayRecipe
-from kuairand_agent.finalization.report import MetricEvidence
+from kuairand_agent.finalization.report import ExperimentNarrative, MetricEvidence
 from kuairand_agent.finalization.submission_bundle import (
     FINAL_BUNDLE_SCHEMA_VERSION,
     REQUIRED_DIRECTORY_PATHS,
@@ -2106,6 +2106,139 @@ def test_fallback_report_includes_research_admission_and_rejection_evidence(
         *facts.research_rejections,
     )
     assert "not agent-generated" in context.selection_rationale
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("durable per-iteration research evidence is unreadable"),
+        ValueError("experiment hypothesis must not contain a newline"),
+        OSError("lineage directory disappeared under the reader"),
+    ],
+)
+def test_report_context_degrades_when_the_trajectory_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    """Recovering the trajectory is presentation; failing to recover it must not abort finalization.
+
+    ``collect_iteration_narratives`` can raise three unrelated exception types -- the evidence
+    error, a ``RuntimeError`` from the journal reader, and a ``ValueError`` from the report text
+    validator.  Only the first was caught, and it was re-raised rather than degraded, so a
+    campaign holding a valid bundle could still finish with nothing published.  The campaign store
+    and the immutable lineage files remain the evidence of record either way.
+    """
+
+    def explode(*_args: object, **_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(production, "collect_iteration_narratives", explode)
+    monkeypatch.setattr(production, "_report_peak_rss_bytes", lambda *_args: 1024)
+    monkeypatch.setattr(
+        production,
+        "_judge_progress_facts",
+        lambda _outcome: production._JudgeProgressFacts(
+            provider_usage="Research-model attempts=1; replay provider calls=0.",
+            portfolio_count=0,
+            portfolio_cap=50,
+            portfolio_cap_reason="repeated_pre_admission_failure",
+            advanced_branch_disposition="Advanced branches were not entered.",
+            research_progress="Research admission: branches attempted=1.",
+            research_outcome="Research admission closed before a candidate was admitted.",
+            research_rejections=(),
+        ),
+    )
+    monkeypatch.setattr(
+        production,
+        "_baseline_mean",
+        lambda _qualification: MetricEvidence(
+            label="official-fm",
+            tier="qualified baseline",
+            gauc=0.6,
+            ndcg_at_5=0.4,
+            primary=0.5,
+            seeds=(0, 1, 2, 3, 4),
+            note="Official fallback.",
+        ),
+    )
+
+    context = production._report_context(
+        candidate_id="official-fm-fallback-seed-4",
+        parent_id="official-fm-fallback-seed-4",
+        run_dir=tmp_path,
+        campaign_id="campaign-degraded-trajectory",
+        metrics=_metrics(0.6, 0.4),
+        qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
+        outcome=cast(
+            Any,
+            SimpleNamespace(
+                selection=None,
+                manual_interventions=0,
+                fallback_receipt_digest=_digest("b"),
+            ),
+        ),
+        generated=False,
+        failures=(),
+        confirmation=None,
+        campaign_wall_seconds=10.0,
+        launch_count=0,
+    )
+
+    assert context.experiments
+
+
+def test_selected_candidate_keeps_its_measured_primary_in_the_trajectory() -> None:
+    """Recovered narratives carry no score, so the promoted row rendered a dash.
+
+    Lineage records hold a proposal and a package but no metric, so replacing the literal
+    narrative with the recovered ones dropped the one number in the table that is actually known.
+    """
+
+    def narrative(iteration: int, experiment_id: str) -> ExperimentNarrative:
+        return ExperimentNarrative(
+            iteration=iteration,
+            experiment_id=experiment_id,
+            parent_id="official-fm-fallback-seed-4",
+            hypothesis="Replace the pointwise objective with a pairwise one.",
+            mechanism="Sample same-user pairs and optimise softplus over the margin.",
+            material_changes=("Changed top-level symbol: fit_scores",),
+            attributions=("Organizer briefing.",),
+            status="promoted",
+        )
+
+    carried = production._with_selected_metric(
+        (narrative(1, "candidate-01"), narrative(2, "candidate-02")),
+        candidate_id="candidate-02",
+        outer_primary=0.6042,
+    )
+
+    assert carried[0].outer_primary is None
+    assert carried[1].outer_primary == 0.6042
+
+
+def test_with_selected_metric_never_overwrites_a_measured_score() -> None:
+    """A score already on the narrative is the measured one and must win."""
+
+    measured = ExperimentNarrative(
+        iteration=1,
+        experiment_id="candidate-01",
+        parent_id="official-fm-fallback-seed-4",
+        hypothesis="Replace the pointwise objective with a pairwise one.",
+        mechanism="Sample same-user pairs and optimise softplus over the margin.",
+        material_changes=("Changed top-level symbol: fit_scores",),
+        attributions=("Organizer briefing.",),
+        status="promoted",
+        outer_primary=0.6001,
+    )
+
+    carried = production._with_selected_metric(
+        (measured,),
+        candidate_id="candidate-01",
+        outer_primary=0.9999,
+    )
+
+    assert carried[0].outer_primary == 0.6001
 
 
 def test_current_runtime_reproof_rejects_source_or_lock_drift_and_is_path_independent(

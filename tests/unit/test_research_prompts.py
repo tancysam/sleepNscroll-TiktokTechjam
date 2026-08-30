@@ -38,10 +38,13 @@ def test_source_generation_prompts_define_overlay_and_material_symbol_semantics(
     instructions = instructions_for(operation)
 
     assert "Unmentioned trusted-parent files remain in the final tree" in instructions
-    assert (
-        "may omit candidate.py only when the supplied trusted parent already contains it"
-        in instructions
+    # The parent always contains candidate.py, so the old conditional wording ("may omit it only
+    # when the parent already contains it") was vacuous and reintroduced the doubt that cost a
+    # live campaign its first branch. The overlay is unconditionally legal without it.
+    assert "a helper-only overlay such as pairwise_fm.py is legal and complete on its own" in (
+        instructions
     )
+    assert "only when the supplied trusted parent already contains it" not in instructions
     assert "reachable top-level Python identifiers actually changed" in instructions
     assert (
         "Documentation, docstrings, filenames, whitespace, and unchanged symbols do not count"

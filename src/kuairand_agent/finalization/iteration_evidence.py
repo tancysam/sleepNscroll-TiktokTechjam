@@ -63,6 +63,20 @@ class IterationEvidence:
         return len(self.narratives)
 
 
+def _one_line(value: object, *, limit: int = 2048) -> str:
+    """Collapse model-authored text to the single line the report validator requires.
+
+    ``schemas._text`` permits newlines up to 16,384 characters; ``report._text`` rejects any
+    string containing one.  Four provider-authored fields cross that boundary, and a lineage
+    record is written read-only, so one multi-line hypothesis would otherwise leave the
+    campaign unfinalizable without editing files by hand.
+    """
+
+    if type(value) is not str:
+        return ""
+    return " ".join(value.split())[:limit]
+
+
 def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
     """Preserve order while dropping blanks and repeats.
 
@@ -73,7 +87,7 @@ def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
     seen: set[str] = set()
     result: list[str] = []
     for value in values:
-        text = value.strip() if type(value) is str else ""
+        text = _one_line(value)
         if text and text not in seen:
             seen.add(text)
             result.append(text)
@@ -156,8 +170,8 @@ def _lineage_narrative(
         iteration=iteration,
         experiment_id=candidate_id,
         parent_id=proposal.parent_candidate_id or fallback_parent_id,
-        hypothesis=proposal.hypothesis,
-        mechanism=f"{proposal.mechanism} Expected to move: {expected}.",
+        hypothesis=_one_line(proposal.hypothesis),
+        mechanism=_one_line(f"{proposal.mechanism} Expected to move: {expected}."),
         material_changes=material_changes,
         attributions=attributions,
         status=candidate_outcomes.get(candidate_id, "evaluated"),

@@ -79,8 +79,11 @@ roots supplied in the request. You have `math`, `json`, `dataclasses`, `typing`,
 `itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.
 You do NOT have `os`, `sys`, `pickle`, `shutil`, `glob`, `tempfile`, `importlib`,
 `multiprocessing`, or any network library. The forbidden check is on the FIRST dotted component,
-so `import os.path` is rejected for the same reason as `import os`. Relative imports between your
-own files (`from . import helper`) are permitted.
+so `import os.path` is rejected for the same reason as `import os`.
+
+Import your own helper modules by plain name (`import pairwise_sampler`), never relatively:
+a relative import is invisible to the walk that decides whether your change is material, and
+the candidate runs as a script, so `from . import helper` fails at execution too.
 
 Serialize checkpoints with `numpy` (`np.savez`), never with `pickle`. Take every path from the
 parsed request object; never construct one with `os.path`.
@@ -93,14 +96,10 @@ of them are reserved basenames and returning one is rejected outright before you
 run. Name a helper module after the mechanism it implements -- `pairwise_sampler.py`,
 `user_grouping.py` -- never after a starter-kit file.
 
-Fixed output paths, pinned by the trusted protocol and verified after your process exits:
-- Training writes its checkpoint to `checkpoint/model.txt`. The extension does not constrain the
-  bytes; a NumPy archive at that path is correct. Any other path fails validation.
-- Prediction writes `scores.npy` as little-endian float64.
-
-The training request supplies `seed` and `user_groups_handle` alongside `features_handle` and
-`targets_handle`. The request key set is checked exactly, so a parser that omits either key fails
-before your model runs."""
+You write no files and parse no requests. The protected wrapper owns protocol parsing,
+capability loading, checkpoint and prediction file I/O, and the command line. `train_model`
+returns a dict of named finite NumPy arrays and `predict_scores` returns one finite array;
+the wrapper serializes both."""
 
 _WORKED_EXAMPLE: Final = """Worked example
 
@@ -171,6 +170,9 @@ _OPERATION: Final = {
         "files the implementation will return. It is validated and must include "
         "candidate.py, which the final tree inherits unchanged from the trusted "
         "parent. A typical manifest is [candidate.py, model_impl.py, config.json]. "
+        "Set maximum_repairs to 2 unless you have a specific reason not to: it is your own "
+        "budget for correcting a rejected implementation, and 0 means the first static-gate "
+        "failure ends the experiment outright. "
         "The implementation step then returns only the subset it actually changes, "
         "and never returns candidate.py itself."
     ),
@@ -227,10 +229,10 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
         (
             "- A response uses complete-file overlay semantics: every returned file is its full "
             "replacement content, never a patch. Unmentioned trusted-parent files remain in the "
-            "final tree. Therefore a legal helper-only overlay such as pairwise_fm.py may omit "
-            "candidate.py only when the supplied trusted parent already contains it. New or "
-            "changed helper modules must be transitively imported from candidate.py to be "
-            "executable and material."
+            "final tree. The trusted parent always contains candidate.py, so a helper-only "
+            "overlay such as pairwise_fm.py is legal and complete on its own. New or changed "
+            "helper modules must be transitively imported from model_impl.py to be executable "
+            "and material."
         ),
         (
             "- Documentation, docstrings, filenames, whitespace, and unchanged symbols do not "

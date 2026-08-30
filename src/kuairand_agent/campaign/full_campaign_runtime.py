@@ -156,7 +156,7 @@ from kuairand_agent.research.factory import (
     ProviderUnavailableDiagnostic,
     select_research_provider,
 )
-from kuairand_agent.research.interface import ResearchModel
+from kuairand_agent.research.interface import ResearchModel, ResearchModelError
 from kuairand_agent.research.loop import CampaignStoreResearchLedger
 from kuairand_agent.research.materialize import snapshot_materialized_candidate
 from kuairand_agent.research.production import (
@@ -164,6 +164,7 @@ from kuairand_agent.research.production import (
     SCRIPTED_PARENT_ID,
     LiveResearchBranchRejected,
     LiveResearchLineage,
+    ProductionResearchError,
     ScriptedLambdaRankLineage,
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
@@ -1352,7 +1353,10 @@ def _reflect(
         reflection_model = research_model
         reflection_provider = lineage.provider
         reflection_live = lineage.live_provider_used
-    reflection = reflection_model.reflect(request)
+    try:
+        reflection = reflection_model.reflect(request)
+    except ResearchModelError as exc:
+        reflection = _unavailable_reflection(exc, scientific_iteration=scientific_iteration)
     transcript = artifacts.put_bytes(
         canonical_json_bytes(
             {
@@ -2081,6 +2085,64 @@ def _provider_credential_envs(
     return tuple(endpoint.config.api_key_env for _, endpoint in model.provider_models)
 
 
+def _unavailable_reflection(
+    exc: BaseException,
+    *,
+    scientific_iteration: int,
+) -> Reflection:
+    """Stand in for a reflection the provider did not return.
+
+    Reflection is commentary on a result the controller already owns, so a provider failure here
+    must degrade rather than propagate out of the research loop.  The diagnostic is collapsed to
+    one line because ``report._text`` rejects newlines that ``schemas._text`` permits, and this
+    text is model- and transport-authored.
+    """
+
+    detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+    return Reflection(
+        response_id=f"reflection-unavailable-{scientific_iteration:02d}",
+        summary=("The research provider did not return a reflection for this iteration: " + detail),
+        recommendation="close_branch",
+        lessons=("Provider reflection was unavailable; the measured result stands.",),
+    )
+
+
+def _research_closure_record(
+    exc: BaseException,
+    *,
+    scientific_iteration: int,
+    operation: str,
+) -> AggregateRecord:
+    """Record a research-plane failure that closes research without ending the campaign."""
+
+    detail = " ".join(str(exc).split())[:2048] or exc.__class__.__name__
+    code = getattr(exc, "code", None)
+    return AggregateRecord(
+        name=f"research_closure_{scientific_iteration:02d}",
+        values={
+            "scientific_iteration": scientific_iteration,
+            "branch_outcome": "research_closed_by_provider_failure",
+            "operation": operation,
+            "failure_type": type(exc).__name__,
+            "failure_code": str(getattr(code, "value", code)) if code is not None else "",
+            "diagnostic": detail,
+        },
+    )
+
+
+def _research_closure_reason(exc: BaseException) -> CampaignStopReason:
+    """Map a research-plane failure onto the terminal condition it actually represents.
+
+    The provider raises a DEADLINE error by design once the finalization reserve opens; that is a
+    scheduled stop, not a fault.
+    """
+
+    code = getattr(exc, "code", None)
+    if getattr(code, "value", None) == "deadline":
+        return CampaignStopReason.FINALIZATION_RESERVE
+    return CampaignStopReason.CANDIDATES_EXHAUSTED
+
+
 def _run_autonomous_followups(
     *,
     request: CampaignCreateRequest,
@@ -2155,6 +2217,18 @@ def _run_autonomous_followups(
         if status.outer_queries_remaining <= 0:
             terminal = CampaignStopReason.OUTER_PROMOTION_LIMIT
             break
+        # ``result.elapsed_seconds`` accumulates only candidate subprocess wall time, so
+        # provider latency, materialization and reflection are invisible to it.  Measured on
+        # this project's own runs the unaccounted provider time reached 4011s in a single
+        # partial campaign, larger than the whole finalization reserve.  Phase 1 consults the
+        # real clock; this loop must too, or research runs straight through the reserve.
+        observed_deadline = runtime_template.engine.inspect_deadline(runtime_template.run_dir)
+        if observed_deadline.hard_expired:
+            terminal = CampaignStopReason.HARD_DEADLINE
+            break
+        if observed_deadline.finalization_reserve_active:
+            terminal = CampaignStopReason.FINALIZATION_RESERVE
+            break
 
         iteration += 1
         safe_context = _safe_context(
@@ -2186,6 +2260,24 @@ def _run_autonomous_followups(
             rejected_records.append(rejected_record)
             terminal = CampaignStopReason.CANDIDATES_EXHAUSTED
             continue
+        except (ResearchModelError, ProductionResearchError) as exc:
+            # A provider or lineage failure closes research; it must never end the campaign
+            # before finalization.  Breaking here returns normally, so the caller finalizes
+            # the retained incumbent exactly as it would on any other terminal condition.
+            #
+            # ``records`` is local and dies with this frame, so the closure also goes into
+            # ``rejected_records``, which is what reaches the durable rejection ledger.  Without
+            # that the report would show research simply stopping with no stated cause.  The
+            # branch genuinely was rejected before execution, so the count stays honest.
+            closure_record = _research_closure_record(
+                exc,
+                scientific_iteration=iteration,
+                operation="lineage",
+            )
+            records.append(closure_record)
+            rejected_records.append(closure_record)
+            terminal = _research_closure_reason(exc)
+            break
         candidate_id = lineage.candidate_id
         research_ledger, experiment_id = _ensure_lineage_ledger(
             campaign_store=runtime_template.campaign_store,

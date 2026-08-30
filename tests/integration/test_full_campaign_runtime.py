@@ -36,6 +36,7 @@ from kuairand_agent.campaign.store import CampaignStore
 from kuairand_agent.contract import STARTER_FILE_SHA256
 from kuairand_agent.execution.artifacts import ArtifactKind, ArtifactRef, ArtifactStore
 from kuairand_agent.research.context import AggregateRecord
+from kuairand_agent.research.interface import ResearchModelError
 from kuairand_agent.research.production import (
     LiveResearchBranchRejected,
     ResearchFailureObservation,
@@ -392,11 +393,20 @@ def test_initial_live_lineage_portfolio_rejects_tampered_rejection_journal(
         )
 
 
-def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
+def _drive_autonomous_followups(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exercise the live outer loop with provider/model seams replaced by typed fakes."""
+    *,
+    prepare_lineage_hook: Any = None,
+    reflect_hook: Any = None,
+    deadline: Any = None,
+) -> SimpleNamespace:
+    """Exercise the live outer loop with provider/model seams replaced by typed fakes.
+
+    ``prepare_lineage_hook`` and ``reflect_hook`` are called with the scientific iteration
+    before the corresponding fake returns, so a test can make either seam raise.
+    ``deadline`` replaces what the engine reports for the real clock.
+    """
 
     config = _config()
     fallback = _fallback()
@@ -443,10 +453,23 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     class FakeEngine:
         def __init__(self) -> None:
             self.status_calls = 0
+            self.deadline_calls = 0
 
         def status(self, _run_dir: Path) -> SimpleNamespace:
             self.status_calls += 1
             return SimpleNamespace(outer_queries_remaining=6)
+
+        def inspect_deadline(self, _run_dir: Path) -> SimpleNamespace:
+            # The loop now stops on the real clock rather than a counter that cannot see
+            # provider latency, so the fake must answer that question too.
+            self.deadline_calls += 1
+            if deadline is not None:
+                observed: SimpleNamespace = deadline(self.deadline_calls)
+                return observed
+            return SimpleNamespace(
+                finalization_reserve_active=False,
+                hard_expired=False,
+            )
 
     store = FakeStore()
     engine = FakeEngine()
@@ -502,12 +525,8 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     def prepare_lineage(**kwargs: object) -> SimpleNamespace:
         iteration = cast(int, kwargs["scientific_iteration"])
         prepared_iterations.append(iteration)
-        if iteration == 2:
-            raise LiveResearchBranchRejected(
-                failed_candidate_id="live-candidate-2-repair-1",
-                repairs_attempted=1,
-                diagnostic="declared material symbols did not change executable source",
-            )
+        if prepare_lineage_hook is not None:
+            prepare_lineage_hook(iteration)
         return SimpleNamespace(
             candidate_id=f"live-candidate-{iteration}",
             parent=kwargs["parent"],
@@ -533,6 +552,8 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
 
     def reflect(**kwargs: object) -> tuple[str, str, ArtifactRef, Reflection]:
         iteration = cast(int, kwargs["scientific_iteration"])
+        if reflect_hook is not None:
+            reflect_hook(iteration)
         return (
             f"reflection-request-{iteration}",
             f"reflection-response-{iteration}",
@@ -588,9 +609,40 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
         prior_records=(),
     )
 
-    assert prepared_iterations == [2, 3, 4]
-    assert cursor_history == [(1, 7), (2, 8)]
-    assert context_record_counts == [1, 2, 3]
+    return SimpleNamespace(
+        result=result,
+        prepared_iterations=prepared_iterations,
+        cursor_history=cursor_history,
+        context_record_counts=context_record_counts,
+        store=store,
+        engine=engine,
+    )
+
+
+def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected branch costs one iteration; the loop continues to exact convergence."""
+
+    def reject_the_second_branch(iteration: int) -> None:
+        if iteration == 2:
+            raise LiveResearchBranchRejected(
+                failed_candidate_id="live-candidate-2-repair-1",
+                repairs_attempted=1,
+                diagnostic="declared material symbols did not change executable source",
+            )
+
+    driven = _drive_autonomous_followups(
+        tmp_path,
+        monkeypatch,
+        prepare_lineage_hook=reject_the_second_branch,
+    )
+    result = driven.result
+
+    assert driven.prepared_iterations == [2, 3, 4]
+    assert driven.cursor_history == [(1, 7), (2, 8)]
+    assert driven.context_record_counts == [1, 2, 3]
     assert result.iterations_completed == 4
     assert result.result.convergence.completed_iterations == 3
     assert result.result.convergence.should_stop is True
@@ -598,8 +650,128 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     assert result.result.stop_reason is CampaignStopReason.CONVERGED
     assert len(result.rejected_records) == 1
     assert result.rejected_records[0].values["root_failure_code"] == "branch_rejected"
-    assert len(store.convergence_manifests) == 2
-    assert engine.status_calls == 3
+    assert len(driven.store.convergence_manifests) == 2
+    assert driven.engine.status_calls == 3
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_reason"),
+    [
+        ("deadline", CampaignStopReason.FINALIZATION_RESERVE),
+        ("http", CampaignStopReason.CANDIDATES_EXHAUSTED),
+        (None, CampaignStopReason.CANDIDATES_EXHAUSTED),
+    ],
+)
+def test_autonomous_followup_driver_closes_research_when_the_provider_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str | None,
+    expected_reason: CampaignStopReason,
+) -> None:
+    """A provider failure must cost the branch, not the campaign.
+
+    Only ``LiveResearchBranchRejected`` used to be caught here, so the deadline error the provider
+    raises by design once the finalization reserve opens escaped this loop, escaped the single try
+    block in the CLI, and left five hours of research with no bundle written.  The loop must now
+    return normally with a terminal reason, and a scheduled deadline must be reported as the
+    reserve rather than as candidate exhaustion.
+    """
+
+    failure = ResearchModelError("provider refused the implementation request")
+    if code is not None:
+        failure.code = SimpleNamespace(value=code)  # type: ignore[attr-defined]
+
+    def fail_the_second_branch(iteration: int) -> None:
+        if iteration == 2:
+            raise failure
+
+    driven = _drive_autonomous_followups(
+        tmp_path,
+        monkeypatch,
+        prepare_lineage_hook=fail_the_second_branch,
+    )
+    result = driven.result
+
+    assert driven.prepared_iterations == [2]
+    assert result.result.stop_reason is expected_reason
+    closures = [
+        record
+        for record in result.rejected_records
+        if record.values["branch_outcome"] == "research_closed_by_provider_failure"
+    ]
+    assert len(closures) == 1
+    assert closures[0].values["operation"] == "lineage"
+    assert closures[0].values["failure_type"] == "ResearchModelError"
+    assert closures[0].values["failure_code"] == (code or "")
+
+
+def test_reflection_degrades_to_a_single_line_when_the_provider_fails() -> None:
+    """Reflection is commentary, so losing it must not lose the campaign.
+
+    The call into ``reflection_model.reflect`` was the one provider seam in the research loop with
+    no guard at all.  The substitute must also survive the report writer: ``schemas._text`` permits
+    newlines that ``report._text`` rejects, and a transport error message is a plausible source of
+    one, so the diagnostic is collapsed here rather than at the point of rendering.
+    """
+
+    failure = ResearchModelError("provider returned\n  a multi-line\ttransport diagnostic")
+    reflection = runtime._unavailable_reflection(failure, scientific_iteration=3)
+
+    assert reflection.response_id == "reflection-unavailable-03"
+    assert reflection.recommendation == "close_branch"
+    assert "\n" not in reflection.summary
+    assert "provider returned a multi-line transport diagnostic" in reflection.summary
+    assert reflection.lessons
+
+
+def test_reflection_degradation_never_produces_an_empty_summary() -> None:
+    """An exception can stringify to nothing, which would render as an unexplained blank."""
+
+    reflection = runtime._unavailable_reflection(ResearchModelError(), scientific_iteration=1)
+
+    assert reflection.summary.endswith("ResearchModelError")
+
+
+def test_reflection_seam_uses_the_degrading_helper() -> None:
+    """Guard the wiring, since the helper above is only useful if the seam actually calls it."""
+
+    source = inspect.getsource(runtime._reflect)
+
+    assert "except ResearchModelError as exc:" in source
+    assert "_unavailable_reflection(exc, scientific_iteration=scientific_iteration)" in source
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_reason"),
+    [
+        ("finalization_reserve_active", CampaignStopReason.FINALIZATION_RESERVE),
+        ("hard_expired", CampaignStopReason.HARD_DEADLINE),
+    ],
+)
+def test_autonomous_followup_driver_stops_on_the_real_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    expected_reason: CampaignStopReason,
+) -> None:
+    """The scientific counter cannot see provider time, so the engine clock must be consulted.
+
+    ``scientific.py`` advances ``elapsed_seconds`` only by candidate subprocess wall time.  Summing
+    the provider journals of one real overnight run gives 4011 s of latency the counter never saw,
+    which is more than the entire finalization reserve.
+    """
+
+    def clock(call: int) -> SimpleNamespace:
+        expired = call >= 2
+        return SimpleNamespace(
+            finalization_reserve_active=expired and field == "finalization_reserve_active",
+            hard_expired=expired and field == "hard_expired",
+        )
+
+    driven = _drive_autonomous_followups(tmp_path, monkeypatch, deadline=clock)
+
+    assert driven.result.result.stop_reason is expected_reason
+    assert driven.prepared_iterations == [2]
 
 
 def test_production_runtime_preserves_active_interpreter_at_both_child_seams() -> None:

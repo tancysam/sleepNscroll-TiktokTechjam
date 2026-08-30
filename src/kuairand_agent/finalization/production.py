@@ -34,7 +34,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -114,7 +114,7 @@ from kuairand_agent.finalization.finalize import (
     run_finalization,
 )
 from kuairand_agent.finalization.iteration_evidence import (
-    IterationEvidenceError,
+    IterationEvidence,
     collect_iteration_narratives,
     count_recorded_iterations,
 )
@@ -3375,6 +3375,27 @@ def _candidate_outcome_status(outcome: FullCampaignOutcome) -> dict[str, str]:
     return {selection.candidate_id: "promoted"}
 
 
+def _with_selected_metric(
+    narratives: tuple[ExperimentNarrative, ...],
+    *,
+    candidate_id: str,
+    outer_primary: float,
+) -> tuple[ExperimentNarrative, ...]:
+    """Attach the measured outer primary to the narrative for the selected candidate.
+
+    Recovered narratives are built from lineage records, which carry a proposal and a package
+    but no score.  Without this the trajectory table renders a dash for the one iteration
+    whose score is actually known.
+    """
+
+    return tuple(
+        replace(item, outer_primary=outer_primary)
+        if item.experiment_id == candidate_id and item.outer_primary is None
+        else item
+        for item in narratives
+    )
+
+
 def _report_context(
     *,
     candidate_id: str,
@@ -3427,10 +3448,11 @@ def _report_context(
             fallback_parent_id=parent_id,
             candidate_outcomes=_candidate_outcome_status(outcome),
         )
-    except IterationEvidenceError as exc:
-        raise ProductionFinalizationError(
-            "durable per-iteration research evidence is unreadable"
-        ) from exc
+    except Exception:
+        # The recovered trajectory is presentation; the campaign store and the immutable
+        # lineage files remain the evidence of record.  Degrade to the single narrative
+        # below rather than aborting a finalization that has a valid bundle to publish.
+        recovered = IterationEvidence((), ())
     experiment = ExperimentNarrative(
         iteration=1,
         experiment_id=candidate_id,
@@ -3525,7 +3547,14 @@ def _report_context(
         },
         baselines=(_baseline_mean(qualification),),
         selected=selected,
-        experiments=(recovered.narratives or (experiment,)),
+        experiments=(
+            _with_selected_metric(
+                recovered.narratives,
+                candidate_id=candidate_id,
+                outer_primary=selected.primary,
+            )
+            or (experiment,)
+        ),
         inner_fold_evidence=inner_evidence,
         seed_confirmation=seed_confirmation,
         failures_and_recoveries=failure_lines,
@@ -4963,19 +4992,29 @@ def _finalize_provider_free_campaign_impl(
                 )
         observation = selected_engine.observe_deadline(run)
         launches = store.snapshot().launches_used
-        fallback = _fallback_replay_candidate(
-            qualification=qualification,
-            context=context,
-            request=request,
-            environment=environment,
-            artifact_store=artifact_store,
-            outcome=research,
-            starter_dir=starter_dir,
-            report_failures=failures,
-            campaign_wall_seconds=observation.elapsed_seconds,
-            launch_count=launches,
-            cancel_event=cancellation,
-        )
+        # The guarantee-of-last-resort path.  The generated builder above is wrapped; this
+        # one must be too, or a defect shared by both takes down the fallback itself.
+        try:
+            fallback = _fallback_replay_candidate(
+                qualification=qualification,
+                context=context,
+                request=request,
+                environment=environment,
+                artifact_store=artifact_store,
+                outcome=research,
+                starter_dir=starter_dir,
+                report_failures=failures,
+                campaign_wall_seconds=observation.elapsed_seconds,
+                launch_count=launches,
+                cancel_event=cancellation,
+            )
+        except ProductionFinalizationError:
+            # Already the right type, and cancellation is signalled this way too.
+            raise
+        except Exception as exc:
+            raise ProductionFinalizationError(
+                "official FM fallback candidate could not be prepared"
+            ) from exc
         candidates.append(fallback)
         experiments_jsonl, experiments_csv = _write_experiment_ledgers(
             run_dir=run,

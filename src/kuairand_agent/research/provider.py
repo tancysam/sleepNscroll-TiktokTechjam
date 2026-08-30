@@ -61,8 +61,9 @@ _GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai"})
 # config.json, and one response that repeated the same path twelve times.  Disabling it
 # returned the same request in 12s instead of 334s with the full output budget intact.
 #
-# The switch is therefore treated as binary here.  Efforts at or below ``low`` disable
-# thinking outright; higher efforts enable it and accept that the budget is not enforced.
+# The switch is therefore treated as binary here, and it is left ON for every effort this
+# campaign configures.  Only an explicit request for no reasoning turns it off, because the
+# alternative is worse: see ``_THINKING_DISABLED_EFFORTS`` below.
 _THINKING_SWITCH_HOSTS: Final = frozenset({"api.tokenrouter.com"})
 # Measured: with thinking disabled this model stops writing code and returns 18-character
 # stubs -- every file identical, and "import numpy as np" written into config.json.  Only an
@@ -836,6 +837,12 @@ class OpenAIChatCompletionsModel:
             # parameter with endpoint capability metadata.  These four fields are merely their
             # Chat Completions defaults and are not advertised by otherwise compatible strict-
             # schema endpoints, so sending them can incorrectly eliminate every route.
+            #
+            # ``tools`` and ``tool_choice`` deliberately survive the scrub.  They were the obvious
+            # next suspects for the 404 that eliminated every route, so they were measured against
+            # the live endpoint: a strict ``json_schema`` request returns 200 with them, without
+            # them, with either one alone, and with ``require_parameters`` off.  The 404 was an
+            # account-level data policy, not this payload.  Do not remove them on suspicion.
             for defaulted_parameter in ("n", "store", "stream", "parallel_tool_calls"):
                 payload.pop(defaulted_parameter, None)
             payload["provider"] = {

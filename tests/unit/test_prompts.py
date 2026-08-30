@@ -62,25 +62,40 @@ def test_briefing_carries_the_organizers_measured_dead_ends(
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
-def test_source_operations_state_the_pinned_output_paths(
+def test_source_operations_disclaim_the_work_the_wrapper_owns(
     operation: ResearchOperation,
 ) -> None:
-    """A candidate that writes the wrong checkpoint path fails after training completes."""
+    """The model must not be told to do the protected wrapper's job.
 
-    rendered = instructions_for(operation)
-    assert "checkpoint/model.txt" in rendered
-    assert "scores.npy" in rendered
+    This previously asserted the opposite: that the prompt names ``checkpoint/model.txt``,
+    ``scores.npy`` and the training request keys. Those instructions predate the split of
+    ``candidate.py`` into a protected wrapper plus a mutable ``model_impl.py``, and they
+    contradicted the runtime-contract section of the same message, which forbids implementing
+    protocol parsing, capability loading or checkpoint I/O. Every token spent teaching the model
+    to duplicate the wrapper also comes out of the output budget the generated code needs.
+    """
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "You write no files and parse no requests" in rendered
+    assert "the wrapper serializes both" in rendered
+    assert "checkpoint/model.txt" not in rendered
+    assert "scores.npy" not in rendered
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
-def test_source_operations_state_the_full_training_request_keys(
+def test_source_operations_teach_an_import_form_that_survives_the_gates(
     operation: ResearchOperation,
 ) -> None:
-    """The executor always sends these; a parser that omits either one fails closed."""
+    """Relative imports fail twice over, so the prompt must not offer them.
 
-    rendered = instructions_for(operation)
-    assert "user_groups_handle" in rendered
-    assert "seed" in rendered
+    ``materialize._reachable_python_files`` skips ``ImportFrom`` nodes with ``level > 0``, so a
+    relatively imported helper is invisible to the material-change gate; and the candidate is
+    launched as a script, so the import raises at execution as well.
+    """
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "never relatively" in rendered
+    assert "from . import helper` are permitted" not in rendered
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
