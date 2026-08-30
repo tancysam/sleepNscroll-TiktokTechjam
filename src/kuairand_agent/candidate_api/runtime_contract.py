@@ -30,7 +30,15 @@ class CandidateRuntimeContract:
     train_result_path: str = "candidate_result.json"
     prediction_result_path: str = "prediction_result.json"
     scores_path: str = "scores.npy"
-    protected_paths: tuple[str, ...] = ("candidate.py",)
+    protected_paths: tuple[str, ...] = (
+        "candidate.py",
+        "reference_categorical_ranker.py",
+        "reference_listnet_ranker.py",
+        "reference_observed_pair_fm.py",
+        "reference_observed_pair_objectives.py",
+        "reference_pairwise_fm.py",
+        "reference_pointwise_ranker.py",
+    )
     train_request_fields: tuple[str, ...] = (
         "config_digest",
         "data_digest",

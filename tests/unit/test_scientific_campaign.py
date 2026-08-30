@@ -288,7 +288,7 @@ def test_fold_a_b_confirmation_then_matched_seeds_materially_promotes() -> None:
     assert not any("epoch" in request.manifest() for request in outer_requests)
 
 
-def test_callback_failure_is_charged_but_cannot_displace_replayable_fallback() -> None:
+def test_callback_failure_is_launch_charged_but_does_not_count_as_science() -> None:
     def runner(_: ScientificRunRequest) -> ScientificRunEvidence:
         raise RuntimeError("ordinary isolated candidate failure")
 
@@ -304,8 +304,28 @@ def test_callback_failure_is_charged_but_cannot_displace_replayable_fallback() -
     assert result.candidates[0].runs == ()
     assert result.incumbent == result.fallback == _fallback()
     assert result.launches_used == 7
-    assert result.convergence.completed_iterations == 1
-    assert result.convergence.non_material_streak == 1
+    assert result.convergence.completed_iterations == 0
+    assert result.convergence.non_material_streak == 0
+
+
+def test_repeated_callback_failures_cannot_satisfy_convergence_patience() -> None:
+    def runner(_: ScientificRunRequest) -> ScientificRunEvidence:
+        raise RuntimeError("ordinary isolated candidate failure")
+
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=tuple(_candidate(f"broken-{index}") for index in range(4)),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert len(result.candidates) == 4
+    assert all(item.outcome is CandidateOutcome.CALLBACK_FAILED for item in result.candidates)
+    assert result.launches_used == 10
+    assert result.convergence.completed_iterations == 0
+    assert result.convergence.non_material_streak == 0
+    assert not result.convergence.should_stop
 
 
 def test_three_nonmaterial_screens_converge_before_fourth_candidate() -> None:
@@ -548,6 +568,77 @@ def test_outer_reservation_preserves_finalization_time_for_full_seed_bundle() ->
     assert result.stop_reason is CampaignStopReason.FINALIZATION_RESERVE
     assert result.launches_used == 8
     assert not ledger.reservations
+
+
+def test_outer_candidate_limit_is_budget_blocked_without_advancing_convergence() -> None:
+    class FullLedger(_Ledger):
+        def snapshot(self) -> OuterPromotionLedgerSnapshot:
+            return OuterPromotionLedgerSnapshot(
+                revision=12,
+                campaign_digest=_DIGESTS[7],
+                benchmark_digest=_DIGESTS[0],
+                dataset_digest=_DIGESTS[1],
+                scorer_digest=_DIGESTS[2],
+                max_distinct_candidates=6,
+                candidate_fingerprints=tuple(f"{index:x}" * 64 for index in range(1, 7)),
+            )
+
+    ledger = FullLedger()
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=lambda request: _evidence(request, 0.604),
+        outer_ledger=ledger,
+    )
+
+    assert result.candidates[0].outcome is CandidateOutcome.BUDGET_REJECTED
+    assert result.candidates[0].reason == "outer_candidate_limit"
+    assert result.stop_reason is CampaignStopReason.OUTER_PROMOTION_LIMIT
+    assert result.convergence.completed_iterations == 0
+    assert result.convergence.non_material_streak == 0
+    assert not ledger.reservations
+
+
+def test_fold_a_structural_failure_is_not_a_scientific_observation() -> None:
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        gates = (
+            GateEvidence(imports=False)
+            if request.tier is ScientificTier.FOLD_A_CONFIRMATION
+            else None
+        )
+        return _evidence(request, 0.604, gates=gates)
+
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert result.candidates[0].outcome is CandidateOutcome.CALLBACK_FAILED
+    assert result.candidates[0].reason == "structural_gate_failed"
+    assert result.convergence.completed_iterations == 0
+    assert result.convergence.non_material_streak == 0
+
+
+def test_valid_inner_rejection_advances_nonmaterial_convergence_once() -> None:
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        primary = 0.596 if request.tier is ScientificTier.FOLD_A_CONFIRMATION else 0.604
+        return _evidence(request, primary)
+
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert result.candidates[0].outcome is CandidateOutcome.INNER_REJECTED
+    assert result.convergence.completed_iterations == 1
+    assert result.convergence.non_material_streak == 1
 
 
 def test_public_feedback_precision_is_locked_to_safe_context_four_decimals() -> None:

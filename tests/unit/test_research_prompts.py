@@ -16,7 +16,7 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
 ) -> None:
     instructions = instructions_for(operation)
 
-    assert PROMPT_VERSION == 6
+    assert PROMPT_VERSION == 20
     assert DEFAULT_CANDIDATE_SOURCE_POLICY.digest in instructions
     assert "candidate.py" in instructions
     assert "baseline.py" in instructions
@@ -28,6 +28,11 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
     assert "Candidate runtime contract digest" in instructions
     assert "finite float64 (N,D)" in instructions
     assert "feature_names_csv" in instructions
+    assert "prefix-fitted video_type_code" in instructions
+    assert "contains 95 columns" in instructions
+    assert "positions 83 through 94" in instructions
+    assert "every subsequent index is local to that projection" in instructions
+    assert "reserved unknown slot" in instructions
     assert "never assume features[:,0:5]" in instructions
 
 
@@ -58,6 +63,18 @@ def test_source_generation_prompts_define_overlay_and_material_symbol_semantics(
         assert "unmentioned rejected-overlay files are not implicitly retained" in instructions
     assert "Never return or replace" in instructions
     assert "protected_paths" in instructions
+    assert "train_reference_pairwise_fm" in instructions
+    assert "sample_reference_logged_pairs" in instructions
+    assert "never regenerate same-user grouping" in instructions
+    assert "train_reference_categorical_ranker" in instructions
+    assert "categorical_rank_*" in instructions
+    assert "train_reference_listnet_ranker" in instructions
+    assert "train_reference_pointwise_ranker" in instructions
+    assert "train_reference_duration_pairwise_fm" in instructions
+    assert "train_reference_uniform_pairwise_fm" in instructions
+    assert "do not select it as the default backbone" in instructions
+    assert "listwise_*" in instructions
+    assert "do not regenerate" in instructions
     assert "model_impl.py" in instructions
 
 
@@ -68,6 +85,8 @@ def test_model_generation_prompt_defines_one_general_model_interface() -> None:
     assert "predict_scores(features, checkpoint)" in instructions
     assert "1..64 named finite numeric NumPy arrays" in instructions
     assert "checkpoint keys may be model-specific" in instructions
+    assert "read it with .item()" in instructions
+    assert "training_diagnostics against the returned checkpoint" in instructions
     assert "The protected wrapper owns them" in instructions
 
 
@@ -76,6 +95,15 @@ def test_proposal_prompt_requires_a_legal_final_manifest() -> None:
 
     assert "files_expected describes the final candidate manifest" in instructions
     assert "must include candidate.py" in instructions
+    assert "proposal_family_blocked" in instructions
+    assert "generated-only Fold-B metrics" in instructions
+    assert "selected generated weight of zero" in instructions
+    assert "trials remaining under the frozen convergence" in instructions
+    assert "distinct source of ranking signal" in instructions
+    assert "Renaming an MLP" in instructions
+    assert "standalone independently trained ranking mechanism" in instructions
+    assert "candidate-local execution failure" in instructions
+    assert "preserve its principal claim" in instructions
 
 
 def test_delivered_prompt_uses_the_exact_request_policy_digest() -> None:

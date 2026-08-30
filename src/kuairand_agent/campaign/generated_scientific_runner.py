@@ -37,6 +37,7 @@ from kuairand_agent.campaign.scientific import (
 from kuairand_agent.campaign.selector import GateEvidence, OrganizerMetrics
 from kuairand_agent.candidates.fusion import (
     FUSION_WEIGHT_GRID,
+    LEGACY_FUSION_WEIGHT_GRID,
     FusionResult,
     fuse_ranked_predictions,
     normalize_within_user_percentiles,
@@ -593,9 +594,11 @@ class FoldBFusionSelectionEvidence:
 
     def __post_init__(self) -> None:
         _digest(self.selector_digest, "fusion selector_digest")
-        if tuple(point.weights for point in self.points) != FUSION_WEIGHT_GRID:
+        recorded_grid = tuple(point.weights for point in self.points)
+        if recorded_grid not in {FUSION_WEIGHT_GRID, LEGACY_FUSION_WEIGHT_GRID}:
             raise GeneratedScientificRunnerError(
-                "fusion selection must contain every fixed grid point in canonical order"
+                "fusion selection must contain every point from a supported fixed grid in "
+                "canonical order"
             )
         _fusion_weight(self.selected_weights, "selected fusion weights")
         selected = next(point for point in self.points if point.weights == self.selected_weights)

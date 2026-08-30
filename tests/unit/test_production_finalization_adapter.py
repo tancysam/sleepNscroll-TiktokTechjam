@@ -1669,6 +1669,15 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
                         "fingerprint": _digest("2"),
                         "diagnostic": "declared material symbol did not change: main",
                     },
+                    {
+                        "scientific_iteration": 3,
+                        "candidate_id": "candidate-03",
+                        "proposal_family": "pairwise:bpr",
+                        "proposal_signature": _digest("f"),
+                        "role": "root",
+                        "fingerprint": (_digest("1")),
+                        "diagnostic": ("reserved candidate filename is forbidden: baseline.py"),
+                    },
                 ],
                 "counts_truncated": False,
                 "examples_truncated": False,
@@ -1725,11 +1734,17 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
         f"forbidden_basename/baseline.py [{_digest('1')}] x2.",
         "Research rejection terminals: repair/materiality/declared_symbol_unchanged/"
         f"main [{_digest('2')}] x2.",
-        f"Research rejection example (root): {_digest('1')}; "
+        f"Research rejection example (root, iteration 2, candidate candidate-02, "
+        f"family pairwise:bpr): {_digest('1')}; "
         "reserved candidate filename is forbidden: baseline.py",
-        f"Research rejection example (terminal): {_digest('2')}; "
+        f"Research rejection example (terminal, iteration 2, candidate candidate-02, "
+        f"family pairwise:bpr): {_digest('2')}; "
         "declared material symbol did not change: main",
+        f"Research rejection example (root, iteration 3, candidate candidate-03, "
+        f"family pairwise:bpr): {_digest('1')}; "
+        "reserved candidate filename is forbidden: baseline.py",
     )
+    assert len(facts.research_rejections) == len(set(facts.research_rejections))
     limitations = production._bundle_known_limitations(
         generated=True,
         status=FinalStatus.VALIDATION_IMPROVED,

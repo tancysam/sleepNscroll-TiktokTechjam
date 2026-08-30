@@ -22,6 +22,7 @@ from kuairand_agent.candidates.fusion import FUSION_WEIGHT_GRID
 
 REPLAY_RECIPE_SCHEMA_VERSION: Final = 1
 MAX_REPLAY_RECIPE_BYTES: Final = 256 * 1024
+MAX_ENSEMBLE_REPLAY_MEMBERS: Final = 16
 _DIGEST_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -33,6 +34,7 @@ class ReplayBackendKind(StrEnum):
     """The complete executable backend allowlist."""
 
     GENERATED_LAMBDARANK = "generated_lambdarank_v1"
+    GENERATED_LAMBDARANK_ENSEMBLE = "generated_lambdarank_ensemble_v2"
     OFFICIAL_FM = "official_fm_v1"
 
 
@@ -193,6 +195,115 @@ class GeneratedLambdaRankReplayRecipe:
 
 
 @dataclass(frozen=True, slots=True)
+class GeneratedLambdaRankEnsembleReplayRecipe:
+    """Ordered, all-or-nothing rank fusion of complete generated LambdaRank v1 recipes.
+
+    ``members`` is intentionally an ordered tuple rather than a mapping: position is the frozen
+    seed/member identity and must stay paired with the corresponding digest, validation output,
+    and fusion weight.  A member remains a complete v1 recipe so its source, input, checkpoint,
+    and bounded subprocess policy are replayed unchanged.  This supports a uniform seed ensemble
+    today without encoding a seed-specific protocol, and can later carry distinct direct-portfolio
+    members through the same immutable tuple.
+    """
+
+    members: tuple[GeneratedLambdaRankReplayRecipe, ...]
+    member_recipe_digests: tuple[str, ...]
+    validation_member_prediction_digests: tuple[str, ...]
+    fusion_weights: tuple[float, ...]
+    validation_fusion_digest: str
+    schema_version: int = field(init=False, default=REPLAY_RECIPE_SCHEMA_VERSION)
+    backend: ReplayBackendKind = field(
+        init=False, default=ReplayBackendKind.GENERATED_LAMBDARANK_ENSEMBLE
+    )
+
+    def __post_init__(self) -> None:
+        members = self.members
+        if type(members) is not tuple or not 2 <= len(members) <= MAX_ENSEMBLE_REPLAY_MEMBERS:
+            raise ReplayRecipeError(
+                "ensemble members must be an ordered tuple containing between 2 and "
+                f"{MAX_ENSEMBLE_REPLAY_MEMBERS} generated LambdaRank recipes"
+            )
+        if any(not isinstance(member, GeneratedLambdaRankReplayRecipe) for member in members):
+            raise ReplayRecipeError("ensemble members must all be GeneratedLambdaRankReplayRecipe")
+        if len({member.digest for member in members}) != len(members):
+            raise ReplayRecipeError("ensemble members must not repeat one member recipe")
+        for name in (
+            "member_recipe_digests",
+            "validation_member_prediction_digests",
+        ):
+            values = getattr(self, name)
+            if type(values) is not tuple or len(values) != len(members):
+                raise ReplayRecipeError(f"{name} must be an ordered digest tuple matching members")
+            for index, value in enumerate(values):
+                _digest(value, f"{name}[{index}]")
+        if self.member_recipe_digests != tuple(member.digest for member in members):
+            raise ReplayRecipeError("member_recipe_digests must exactly bind ordered members")
+        weights = self.fusion_weights
+        if (
+            type(weights) is not tuple
+            or len(weights) != len(members)
+            or any(
+                type(weight) is not float
+                or not math.isfinite(weight)
+                or weight < 0.0
+                or (weight == 0.0 and math.copysign(1.0, weight) < 0.0)
+                for weight in weights
+            )
+            or math.fsum(weights) != 1.0
+        ):
+            raise ReplayRecipeError(
+                "fusion_weights must be a finite non-negative float tuple matching members and "
+                "summing to one"
+            )
+        _digest(self.validation_fusion_digest, "validation_fusion_digest")
+        first = members[0]
+        for member in members[1:]:
+            if member.data_sha256 != first.data_sha256:
+                raise ReplayRecipeError("ensemble members must bind one shared data_sha256")
+            if member.validation_inputs_digest != first.validation_inputs_digest:
+                raise ReplayRecipeError(
+                    "ensemble members must bind one shared validation input capability"
+                )
+            if member.final_inputs_digest != first.final_inputs_digest:
+                raise ReplayRecipeError(
+                    "ensemble members must bind one shared final input capability"
+                )
+
+    @property
+    def data_sha256(self) -> str:
+        return self.members[0].data_sha256
+
+    @property
+    def validation_inputs_digest(self) -> str:
+        return self.members[0].validation_inputs_digest
+
+    @property
+    def final_inputs_digest(self) -> str:
+        return self.members[0].final_inputs_digest
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "backend": self.backend.value,
+            "members": [member.manifest() for member in self.members],
+            "member_recipe_digests": list(self.member_recipe_digests),
+            "validation_member_prediction_digests": list(
+                self.validation_member_prediction_digests
+            ),
+            "fusion_weights": list(self.fusion_weights),
+            "validation_fusion_digest": self.validation_fusion_digest,
+        }
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json(self.manifest())
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class OfficialFMReplayRecipe:
     """Frozen official FM fallback over label-free candidate input capabilities."""
 
@@ -241,7 +352,11 @@ class OfficialFMReplayRecipe:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
 
 
-type ReplayRecipe = GeneratedLambdaRankReplayRecipe | OfficialFMReplayRecipe
+type ReplayRecipe = (
+    GeneratedLambdaRankReplayRecipe
+    | GeneratedLambdaRankEnsembleReplayRecipe
+    | OfficialFMReplayRecipe
+)
 
 
 def _pairs_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -348,6 +463,51 @@ def _generated_from_manifest(value: dict[str, object]) -> GeneratedLambdaRankRep
     )
 
 
+def _ensemble_from_manifest(value: dict[str, object]) -> GeneratedLambdaRankEnsembleReplayRecipe:
+    raw = _exact(
+        value,
+        {
+            "schema_version",
+            "backend",
+            "members",
+            "member_recipe_digests",
+            "validation_member_prediction_digests",
+            "fusion_weights",
+            "validation_fusion_digest",
+        },
+        "generated LambdaRank ensemble recipe",
+    )
+    raw_members = raw["members"]
+    if not isinstance(raw_members, list):
+        raise ReplayRecipeError("ensemble members must be a JSON array")
+    members: list[GeneratedLambdaRankReplayRecipe] = []
+    for index, raw_member in enumerate(raw_members):
+        if not isinstance(raw_member, dict):
+            raise ReplayRecipeError(f"ensemble members[{index}] must be a generated recipe object")
+        if raw_member.get("backend") != ReplayBackendKind.GENERATED_LAMBDARANK.value:
+            raise ReplayRecipeError(f"ensemble members[{index}] must be generated_lambdarank_v1")
+        members.append(_generated_from_manifest(cast(dict[str, object], raw_member)))
+
+    def _digest_tuple(field: str) -> tuple[str, ...]:
+        values = raw[field]
+        if not isinstance(values, list) or any(type(item) is not str for item in values):
+            raise ReplayRecipeError(f"{field} must be a JSON string array")
+        return tuple(cast(str, item) for item in values)
+
+    raw_weights = raw["fusion_weights"]
+    if not isinstance(raw_weights, list) or any(type(item) is not float for item in raw_weights):
+        raise ReplayRecipeError("fusion_weights must be a JSON float array")
+    return GeneratedLambdaRankEnsembleReplayRecipe(
+        members=tuple(members),
+        member_recipe_digests=_digest_tuple("member_recipe_digests"),
+        validation_member_prediction_digests=_digest_tuple(
+            "validation_member_prediction_digests"
+        ),
+        fusion_weights=tuple(cast(float, item) for item in raw_weights),
+        validation_fusion_digest=cast(str, raw["validation_fusion_digest"]),
+    )
+
+
 def _official_from_manifest(value: dict[str, object]) -> OfficialFMReplayRecipe:
     raw = _exact(
         value,
@@ -402,6 +562,8 @@ def parse_replay_recipe(payload: bytes) -> ReplayRecipe:
         raise ReplayRecipeError("replay backend is not allowlisted") from exc
     if kind is ReplayBackendKind.GENERATED_LAMBDARANK:
         return _generated_from_manifest(raw)
+    if kind is ReplayBackendKind.GENERATED_LAMBDARANK_ENSEMBLE:
+        return _ensemble_from_manifest(raw)
     if kind is ReplayBackendKind.OFFICIAL_FM:
         return _official_from_manifest(raw)
     raise ReplayRecipeError("replay backend is not allowlisted")  # pragma: no cover
@@ -455,7 +617,14 @@ def load_replay_recipe(path: str | Path, *, expected_sha256: str | None = None) 
 def write_replay_recipe(path: str | Path, recipe: ReplayRecipe) -> Path:
     """Exclusively persist one canonical recipe suitable for an INPUT artifact."""
 
-    if not isinstance(recipe, (GeneratedLambdaRankReplayRecipe, OfficialFMReplayRecipe)):
+    if not isinstance(
+        recipe,
+        (
+            GeneratedLambdaRankReplayRecipe,
+            GeneratedLambdaRankEnsembleReplayRecipe,
+            OfficialFMReplayRecipe,
+        ),
+    ):
         raise ReplayRecipeError("recipe must be one allowlisted replay recipe")
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -488,8 +657,10 @@ def write_replay_recipe(path: str | Path, recipe: ReplayRecipe) -> Path:
 
 
 __all__ = [
+    "MAX_ENSEMBLE_REPLAY_MEMBERS",
     "MAX_REPLAY_RECIPE_BYTES",
     "REPLAY_RECIPE_SCHEMA_VERSION",
+    "GeneratedLambdaRankEnsembleReplayRecipe",
     "GeneratedLambdaRankReplayRecipe",
     "OfficialFMMemberRecipe",
     "OfficialFMReplayRecipe",

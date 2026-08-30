@@ -583,7 +583,7 @@ def test_exhausted_syntax_repair_never_launches_or_changes_incumbent(
     assert store.current_incumbent() is not None
     assert store.current_incumbent().incumbent_id == "fm-fallback"  # type: ignore[union-attr]
     convergence = ConvergenceState.from_manifest(store.snapshot().convergence_state)
-    assert convergence.completed_iterations == 1
+    assert convergence.completed_iterations == 0
     assert convergence.best_primary == 0.6
     store.close()
 
@@ -653,7 +653,7 @@ def test_candidate_metric_spoof_is_ignored_when_trusted_evaluator_rejects_output
     assert failure[0] == "output_contract"
     assert "999" not in failure[1]
     convergence = ConvergenceState.from_manifest(store.snapshot().convergence_state)
-    assert convergence.completed_iterations == 1
+    assert convergence.completed_iterations == 0
     store.close()
 
 

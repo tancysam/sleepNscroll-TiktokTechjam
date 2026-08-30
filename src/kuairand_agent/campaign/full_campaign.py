@@ -1617,6 +1617,8 @@ class FoldDataPlane:
     fold: TemporalFold
     prefix_inputs: CanonicalInputs
     prefix_labels: tuple[int, ...] = field(repr=False)
+    prefix_click_labels: tuple[int, ...] = field(repr=False)
+    prefix_watch_progress: tuple[float, ...] = field(repr=False)
     query_inputs: CanonicalInputs
     query_labels: tuple[int, ...] = field(repr=False)
 
@@ -1629,6 +1631,17 @@ class FoldDataPlane:
             raise FullCampaignError("fold query inputs and targets differ in row count")
         if any(type(value) is not int or value not in (0, 1) for value in self.prefix_labels):
             raise FullCampaignError("fold prefix targets must remain binary integers")
+        if len(self.prefix_inputs) != len(self.prefix_click_labels) or any(
+            type(value) is not int or value not in (0, 1) for value in self.prefix_click_labels
+        ):
+            raise FullCampaignError("fold prefix click targets must remain aligned binary integers")
+        if len(self.prefix_inputs) != len(self.prefix_watch_progress) or any(
+            not math.isfinite(value) or not 0.0 <= value <= 2.0
+            for value in self.prefix_watch_progress
+        ):
+            raise FullCampaignError(
+                "fold prefix watch progress must remain aligned and finite in [0, 2]"
+            )
         if any(type(value) is not int or value not in (0, 1) for value in self.query_labels):
             raise FullCampaignError("fold query targets must remain binary integers")
 
@@ -1647,6 +1660,8 @@ class CampaignDataPlane:
     fold_b: FoldDataPlane
     outer_train_inputs: CanonicalInputs
     outer_train_labels: tuple[int, ...] = field(repr=False)
+    outer_train_click_labels: tuple[int, ...] = field(repr=False)
+    outer_train_watch_progress: tuple[float, ...] = field(repr=False)
     outer_validation_inputs: CanonicalInputs
     final_inputs: CanonicalInputs
     digest: str = field(init=False)
@@ -1661,6 +1676,17 @@ class CampaignDataPlane:
             raise FullCampaignError("outer train inputs and targets differ in row count")
         if any(type(value) is not int or value not in (0, 1) for value in self.outer_train_labels):
             raise FullCampaignError("outer train targets must remain binary integers")
+        if len(self.outer_train_inputs) != len(self.outer_train_click_labels) or any(
+            type(value) is not int or value not in (0, 1) for value in self.outer_train_click_labels
+        ):
+            raise FullCampaignError("outer train click targets must remain aligned binary integers")
+        if len(self.outer_train_inputs) != len(self.outer_train_watch_progress) or any(
+            not math.isfinite(value) or not 0.0 <= value <= 2.0
+            for value in self.outer_train_watch_progress
+        ):
+            raise FullCampaignError(
+                "outer train watch progress must remain aligned and finite in [0, 2]"
+            )
         manifest = self.manifest()
         object.__setattr__(self, "digest", _manifest_digest(b"data-plane\0", manifest))
 
@@ -1698,12 +1724,16 @@ class CampaignDataPlane:
 def _fold_data(
     train_inputs: CanonicalInputs,
     labels: tuple[int, ...],
+    click_labels: tuple[int, ...],
+    watch_progress: tuple[float, ...],
     fold: TemporalFold,
 ) -> FoldDataPlane:
     return FoldDataPlane(
         fold=fold,
         prefix_inputs=subset_canonical_inputs(train_inputs, fold.train_positions),
         prefix_labels=subset_values(labels, fold.train_positions),
+        prefix_click_labels=subset_values(click_labels, fold.train_positions),
+        prefix_watch_progress=tuple(watch_progress[index] for index in fold.train_positions),
         query_inputs=subset_canonical_inputs(train_inputs, fold.valid_positions),
         query_labels=subset_values(labels, fold.valid_positions),
     )
@@ -1740,14 +1770,26 @@ def prepare_campaign_data_plane(
     if not isinstance(valid.targets, ProtectedTargets):
         raise FullCampaignError("public validation lacks protected scorer targets")
     labels = train.targets.long_view
+    click_labels = tuple(int(value) for value in train.targets.column("is_click"))
+    play_time_ms = tuple(float(value) for value in train.targets.column("play_time_ms"))
+    watch_progress = tuple(
+        min(max(play_time / max(min(duration, 18_000.0), 1.0), 0.0), 2.0)
+        for play_time, duration in zip(
+            play_time_ms,
+            train.inputs.duration_ms,
+            strict=True,
+        )
+    )
     folds = build_temporal_folds(train)
     return CampaignDataPlane(
         dataset_digest=dataset.digest,
         folds=folds,
-        fold_a=_fold_data(train.inputs, labels, folds.fold_a),
-        fold_b=_fold_data(train.inputs, labels, folds.fold_b),
+        fold_a=_fold_data(train.inputs, labels, click_labels, watch_progress, folds.fold_a),
+        fold_b=_fold_data(train.inputs, labels, click_labels, watch_progress, folds.fold_b),
         outer_train_inputs=train.inputs,
         outer_train_labels=labels,
+        outer_train_click_labels=click_labels,
+        outer_train_watch_progress=watch_progress,
         outer_validation_inputs=valid.inputs,
         final_inputs=final.inputs,
     )
@@ -1755,7 +1797,7 @@ def prepare_campaign_data_plane(
 
 @dataclass(frozen=True, slots=True)
 class ProductionFeatureBundle:
-    """A/B and train-frozen outer+final feature matrices with one shared query build."""
+    """A/B and outer+final matrices with frozen outcomes and input-only query warm-up."""
 
     data_plane_digest: str
     fold_a: PureFeaturePair
@@ -1802,7 +1844,7 @@ def build_production_feature_bundle(
     builder_source_digest: str,
     cache_dir: Path | str | None = None,
 ) -> ProductionFeatureBundle:
-    """Build every causal table, using one train-frozen query for validation and final rows."""
+    """Build one outer query stream: frozen outcomes plus strict-earlier input exposures."""
 
     if not isinstance(data, CampaignDataPlane):
         raise FullCampaignError("data must be a prepared CampaignDataPlane")
@@ -1810,6 +1852,8 @@ def build_production_feature_bundle(
     fold_a = build_pure_feature_pair(
         prefix_inputs=data.fold_a.prefix_inputs,
         prefix_labels=data.fold_a.prefix_labels,
+        prefix_click_labels=data.fold_a.prefix_click_labels,
+        prefix_watch_progress=data.fold_a.prefix_watch_progress,
         query_inputs=data.fold_a.query_inputs,
         dataset_digest=data.dataset_digest,
         split_role="inner_fold_A",
@@ -1819,6 +1863,8 @@ def build_production_feature_bundle(
     fold_b = build_pure_feature_pair(
         prefix_inputs=data.fold_b.prefix_inputs,
         prefix_labels=data.fold_b.prefix_labels,
+        prefix_click_labels=data.fold_b.prefix_click_labels,
+        prefix_watch_progress=data.fold_b.prefix_watch_progress,
         query_inputs=data.fold_b.query_inputs,
         dataset_digest=data.dataset_digest,
         split_role="inner_fold_B",
@@ -1829,6 +1875,8 @@ def build_production_feature_bundle(
     outer_and_final = build_pure_feature_pair(
         prefix_inputs=data.outer_train_inputs,
         prefix_labels=data.outer_train_labels,
+        prefix_click_labels=data.outer_train_click_labels,
+        prefix_watch_progress=data.outer_train_watch_progress,
         query_inputs=combined_query,
         dataset_digest=data.dataset_digest,
         split_role="outer_validation_and_final",
@@ -1966,7 +2014,9 @@ def _grid_evidence(
     if not math.isclose(result.primary, metrics.primary, rel_tol=0.0, abs_tol=1e-15):
         raise FullCampaignError("protected fusion primary is not mean(GAUC, nDCG@5)")
     return FusionGridEvidence(
-        weights=fusion.weights,
+        # This legacy v1 grid remains exactly two-member even though FusionResult now supports
+        # additive n-member fusion for the v2 replay path.
+        weights=(fusion.weights[0], fusion.weights[1]),
         fusion_digest=fusion.fusion_digest,
         prediction_digest=fusion.prediction_digest,
         scorer_digest=scorer_digest,

@@ -99,7 +99,7 @@ def test_recipe_rejects_unknown_backends_and_non_grid_or_unpaired_fusion(
         GeneratedLambdaRankReplayRecipe(
             **_recipe_kwargs(),
             fm_member=_fm_member(),
-            fusion_weights=(0.6, 0.4),
+            fusion_weights=(0.625, 0.375),
         )
     with pytest.raises(ReplayRecipeError, match="together"):
         GeneratedLambdaRankReplayRecipe(

@@ -24,12 +24,13 @@ from kuairand_agent.candidate_api.protocol import (
     PredictionExpectation,
     validate_prediction_outputs,
 )
-from kuairand_agent.candidates.fusion import fuse_ranked_predictions
+from kuairand_agent.candidates.fusion import fuse_ranked_members, fuse_ranked_predictions
 from kuairand_agent.contract import sha256_file, verify_starter_kit
 from kuairand_agent.data.capabilities import CandidateInputs, DataPhase
 from kuairand_agent.execution.policy import SplitRole
 from kuairand_agent.execution.runner import ExecutionOutcome, ExecutionSpec, Runner
 from kuairand_agent.finalization.recipe import (
+    GeneratedLambdaRankEnsembleReplayRecipe,
     GeneratedLambdaRankReplayRecipe,
     OfficialFMMemberRecipe,
     OfficialFMReplayRecipe,
@@ -39,6 +40,7 @@ from kuairand_agent.finalization.recipe import (
 )
 from kuairand_agent.finalization.replay import (
     FrozenCandidateWorkspace,
+    FrozenReplayIdentity,
     ReplayBackend,
     ReplayCancelledError,
     ReplayError,
@@ -651,6 +653,152 @@ class GeneratedLambdaRankReplayBackend:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedLambdaRankEnsembleReplayBackend:
+    """Replay complete v1 members in order, then perform one frozen n-member fusion.
+
+    The enclosing frozen bundle uses a fixed, non-configurable layout so a recipe cannot select
+    paths or executable code::
+
+        source/members/<position>/source, source/members/<position>/recipe.json
+        features/members/<position>, checkpoint/members/<position>
+
+    ``position`` is the zero-based tuple position from the recipe.  Each nested recipe is loaded
+    again from its own SHA-bound artifact by the unchanged v1 backend.  Scores are retained only
+    in memory and the method returns only after every member has replayed and the one fusion call
+    has passed its validation bindings.
+    """
+
+    recipe: GeneratedLambdaRankEnsembleReplayRecipe
+    interpreter: Path
+    runner: Runner
+    cancel_event: threading.Event | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.recipe, GeneratedLambdaRankEnsembleReplayRecipe):
+            raise ReplayRecipeError("recipe must be GeneratedLambdaRankEnsembleReplayRecipe")
+        if not isinstance(self.interpreter, Path) or not self.interpreter.is_absolute():
+            raise ReplayRecipeError("generated replay interpreter must be an absolute path")
+        if not isinstance(self.runner, Runner):
+            raise ReplayRecipeError("generated replay runner must be Runner")
+        if self.cancel_event is not None and not isinstance(self.cancel_event, threading.Event):
+            raise ReplayRecipeError("cancel_event must be threading.Event or None")
+
+    def _member_workspace(
+        self,
+        *,
+        workspace: FrozenCandidateWorkspace,
+        member: GeneratedLambdaRankReplayRecipe,
+        position: int,
+        validation_prediction_digest: str,
+    ) -> FrozenCandidateWorkspace:
+        # Only the fixed ordinal is used to resolve member files.  Digests are verified by the v1
+        # backend after this construction; no recipe-controlled path reaches the filesystem.
+        member_name = str(position)
+        member_identity = FrozenReplayIdentity(
+            source_sha256=member.source_artifact_sha256,
+            config_sha256=member.digest,
+            features_sha256=member.feature_artifact_sha256,
+            checkpoint_sha256=member.checkpoint_artifact_sha256,
+            validation_prediction_artifact_sha256=validation_prediction_digest,
+            validation_prediction_digest=validation_prediction_digest,
+            data_sha256=member.data_sha256,
+            environment_sha256=workspace.identity.environment_sha256,
+        )
+        return FrozenCandidateWorkspace(
+            root=workspace.root,
+            source_dir=workspace.source_dir / "members" / member_name / "source",
+            config_path=workspace.source_dir / "members" / member_name / "recipe.json",
+            features_path=workspace.features_path / "members" / member_name,
+            checkpoint_path=workspace.checkpoint_path / "members" / member_name,
+            identity=member_identity,
+        )
+
+    def _predict(
+        self,
+        *,
+        workspace: FrozenCandidateWorkspace,
+        inputs: CandidateInputs,
+        phase: DataPhase,
+        expected_inputs_digest: str,
+    ) -> Float64Vector:
+        _require_workspace(workspace)
+        _require_recipe_artifact(workspace, self.recipe)
+        if not isinstance(inputs, CandidateInputs) or inputs.phase is not phase:
+            raise ReplayError(f"replay backend requires a {phase.value} CandidateInputs capability")
+        if inputs.digest != expected_inputs_digest:
+            raise ReplayError("candidate input capability differs from the replay recipe")
+
+        scores: list[Float64Vector] = []
+        for position, (member, member_digest, validation_digest) in enumerate(
+            zip(
+                self.recipe.members,
+                self.recipe.member_recipe_digests,
+                self.recipe.validation_member_prediction_digests,
+                strict=True,
+            )
+        ):
+            # Constructor validation makes this redundant for normal callers, but it keeps the
+            # fail-closed guarantee local to the executable boundary.
+            if member.digest != member_digest:
+                raise ReplayError("ensemble member recipe digest differs from ordered binding")
+            member_backend = GeneratedLambdaRankReplayBackend(
+                member,
+                self.interpreter,
+                self.runner,
+                self.cancel_event,
+            )
+            member_scores = member_backend._predict(
+                workspace=self._member_workspace(
+                    workspace=workspace,
+                    member=member,
+                    position=position,
+                    validation_prediction_digest=validation_digest,
+                ),
+                inputs=inputs,
+                phase=phase,
+                expected_inputs_digest=expected_inputs_digest,
+            )
+            scores.append(member_scores)
+
+        try:
+            fused = fuse_ranked_members(
+                inputs.column("user_id"),
+                inputs.column("video_id"),
+                tuple(scores),
+                weights=self.recipe.fusion_weights,
+                phase=phase,
+            )
+        except Exception as exc:
+            raise ReplayError("frozen ordered rank-ensemble fusion failed") from exc
+        if phase is DataPhase.OUTER_VALID:
+            if fused.member_prediction_digests != self.recipe.validation_member_prediction_digests:
+                raise ReplayError("ensemble validation member predictions differ from recipe")
+            if fused.fusion_digest != self.recipe.validation_fusion_digest:
+                raise ReplayError("ensemble validation fusion digest differs from recipe")
+        return fused.scores
+
+    def replay_validation(
+        self, *, workspace: FrozenCandidateWorkspace, inputs: CandidateInputs
+    ) -> Float64Vector:
+        return self._predict(
+            workspace=workspace,
+            inputs=inputs,
+            phase=DataPhase.OUTER_VALID,
+            expected_inputs_digest=self.recipe.validation_inputs_digest,
+        )
+
+    def predict_final(
+        self, *, workspace: FrozenCandidateWorkspace, inputs: CandidateInputs
+    ) -> Float64Vector:
+        return self._predict(
+            workspace=workspace,
+            inputs=inputs,
+            phase=DataPhase.FINAL,
+            expected_inputs_digest=self.recipe.final_inputs_digest,
+        )
+
+
 def build_replay_backend(
     recipe: ReplayRecipe,
     *,
@@ -666,6 +814,14 @@ def build_replay_backend(
     if isinstance(recipe, GeneratedLambdaRankReplayRecipe):
         selected_interpreter = Path(sys.executable) if interpreter is None else interpreter
         return GeneratedLambdaRankReplayBackend(
+            recipe,
+            selected_interpreter,
+            Runner(),
+            cancel_event,
+        )
+    if isinstance(recipe, GeneratedLambdaRankEnsembleReplayRecipe):
+        selected_interpreter = Path(sys.executable) if interpreter is None else interpreter
+        return GeneratedLambdaRankEnsembleReplayBackend(
             recipe,
             selected_interpreter,
             Runner(),
@@ -697,6 +853,7 @@ def load_replay_backend(
 
 
 __all__ = [
+    "GeneratedLambdaRankEnsembleReplayBackend",
     "GeneratedLambdaRankReplayBackend",
     "OfficialFMReplayBackend",
     "build_replay_backend",

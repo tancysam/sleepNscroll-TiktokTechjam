@@ -1,6 +1,7 @@
 """Provider-free replay, finalization, and evidence reporting."""
 
 from kuairand_agent.finalization.backends import (
+    GeneratedLambdaRankEnsembleReplayBackend,
     GeneratedLambdaRankReplayBackend,
     OfficialFMReplayBackend,
     build_replay_backend,
@@ -21,9 +22,15 @@ from kuairand_agent.finalization.organizer_check import (
     OrganizerCheckEvidence,
     check_final_submission,
 )
+from kuairand_agent.finalization.production import (
+    GeneratedLambdaRankEnsembleReplayArtifacts,
+    GeneratedLambdaRankReplayMemberBundle,
+    build_generated_lambdarank_ensemble_replay,
+)
 from kuairand_agent.finalization.recipe import (
     MAX_REPLAY_RECIPE_BYTES,
     REPLAY_RECIPE_SCHEMA_VERSION,
+    GeneratedLambdaRankEnsembleReplayRecipe,
     GeneratedLambdaRankReplayRecipe,
     OfficialFMMemberRecipe,
     OfficialFMReplayRecipe,
@@ -94,7 +101,11 @@ __all__ = [
     "FinalizationResult",
     "FrozenCandidateWorkspace",
     "FrozenReplayIdentity",
+    "GeneratedLambdaRankEnsembleReplayArtifacts",
+    "GeneratedLambdaRankEnsembleReplayBackend",
+    "GeneratedLambdaRankEnsembleReplayRecipe",
     "GeneratedLambdaRankReplayBackend",
+    "GeneratedLambdaRankReplayMemberBundle",
     "GeneratedLambdaRankReplayRecipe",
     "MaskedFileEvidence",
     "MaskedViewEvidence",
@@ -115,6 +126,7 @@ __all__ = [
     "ReproduceInstructions",
     "ResourceEvidence",
     "ValidationReplayEvidence",
+    "build_generated_lambdarank_ensemble_replay",
     "build_replay_backend",
     "check_final_submission",
     "create_final_bundle",

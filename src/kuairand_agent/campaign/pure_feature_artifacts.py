@@ -25,6 +25,11 @@ from typing import BinaryIO, Final, cast
 import numpy as np
 
 from kuairand_agent.campaign.pure_features import PureFeaturePair
+from kuairand_agent.campaign.strict_past_exposure import (
+    STRICT_PAST_EXPOSURE_FEATURE_NAMES,
+    StrictPastExposureError,
+    StrictPastExposurePair,
+)
 from kuairand_agent.data.causal_features import CausalFeatureError, FeatureMatrix
 
 PURE_FEATURE_ARTIFACT_SCHEMA_VERSION: Final = 1
@@ -660,6 +665,58 @@ def _decode_pair(npz_handle: BinaryIO, stored_pair: Mapping[str, object]) -> Pur
     except (OSError, ValueError, EOFError, zipfile.BadZipFile, KeyError) as exc:
         raise PureFeatureArtifactError(f"cannot decode pure feature NPZ: {exc}") from exc
 
+    raw_categorical_codes = stored_pair.get("categorical_codes")
+    categorical_encoding_digest = (
+        cast(str | None, raw_categorical_codes.get("encoding_digest"))
+        if isinstance(raw_categorical_codes, Mapping)
+        else None
+    )
+    raw_auxiliary_history = stored_pair.get("auxiliary_history")
+    auxiliary_history_cache_key = (
+        cast(str | None, raw_auxiliary_history.get("causal_cache_key"))
+        if isinstance(raw_auxiliary_history, Mapping)
+        else None
+    )
+    input_exposure: StrictPastExposurePair | None = None
+    raw_input_exposure = stored_pair.get("input_exposure")
+    if stored_pair.get("schema_version") == 8:
+        if not isinstance(raw_input_exposure, Mapping):
+            raise PureFeatureArtifactError(
+                "schema-v8 input-exposure manifest must be an object"
+            )
+        width = len(STRICT_PAST_EXPOSURE_FEATURE_NAMES)
+        if prefix.feature_names[-width:] != STRICT_PAST_EXPOSURE_FEATURE_NAMES:
+            raise PureFeatureArtifactError(
+                "schema-v8 feature matrix lacks the fixed input-exposure suffix"
+            )
+        try:
+            input_exposure = StrictPastExposurePair(
+                prefix=FeatureMatrix(
+                    prefix.values[:, -width:], STRICT_PAST_EXPOSURE_FEATURE_NAMES
+                ),
+                query=FeatureMatrix(
+                    query.values[:, -width:], STRICT_PAST_EXPOSURE_FEATURE_NAMES
+                ),
+                prefix_input_digest=cast(
+                    str, raw_input_exposure.get("prefix_input_digest")
+                ),
+                query_input_digest=cast(
+                    str, raw_input_exposure.get("query_input_digest")
+                ),
+                builder_source_digest=cast(
+                    str, raw_input_exposure.get("builder_source_digest")
+                ),
+            )
+            if input_exposure.digest != _require_digest(
+                raw_input_exposure.get("build_digest"), "input_exposure.build_digest"
+            ):
+                raise PureFeatureArtifactError(
+                    "input-exposure build digest does not match its values"
+                )
+        except StrictPastExposureError as exc:
+            raise PureFeatureArtifactError(
+                f"input-exposure values or identity are invalid: {exc}"
+            ) from exc
     try:
         pair = PureFeaturePair(
             prefix=prefix,
@@ -667,8 +724,13 @@ def _decode_pair(npz_handle: BinaryIO, stored_pair: Mapping[str, object]) -> Pur
             dataset_digest=cast(str, stored_pair.get("dataset_digest")),
             split_role=cast(str, stored_pair.get("split_role")),
             causal_cache_key=cast(str, stored_pair.get("causal_cache_key")),
+            categorical_encoding_digest=categorical_encoding_digest,
+            auxiliary_history_cache_key=auxiliary_history_cache_key,
+            input_exposure=input_exposure,
+            feature_schema_version=cast(int, stored_pair.get("schema_version")),
+            feature_policy=cast(str, stored_pair.get("policy")),
         )
-    except (TypeError, ValueError, CausalFeatureError) as exc:
+    except (TypeError, ValueError, CausalFeatureError, StrictPastExposureError) as exc:
         raise PureFeatureArtifactError(
             f"pure feature values or identity are invalid: {exc}"
         ) from exc
@@ -722,19 +784,45 @@ def _load_verified(
         raise PureFeatureArtifactError("pure feature NPZ manifest is invalid")
     declared_npz_digest = _require_digest(npz_manifest.get("sha256"), "npz.sha256")
     declared_npz_size = _require_positive_int(npz_manifest.get("size_bytes"), "npz.size_bytes")
+    raw_pair = top.get("pair")
+    if not isinstance(raw_pair, Mapping):
+        raise PureFeatureArtifactError("pure feature logical pair manifest must be an object")
+    pair_schema_version = raw_pair.get("schema_version")
+    pair_fields = {
+        "schema_version",
+        "policy",
+        "dataset_digest",
+        "split_role",
+        "aggregate_specs",
+        "static_features",
+        "causal_cache_key",
+        "prefix",
+        "query",
+    }
+    if pair_schema_version in {3, 4}:
+        pair_fields.update(("recency", "categorical_codes"))
+    elif pair_schema_version == 5:
+        pair_fields.update(("recency", "categorical_codes", "auxiliary_history"))
+    elif pair_schema_version in {6, 7, 8}:
+        pair_fields.update(
+            (
+                "recency",
+                "categorical_codes",
+                "auxiliary_history",
+                "watch_progress_history",
+            )
+        )
+        if pair_schema_version == 7:
+            pair_fields.add("video_type_code")
+        elif pair_schema_version == 8:
+            pair_fields.update(("video_type_code", "input_exposure"))
+    elif pair_schema_version == 2:
+        pair_fields.add("recency")
+    elif pair_schema_version != 1:
+        raise PureFeatureArtifactError("pure feature logical pair schema is unsupported")
     stored_pair = _require_mapping(
-        top.get("pair"),
-        fields={
-            "schema_version",
-            "policy",
-            "dataset_digest",
-            "split_role",
-            "aggregate_specs",
-            "static_features",
-            "causal_cache_key",
-            "prefix",
-            "query",
-        },
+        raw_pair,
+        fields=pair_fields,
         name="logical pair manifest",
     )
     with _checked_file(npz_path, maximum=_MAX_NPZ_BYTES, kind="NPZ") as checked_npz:

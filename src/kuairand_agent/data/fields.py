@@ -348,6 +348,20 @@ def _basic_spec(column: str) -> FieldSpec:
             conditions=("unique many-to-one join without row expansion or reordering",),
             rationale="organizer FM baseline input with an explicit missing-value token",
         )
+    if column == "video_type":
+        return FieldSpec(
+            FieldRole.INFERENCE_INPUT,
+            LogicalDType.STRING,
+            enabled=True,
+            conditions=(
+                "unique many-to-one join without row expansion or reordering",
+                "prefix-fitted categorical encoding with an explicit unknown slot",
+            ),
+            rationale=(
+                "train-only Fold-B selection and frozen Fold-A confirmation showed one "
+                "directionally stable complementary basic-video signal"
+            ),
+        )
     if column == "visible_status":
         return _blocked(
             LogicalDType.INTEGER,
@@ -356,7 +370,6 @@ def _basic_spec(column: str) -> FieldSpec:
 
     dtype = {
         "music_id": LogicalDType.STRING,
-        "video_type": LogicalDType.STRING,
         "upload_type": LogicalDType.STRING,
         "upload_dt": LogicalDType.STRING,
         "video_duration": LogicalDType.NUMBER,

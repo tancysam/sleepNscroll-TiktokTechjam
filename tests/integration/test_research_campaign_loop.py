@@ -406,7 +406,7 @@ def test_three_iteration_scripted_campaign_repairs_selects_and_retains_evidence(
     snapshot = store.snapshot()
     assert snapshot.launches_used == 3
     convergence = ConvergenceState.from_manifest(snapshot.convergence_state)
-    assert convergence.completed_iterations == 3
+    assert convergence.completed_iterations == 2
     assert convergence.best_primary == 1.0
     assert parent.file("candidate.py").content == BASE_SOURCE
 

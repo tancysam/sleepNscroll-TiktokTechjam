@@ -17,14 +17,18 @@ import pytest
 from kuairand_agent.baselines.artifacts import StarterFMCheckpoint, save_checkpoint
 from kuairand_agent.baselines.encoding import StarterEncoding
 from kuairand_agent.baselines.starter_fm import StarterFMAdapter, StarterFMConfig
-from kuairand_agent.candidates.fusion import fuse_ranked_predictions
+from kuairand_agent.candidates.fusion import fuse_ranked_members, fuse_ranked_predictions
 from kuairand_agent.contract import sha256_file, verify_starter_kit
 from kuairand_agent.data.canonical import CanonicalInputs
 from kuairand_agent.data.capabilities import CandidateInputs, DataPhase, build_candidate_inputs
 from kuairand_agent.data.fields import STANDARD_LATE_MEMBER, VIDEO_BASIC_MEMBER, FieldKey
 from kuairand_agent.execution.artifacts import ArtifactKind, ArtifactStore
-from kuairand_agent.finalization.backends import build_replay_backend
+from kuairand_agent.finalization.backends import (
+    GeneratedLambdaRankReplayBackend,
+    build_replay_backend,
+)
 from kuairand_agent.finalization.recipe import (
+    GeneratedLambdaRankEnsembleReplayRecipe,
     GeneratedLambdaRankReplayRecipe,
     OfficialFMMemberRecipe,
     OfficialFMReplayRecipe,
@@ -467,5 +471,149 @@ def test_generated_lambdarank_backend_runs_fresh_subprocess_and_replays_frozen_f
     with pytest.raises(ReplayCancelledError, match="cancelled"):
         cancelled_backend.replay_validation(
             workspace=cancelled_workspace,
+            inputs=validation_inputs,
+        )
+
+
+def test_generated_ensemble_backend_replays_all_ordered_v1_members_before_one_fusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values: _InputValues = {
+        "users": ("u1", "u1", "u1"),
+        "videos": ("v1", "v2", "v3"),
+        "authors": ("a1", "a2", "a3"),
+        "tabs": ("0", "1", "0"),
+        "durations": (5.0, 25.0, 45.0),
+    }
+    validation_inputs = _inputs(DataPhase.OUTER_VALID, **values)
+    final_inputs = _inputs(DataPhase.FINAL, **values)
+
+    def member(marker: str) -> GeneratedLambdaRankReplayRecipe:
+        return GeneratedLambdaRankReplayRecipe(
+            source_artifact_sha256="1" * 64,
+            candidate_source_sha256=marker * 64,
+            candidate_config_sha256="3" * 64,
+            feature_artifact_sha256="4" * 64,
+            validation_features_sha256="5" * 64,
+            final_features_sha256="6" * 64,
+            checkpoint_artifact_sha256="7" * 64,
+            tree_checkpoint_sha256="8" * 64,
+            data_sha256="9" * 64,
+            validation_inputs_digest=validation_inputs.digest,
+            final_inputs_digest=final_inputs.digest,
+            feature_count=2,
+            timeout_seconds=60,
+            memory_limit_bytes=1024 * 1024,
+            threads=1,
+        )
+
+    members = (member("a"), member("b"))
+    validation_scores = {
+        members[0].digest: np.asarray([3.0, 2.0, 1.0], dtype=np.float64),
+        members[1].digest: np.asarray([1.0, 3.0, 2.0], dtype=np.float64),
+    }
+    final_scores = {
+        members[0].digest: np.asarray([2.0, 3.0, 1.0], dtype=np.float64),
+        members[1].digest: np.asarray([1.0, 2.0, 3.0], dtype=np.float64),
+    }
+    expected_validation = fuse_ranked_members(
+        values["users"],
+        values["videos"],
+        tuple(validation_scores[member.digest] for member in members),
+        weights=(0.75, 0.25),
+        phase=DataPhase.OUTER_VALID,
+    )
+    expected_final = fuse_ranked_members(
+        values["users"],
+        values["videos"],
+        tuple(final_scores[member.digest] for member in members),
+        weights=(0.75, 0.25),
+        phase=DataPhase.FINAL,
+    )
+    recipe = GeneratedLambdaRankEnsembleReplayRecipe(
+        members=members,
+        member_recipe_digests=tuple(member.digest for member in members),
+        validation_member_prediction_digests=expected_validation.member_prediction_digests,
+        fusion_weights=(0.75, 0.25),
+        validation_fusion_digest=expected_validation.fusion_digest,
+    )
+    recipe_path = write_replay_recipe(tmp_path / "ensemble-recipe.json", recipe)
+    source = tmp_path / "source"
+    features = tmp_path / "features"
+    checkpoint = tmp_path / "checkpoint"
+    for path in (source, features, checkpoint):
+        path.mkdir()
+    workspace = FrozenCandidateWorkspace(
+        root=tmp_path,
+        source_dir=source,
+        config_path=recipe_path,
+        features_path=features,
+        checkpoint_path=checkpoint,
+        identity=FrozenReplayIdentity(
+            source_sha256="c" * 64,
+            config_sha256=recipe.digest,
+            features_sha256="d" * 64,
+            checkpoint_sha256="e" * 64,
+            validation_prediction_artifact_sha256="f" * 64,
+            validation_prediction_digest=expected_validation.prediction_digest,
+            data_sha256="9" * 64,
+            environment_sha256="0" * 64,
+        ),
+    )
+    calls: list[tuple[str, DataPhase, Path]] = []
+
+    # The real member adapter is reached before any candidate code when a fixed-position member
+    # bundle is absent, so no partial fusion result can escape this boundary.
+    with pytest.raises(ReplayError, match="frozen replay source_dir is unavailable or unsafe"):
+        build_replay_backend(recipe).replay_validation(
+            workspace=workspace,
+            inputs=validation_inputs,
+        )
+
+    def replay_member(
+        self: GeneratedLambdaRankReplayBackend,
+        *,
+        workspace: FrozenCandidateWorkspace,
+        inputs: CandidateInputs,
+        phase: DataPhase,
+        expected_inputs_digest: str,
+    ) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
+        assert inputs.digest == expected_inputs_digest
+        calls.append((self.recipe.digest, phase, workspace.config_path))
+        return (validation_scores if phase is DataPhase.OUTER_VALID else final_scores)[
+            self.recipe.digest
+        ]
+
+    monkeypatch.setattr(GeneratedLambdaRankReplayBackend, "_predict", replay_member)
+    backend = build_replay_backend(recipe)
+
+    replayed = np.asarray(backend.replay_validation(workspace=workspace, inputs=validation_inputs))
+    predicted = np.asarray(backend.predict_final(workspace=workspace, inputs=final_inputs))
+
+    np.testing.assert_array_equal(replayed, expected_validation.scores)
+    np.testing.assert_array_equal(predicted, expected_final.scores)
+    assert [(digest, phase) for digest, phase, _ in calls] == [
+        (members[0].digest, DataPhase.OUTER_VALID),
+        (members[1].digest, DataPhase.OUTER_VALID),
+        (members[0].digest, DataPhase.FINAL),
+        (members[1].digest, DataPhase.FINAL),
+    ]
+    assert [path.relative_to(source).as_posix() for _, _, path in calls] == [
+        "members/0/recipe.json",
+        "members/1/recipe.json",
+        "members/0/recipe.json",
+        "members/1/recipe.json",
+    ]
+
+    wrong_recipe = replace(recipe, validation_fusion_digest="f" * 64)
+    wrong_path = write_replay_recipe(tmp_path / "wrong-ensemble-recipe.json", wrong_recipe)
+    wrong_workspace = replace(
+        workspace,
+        config_path=wrong_path,
+        identity=replace(workspace.identity, config_sha256=wrong_recipe.digest),
+    )
+    with pytest.raises(ReplayError, match="validation fusion digest differs"):
+        build_replay_backend(wrong_recipe).replay_validation(
+            workspace=wrong_workspace,
             inputs=validation_inputs,
         )

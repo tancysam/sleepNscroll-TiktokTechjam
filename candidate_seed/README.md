@@ -11,6 +11,38 @@ python candidate.py predict --request request.json --checkpoint output/checkpoin
 
 `candidate.py` is the stable protocol entrypoint. It owns finite numeric capability loading,
 request validation, checkpoint serialization, result writing, and the command-line interface.
+`reference_pairwise_fm.py` is the protected five-field pairwise-FM control. Its training function
+is `train_reference_pairwise_fm(features, targets, user_groups, *, seed)`. It uses positive-ticket
+GAUC-aligned sampling, the organizer codes at positions 51–55, float32 FM reductions, and the
+frozen dense-Adam recipe. New pairwise work must reuse `sample_reference_logged_pairs` instead of
+rebuilding group offsets or row-index maps.
+
+`reference_categorical_ranker.py` is the native-categorical LambdaRank specialist. Its training
+function is `train_reference_categorical_ranker(features, targets, user_groups, *, seed)`. It
+consumes the first 83 columns and treats positions 51–55 and 82 (`video_type_code`) as categorical.
+`reference_listnet_ranker.py` and `reference_pointwise_ranker.py` preserve their historical
+first-82 correction surfaces; they supply a neutral column 82 only to their nested categorical
+backbone. Their training functions also require the controller seed as the keyword-only `seed`
+argument. Mutable candidates may compose these specialists, but cannot replace, retune, or omit
+their checkpoint arrays.
+
+`reference_observed_pair_objectives.py` and `reference_observed_pair_fm.py` provide a predeclared
+equal-budget ablation of pair selection. The control is byte-exact to the uniform reference FM;
+the treatment changes exactly half of its logged pairs to same-user, same-duration-bucket
+positive/negative comparisons. Use `train_reference_uniform_pairwise_fm(..., *, seed)` and
+`train_reference_duration_pairwise_fm(..., *, seed)` as paired arms. Inference remains
+label- and group-free through `reference_observed_pair_fm_scores(features, checkpoint)`.
+The full-budget three-seed train-fold replicate is recorded in
+`docs/research/observed_pair_duration_pilot-20260830.md`: its mean primary delta versus the
+uniform-pair control was `+0.0007370909`, but the worst fold/seed cell was `-0.0001828671`.
+Accordingly, this remains an experimental specialist and is not evidence for deployment by itself.
+
+The current controller matrix has 95 columns. Positions 0–81 preserve the historical feature
+surface, position 82 is `video_type_code`, and positions 83–94 are input-only strict-past exposure,
+first-seen, and time-since-last-exposure features for user, video, author, and user-video scopes.
+These final 12 columns may advance from earlier query inputs but never accept query outcomes.
+Mutable code may use them only in the exact order declared by the current
+`controller_causal_feature_bundle.feature_names_csv` method card.
 `model_impl.py` is the deliberately small mutable scientific surface: it owns the objective,
 optimization, model-specific checkpoint arrays, diagnostics, and label-free prediction.
 Autonomous implementations may replace `model_impl.py`, `config.json`, and reachable helper

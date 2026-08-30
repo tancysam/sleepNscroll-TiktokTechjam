@@ -245,7 +245,10 @@ class SelectionReason(StrEnum):
     INCUMBENT_EVIDENCE_INCOMPLETE = "incumbent_evidence_incomplete"
     SPECIALIST_ONLY = "specialist_only"
     OUTER_NOT_BETTER = "outer_not_better"
+    MATERIALITY_NOT_MET = "materiality_not_met"
     PROMOTED_MATERIAL = "promoted_material"
+    # Retained for schema-v1 receipt/replay compatibility. New decisions never deploy an
+    # unconfirmed challenger.
     PROMOTED_UNCONFIRMED = "promoted_unconfirmed"
 
 
@@ -258,12 +261,43 @@ class SelectionOutcome(StrEnum):
     PROMOTE_UNCONFIRMED = "promote_unconfirmed"
 
 
+class OuterEligibilityClass(StrEnum):
+    """Whether an eligibility result is science, invalid evidence, or budget policy."""
+
+    ELIGIBLE = "eligible"
+    SCIENTIFIC_REJECTION = "scientific_rejection"
+    INVALID_EVIDENCE = "invalid_evidence"
+    BUDGET_BLOCKED = "budget_blocked"
+
+    @classmethod
+    def classify_reasons(cls, reasons: tuple[SelectionReason, ...]) -> OuterEligibilityClass:
+        """Classify known outer reasons, defaulting new reasons to invalid evidence."""
+
+        reason_set = frozenset(reasons)
+        if not reason_set:
+            return cls.ELIGIBLE
+        if reason_set & {
+            SelectionReason.OUTER_CANDIDATE_LIMIT,
+            SelectionReason.INSUFFICIENT_FINALIZATION_TIME,
+        }:
+            return cls.BUDGET_BLOCKED
+        scientific_rejections = {
+            SelectionReason.FOLD_B_SCREEN_FAILED,
+            SelectionReason.INNER_MEAN_NOT_POSITIVE,
+            SelectionReason.WORST_FOLD_GUARD_FAILED,
+        }
+        if reason_set <= scientific_rejections:
+            return cls.SCIENTIFIC_REJECTION
+        return cls.INVALID_EVIDENCE
+
+
 @dataclass(frozen=True, slots=True)
 class OuterEligibilityDecision:
     eligible: bool
     reasons: tuple[SelectionReason, ...]
     failed_gates: tuple[str, ...]
     consumes_outer_slot: bool
+    classification: OuterEligibilityClass
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,11 +368,13 @@ class Selector:
         if not context.sufficient_finalization_time:
             reasons.append(SelectionReason.INSUFFICIENT_FINALIZATION_TIME)
         eligible = not reasons
+        classification = OuterEligibilityClass.classify_reasons(tuple(reasons))
         return OuterEligibilityDecision(
             eligible=eligible,
             reasons=(SelectionReason.OUTER_ELIGIBLE,) if eligible else tuple(reasons),
             failed_gates=failed_gates,
             consumes_outer_slot=eligible and not is_existing_outer_candidate,
+            classification=classification,
         )
 
     def decide(
@@ -453,15 +489,18 @@ class Selector:
                 outer=outer,
                 confirmation=stats,
             )
-        if mean_paired > MATERIAL_PRIMARY_DELTA:
-            outcome = SelectionOutcome.PROMOTE_CONFIRMED
-            reason = SelectionReason.PROMOTED_MATERIAL
-        else:
-            outcome = SelectionOutcome.PROMOTE_UNCONFIRMED
-            reason = SelectionReason.PROMOTED_UNCONFIRMED
+        if mean_paired <= MATERIAL_PRIMARY_DELTA:
+            return SelectionDecision(
+                outcome=SelectionOutcome.RETAIN_INCUMBENT,
+                reason=SelectionReason.MATERIALITY_NOT_MET,
+                selected_candidate_id=incumbent.candidate_id,
+                challenger_candidate_id=challenger.candidate_id,
+                outer=outer,
+                confirmation=stats,
+            )
         return SelectionDecision(
-            outcome=outcome,
-            reason=reason,
+            outcome=SelectionOutcome.PROMOTE_CONFIRMED,
+            reason=SelectionReason.PROMOTED_MATERIAL,
             selected_candidate_id=challenger.candidate_id,
             challenger_candidate_id=challenger.candidate_id,
             outer=outer,

@@ -32,6 +32,8 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Final, Literal, Self, cast
 
+from kuairand_agent.campaign.convergence import ConvergenceState, ConvergenceStateError
+
 SCHEMA_VERSION: Final = 1
 APPLICATION_ID: Final = 0x4B524143  # ``KRAC``
 DEFAULT_MAX_LAUNCHES: Final = 50
@@ -852,33 +854,15 @@ def _load_json_string_tuple(value: object, location: str) -> tuple[str, ...]:
 
 
 def _convergence_json(value: Mapping[str, object]) -> str:
-    expected = {
-        "schema_version",
-        "best_primary",
-        "non_material_streak",
-        "completed_iterations",
-        "required_completion_pending",
-    }
-    if set(value) != expected:
-        raise StoreInvariantError("convergence state must contain the exact version-1 fields")
-    if value["schema_version"] != 1:
-        raise StoreInvariantError("convergence schema_version must be 1")
-    best = value["best_primary"]
-    if isinstance(best, bool) or not isinstance(best, (int, float)):
-        raise StoreInvariantError("convergence best_primary must be numeric")
-    if not math.isfinite(float(best)) or not 0.0 <= float(best) <= 1.0:
-        raise StoreInvariantError("convergence best_primary must be finite in [0, 1]")
-    for key in ("non_material_streak", "completed_iterations"):
-        number = value[key]
-        if type(number) is not int or number < 0:
-            raise StoreInvariantError(f"convergence {key} must be a non-negative integer")
-    if cast(int, value["non_material_streak"]) > cast(int, value["completed_iterations"]):
-        raise StoreInvariantError(
-            "convergence non_material_streak cannot exceed completed_iterations"
-        )
-    if type(value["required_completion_pending"]) is not bool:
-        raise StoreInvariantError("convergence required_completion_pending must be boolean")
-    return _json_object(value, "convergence state")
+    if not isinstance(value, Mapping):
+        raise StoreInvariantError("convergence state must be a mapping")
+    if any(type(key) is not str for key in value):
+        raise StoreInvariantError("convergence state keys must be strings")
+    try:
+        canonical = ConvergenceState.from_manifest(value).manifest()
+    except ConvergenceStateError as exc:
+        raise StoreInvariantError(f"invalid convergence state: {exc}") from exc
+    return _json_object(canonical, "convergence state")
 
 
 def _timestamp(value: object, location: str) -> str:
@@ -1489,7 +1473,17 @@ class CampaignStore:
                 WHERE campaign_id = ? ORDER BY history_id DESC LIMIT 1""",
                 (self.campaign_id,),
             ).fetchone()
-            convergence = _load_json_object(row["convergence_json"], "campaign convergence_json")
+            stored_convergence = _load_json_object(
+                row["convergence_json"], "campaign convergence_json"
+            )
+            try:
+                convergence = _load_json_object(
+                    _convergence_json(stored_convergence), "campaign convergence_json"
+                )
+            except StoreInvariantError as exc:
+                raise StoreVersionError(
+                    "campaign convergence_json violates the convergence-state contract"
+                ) from exc
             return CampaignSnapshot(
                 campaign_id=self.campaign_id,
                 revision=int(row["revision"]),

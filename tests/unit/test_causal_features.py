@@ -8,6 +8,7 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
+from kuairand_agent.data.canonical import OUTCOME_FIELDS
 from kuairand_agent.data.causal_features import (
     AggregateSpec,
     BuildIdentity,
@@ -338,6 +339,16 @@ def test_invalid_causal_inputs_fail_closed(
 ) -> None:
     with pytest.raises(CausalFeatureError, match=message):
         CausalInputs(time_ms=time_ms, fields=fields)
+
+
+@pytest.mark.parametrize("outcome_name", OUTCOME_FIELDS)
+def test_public_aggregate_spec_rejects_every_canonical_outcome_name(
+    outcome_name: str,
+) -> None:
+    """Every canonical same-row outcome is blocked at the public feature seam."""
+
+    with pytest.raises(CausalFeatureError, match="outcome"):
+        AggregateSpec(key_fields=(outcome_name,))
 
 
 @pytest.mark.parametrize("labels", [(), (True,), (-1,), (2,), (1.0,), ("1",)])

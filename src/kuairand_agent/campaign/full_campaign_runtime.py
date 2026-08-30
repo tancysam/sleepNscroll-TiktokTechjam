@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import resource
 import stat
@@ -88,8 +89,13 @@ from kuairand_agent.campaign.qualification_evidence import (
     QualificationExpectations,
     load_official_fm_qualification,
 )
+from kuairand_agent.campaign.receipt_outer_evaluation import (
+    ReceiptAwareOuterEvaluationLedger,
+)
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateCampaignResult,
+    CandidateOutcome,
     ExecutableChangeEvidence,
     OuterPromotionRequest,
     ScientificCampaignCancelled,
@@ -105,7 +111,9 @@ from kuairand_agent.campaign.scientific_store import (
     DurableScientificLedgerAdapter,
     TrustedOuterSeedEvidence,
 )
+from kuairand_agent.campaign.scoring_receipts import ScoringReceiptBook
 from kuairand_agent.campaign.selector import (
+    MATERIAL_PRIMARY_DELTA,
     GateEvidence,
     IncumbentEvidence,
     OrganizerMetrics,
@@ -165,6 +173,7 @@ from kuairand_agent.research.production import (
     LiveResearchBranchRejected,
     LiveResearchLineage,
     ScriptedLambdaRankLineage,
+    classify_proposal_family,
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
     prepare_or_rehydrate_scripted_lambdarank_lineage,
@@ -184,6 +193,7 @@ from kuairand_agent.research.provider import (
 from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
     ParentSnapshot,
+    Proposal,
     Reflection,
     ReflectionRequest,
     ResearchOperation,
@@ -713,7 +723,30 @@ def _research_context_evidence(
     features: ProductionFeatureBundle,
 ) -> _ResearchContextEvidence:
     train_positive_count = sum(data.outer_train_labels)
+    train_click_count = sum(data.outer_train_click_labels)
+    train_long_view_and_click_count = sum(
+        long_view & click
+        for long_view, click in zip(
+            data.outer_train_labels,
+            data.outer_train_click_labels,
+            strict=True,
+        )
+    )
     train_count = len(data.outer_train_labels)
+    watch_progress = np.asarray(data.outer_train_watch_progress, dtype=np.float64)
+    long_view_negative_count = train_count - train_positive_count
+    click_negative_count = train_count - train_click_count
+    phi_denominator = math.sqrt(
+        train_positive_count * long_view_negative_count * train_click_count * click_negative_count
+    )
+    long_view_click_phi = (
+        0.0
+        if phi_denominator == 0.0
+        else (
+            train_long_view_and_click_count * train_count - train_positive_count * train_click_count
+        )
+        / phi_denominator
+    )
     return _ResearchContextEvidence(
         capability_manifests=(
             _input_capability_manifest(DataPhase.TRAIN, data.outer_train_inputs),
@@ -729,6 +762,16 @@ def _research_context_evidence(
                     "row_count": train_count,
                     "long_view_positive_count": train_positive_count,
                     "long_view_positive_rate": train_positive_count / train_count,
+                    "click_positive_count": train_click_count,
+                    "click_positive_rate": train_click_count / train_count,
+                    "long_view_and_click_positive_count": train_long_view_and_click_count,
+                    "click_rate_given_long_view": (
+                        train_long_view_and_click_count / train_positive_count
+                    ),
+                    "long_view_click_phi": long_view_click_phi,
+                    "watch_progress_mean": float(np.mean(watch_progress)),
+                    "watch_progress_p50": float(np.quantile(watch_progress, 0.50)),
+                    "watch_progress_p90": float(np.quantile(watch_progress, 0.90)),
                 },
             ),
         ),
@@ -746,6 +789,914 @@ def _research_context_evidence(
                     "fold_b_selected_fusion_only": True,
                     "uses_public_labels_for_features": False,
                     "uses_prediction_period_outcomes": False,
+                },
+            ),
+            AggregateRecord(
+                "input_only_strict_past_exposure",
+                {
+                    "status": "enabled_in_feature_schema_v8",
+                    "feature_positions_zero_based_csv": "83,84,85,86,87,88,89,90,91,92,93,94",
+                    "feature_names_csv": (
+                        "user__strict_earlier_exposure_count,user__first_seen,"
+                        "user__log1p_time_since_last_exposure,"
+                        "video__strict_earlier_exposure_count,video__first_seen,"
+                        "video__log1p_time_since_last_exposure,"
+                        "author__strict_earlier_exposure_count,author__first_seen,"
+                        "author__log1p_time_since_last_exposure,"
+                        "user_video__strict_earlier_exposure_count,user_video__first_seen,"
+                        "user_video__log1p_time_since_last_exposure"
+                    ),
+                    "source_fields_csv": "date,time_ms,user_id,video_id,author_id",
+                    "chronology": "date first, then time_ms; equal timestamp buckets are atomic",
+                    "training_policy": "each row sees only strictly earlier input impressions",
+                    "query_policy": (
+                        "earlier query inputs update later query features; no query outcome is "
+                        "accepted or consulted"
+                    ),
+                    "query_outcomes_accepted_by_interface": False,
+                    "raw_identifiers_exposed_to_candidate": False,
+                },
+            ),
+            AggregateRecord(
+                "generated_model_runtime",
+                {
+                    "numpy_version": np.__version__,
+                    "lightgbm_version": "4.7.0",
+                    "lightgbm_import_allowed": True,
+                    "cpu_threads": 4,
+                    "checkpoint_array_limit": 64,
+                    "checkpoint_numeric_arrays_only": True,
+                },
+            ),
+            AggregateRecord(
+                "causal_feature_semantics",
+                {
+                    "history_scopes_csv": (
+                        "user,video,author,tab,duration_bucket,user_author,user_tab,"
+                        "author_tab,user_duration_bucket"
+                    ),
+                    "columns_per_history_scope_csv": (
+                        "strict_past_exposure,strict_past_positive,smoothed_long_view_rate"
+                    ),
+                    "history_smoothing": 20.0,
+                    "history_initial_prior": 0.5,
+                    "training_history_policy": (
+                        "strictly earlier timestamp buckets only; simultaneous rows never "
+                        "observe one another"
+                    ),
+                    "query_history_policy": (
+                        "outcome-bearing histories are frozen at each temporal-fold training "
+                        "cutoff; only the separate input-only exposure family may update from "
+                        "strictly earlier query inputs"
+                    ),
+                    "recency_companion_scopes_csv": "user,video,user_author",
+                    "recency_companion_columns_csv": ("decayed_exposure,smoothed_long_view_rate"),
+                    "recency_half_life_days_csv": "1,3,7",
+                    "recency_previous_single_half_life_days": 3.0,
+                    "recency_query_policy": (
+                        "decay frozen training state to each query timestamp without updating it"
+                    ),
+                    "recency_search_evidence": (
+                        "single-horizon and 1/3/7-day recency transforms were directionally "
+                        "positive but non-material; do not add more horizons"
+                    ),
+                    "duration_bucket_edges_seconds_csv": "5,10,18,30,60",
+                    "duration_seconds_transform": "duration_ms divided by 1000",
+                    "duration_log_transform": "log1p duration_seconds",
+                    "duration_threshold_transform": "one when duration_seconds is at least 18",
+                    "date_transform": "integer date minus 20220408",
+                    "tab_transform": "numeric tab value as float64",
+                },
+            ),
+            AggregateRecord(
+                "lightgbm_lambdarank_pattern",
+                {
+                    "recommended_use": "first-choice nonlinear grouped ranker over causal features",
+                    "objective": "lambdarank",
+                    "metric": "ndcg",
+                    "label_gain": "0,1",
+                    "eval_at": 5,
+                    "deterministic_cpu": True,
+                    "training_group_contract": (
+                        "stable-sort rows by user_groups and pass contiguous query lengths"
+                    ),
+                    "prediction_group_required": False,
+                    "fixed_tree_count_required": True,
+                    "checkpoint_pattern": (
+                        "encode Booster.model_to_string UTF-8 bytes as a uint8 NumPy array"
+                    ),
+                    "uses_protected_outcomes": False,
+                },
+            ),
+            AggregateRecord(
+                "strict_past_click_history",
+                {
+                    "status": "newly_enabled_after_56_feature_plateau",
+                    "source_target": "official_train_is_click_only",
+                    "history_scopes_csv": "user,video,author,user_author",
+                    "columns_per_scope_csv": (
+                        "strict_past_exposure,strict_past_click_positive,smoothed_click_rate"
+                    ),
+                    "global_feature": "click_global__prior",
+                    "history_smoothing": 20.0,
+                    "training_history_policy": (
+                        "strictly earlier timestamp buckets only; simultaneous rows never "
+                        "observe one another"
+                    ),
+                    "query_history_policy": (
+                        "frozen at each temporal-fold training cutoff; query rows never update "
+                        "history"
+                    ),
+                    "same_row_click_exposed": False,
+                    "uses_late_period_outcomes": False,
+                    "raw_click_target_exposed_to_candidate": False,
+                    "recommended_experiment": (
+                        "measure whether strict-past click propensity and its disagreement with "
+                        "strict-past long_view propensity improve grouped ranking; preserve the "
+                        "official FM control and avoid repeating plateaued recency-only, "
+                        "categorical-only, or unchanged LambdaRank configurations"
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "organizer_fm_categorical_codes",
+                {
+                    "status": "newly_enabled_after_dense_39_feature_plateau",
+                    "feature_names_csv": (
+                        "starter_fm_code__user_id,starter_fm_code__video_id,"
+                        "starter_fm_code__author_id,starter_fm_code__tab,"
+                        "starter_fm_code__dur_bucket"
+                    ),
+                    "field_order_csv": "user_id,video_id,author_id,tab,dur_bucket",
+                    "encoding": (
+                        "exact organizer StarterEncoding global integer IDs represented exactly "
+                        "as float64"
+                    ),
+                    "fit_policy": "fit independently on each exact temporal-fold prefix",
+                    "query_unknown_policy": "one prefix-fitted unknown slot per field",
+                    "candidate_input_policy": (
+                        "candidate receives numeric codes only; raw identifier strings and "
+                        "vocabularies remain controller-private"
+                    ),
+                    "recommended_experiment": (
+                        "test a pairwise or listwise factorization model on these five code "
+                        "columns, optionally using the 39 dense causal companions; do not repeat "
+                        "the official pointwise-logloss FM"
+                    ),
+                    "starter_evidence": (
+                        "the organizer identifies ranking-loss alignment and user history as the "
+                        "highest-priority untested directions after static features and larger "
+                        "FM capacity showed no material gain"
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "trusted_pairwise_fm_reference",
+                {
+                    "status": "inner_fold_verified_not_promoted",
+                    "feature_positions_zero_based_csv": "51,52,53,54,55",
+                    "feature_names_csv": (
+                        "starter_fm_code__user_id,starter_fm_code__video_id,"
+                        "starter_fm_code__author_id,starter_fm_code__tab,"
+                        "starter_fm_code__dur_bucket"
+                    ),
+                    "mechanism": (
+                        "five-field float32 factorization machine trained with logged "
+                        "same-user pairwise logistic comparisons"
+                    ),
+                    "sampler": (
+                        "uniform positive row among eligible users, then one observed negative "
+                        "row from the same user"
+                    ),
+                    "factor_dim": 16,
+                    "learning_rate": 0.001,
+                    "l2": 0.000001,
+                    "batch_size": 8192,
+                    "pairs_per_epoch": 250000,
+                    "epochs": 5,
+                    "seed": 20260830,
+                    "fold_b_raw_primary": 0.574186444,
+                    "fold_b_fused_primary": 0.5763888955116272,
+                    "fold_b_control_primary": 0.5754240155220032,
+                    "fold_b_primary_delta": 0.000964879989624,
+                    "frozen_candidate_weight": 0.4,
+                    "frozen_control_weight": 0.6,
+                    "fold_a_raw_primary": 0.6072738766670227,
+                    "fold_a_fused_primary": 0.6081787347793579,
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "fold_a_primary_delta": 0.0010496973991394,
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "this is the strongest directionally consistent unpromoted mechanism. "
+                        "If testing it, implement the exact organizer categorical-code FM and "
+                        "GAUC-aligned logged same-user sampler, preserve the official FM control, "
+                        "and seek a substantive complement rather than merely retuning the same "
+                        "six fixed hyperparameters"
+                    ),
+                    "uses_public_labels_for_tuning": False,
+                },
+            ),
+            AggregateRecord(
+                "protected_candidate_pairwise_fm_primitive",
+                {
+                    "status": "available_video_type_expansion_requires_fresh_train_fold_ablation",
+                    "protected_path": "reference_pairwise_fm.py",
+                    "train_function": (
+                        "train_reference_pairwise_fm(features, targets, user_groups, *, seed)"
+                    ),
+                    "predict_function": ("reference_pairwise_fm_scores(features, checkpoint)"),
+                    "diagnostics_function": "reference_pairwise_fm_diagnostics(checkpoint)",
+                    "pair_sampler_function": (
+                        "sample_reference_logged_pairs(user_groups, targets, *, pair_count, seed)"
+                    ),
+                    "checkpoint_prefix": "reference_",
+                    "feature_positions_zero_based_csv": "51,52,53,54,55",
+                    "sampler": (
+                        "positive-ticket sampling: each eligible logged positive has equal "
+                        "probability, then one logged negative is drawn from the same user"
+                    ),
+                    "encoding": "unmodified prefix-fitted organizer global integer codes",
+                    "numeric_recipe": (
+                        "float32 five-field FM reductions and dense Adam with the exact frozen "
+                        "trusted_pairwise_fm_reference configuration"
+                    ),
+                    "composition_policy": (
+                        "generated model_impl.py may import the primitive and compose a new "
+                        "residual, calibration, or ensemble around its score; it must retain all "
+                        "reference_* checkpoint arrays, must use the protected sampler for every "
+                        "new pairwise objective, and must not reimplement group offsets, row-index "
+                        "maps, pair sampling, or the primitive"
+                    ),
+                    "protected_from_generated_overlay": True,
+                    "metric_or_scorer_access": False,
+                },
+            ),
+            AggregateRecord(
+                "protected_duration_conditioned_pair_ablation",
+                {
+                    "status": (
+                        "implemented_full_budget_train_only_positive_mean_but_not_promotion_ready"
+                    ),
+                    "protected_paths_csv": (
+                        "reference_observed_pair_objectives.py,reference_observed_pair_fm.py"
+                    ),
+                    "control_train_function": (
+                        "train_reference_uniform_pairwise_fm(features, targets, user_groups, "
+                        "*, seed)"
+                    ),
+                    "treatment_train_function": (
+                        "train_reference_duration_pairwise_fm(features, targets, user_groups, "
+                        "*, seed)"
+                    ),
+                    "predict_function": (
+                        "reference_observed_pair_fm_scores(features, checkpoint)"
+                    ),
+                    "duration_feature_position_zero_based": 46,
+                    "duration_bucket_edges_seconds_csv": "5,10,18,30,60",
+                    "treatment_pair_policy": (
+                        "exactly half uniform logged same-user pairs and half logged same-user "
+                        "positive-negative pairs constrained to the same duration bucket"
+                    ),
+                    "control_admission": (
+                        "uniform arm model-state arrays are byte-exact to the protected "
+                        "reference pairwise FM at equal seed and budget"
+                    ),
+                    "equal_compute_budget": True,
+                    "prediction_accepts_targets_or_groups": False,
+                    "full_budget_replicate_seeds_csv": "0,1,2",
+                    "full_budget_replicate_folds_csv": "A,B",
+                    "full_budget_mean_primary_delta_vs_uniform": 0.0007370909,
+                    "full_budget_worst_primary_delta_vs_uniform": -0.0001828671,
+                    "full_budget_decision": (
+                        "retain as experimental specialist only: positive mean evidence did not "
+                        "pass the worst-cell robustness gate"
+                    ),
+                    "evidence_report": (
+                        "docs/research/observed_pair_duration_pilot-20260830.md"
+                    ),
+                    "protected_from_generated_overlay": True,
+                },
+            ),
+            AggregateRecord(
+                "strict_past_watch_progress_history",
+                {
+                    "status": "newly_enabled_after_69_feature_click_history_plateau",
+                    "source_target": "official_train_play_time_ms_only",
+                    "history_scopes_csv": "user,video,author,user_author",
+                    "columns_per_scope_csv": (
+                        "strict_past_exposure,strict_past_progress_sum,smoothed_progress_mean"
+                    ),
+                    "global_feature": "watch_global__mean",
+                    "transform": ("clip(play_time_ms / max(min(duration_ms, 18000), 1), 0, 2)"),
+                    "history_smoothing": 20.0,
+                    "training_history_policy": (
+                        "strictly earlier timestamp buckets only; simultaneous rows never "
+                        "observe one another"
+                    ),
+                    "query_history_policy": (
+                        "frozen at each temporal-fold training cutoff; query rows never update "
+                        "history"
+                    ),
+                    "same_row_play_time_exposed": False,
+                    "uses_late_period_outcomes": False,
+                    "raw_play_time_target_exposed_to_candidate": False,
+                    "recommended_experiment": (
+                        "test whether graded prior threshold progress complements binary "
+                        "long_view and click histories, especially through scope disagreement "
+                        "and reliability; do not repeat the exact 69-feature models"
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_33_feature_lambdarank_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "configuration": (
+                        "300 trees, learning_rate 0.05, num_leaves 31, min_data_in_leaf 20, "
+                        "lambdarank with deterministic CPU"
+                    ),
+                    "fold_b_fused_primary": 0.5756440162658691,
+                    "fold_b_control_primary": 0.5754240304231644,
+                    "fold_a_fused_primary": 0.6074154376983643,
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "selected_generated_weight": 0.25,
+                    "selected_control_weight": 0.75,
+                    "matched_seed_mean_primary_delta": 0.000042249759038289384,
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "do not repeat unchanged 33-feature LambdaRank; test the new recency "
+                        "companions or another substantively different representation"
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_39_feature_campaign_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "representation": "39 dense causal aggregate, recency, and static features",
+                    "fold_b_control_primary": 0.5754240304231644,
+                    "recency_lambdarank_generated_primary": 0.5682356506586075,
+                    "recency_lambdarank_fused_primary": 0.5756224244832993,
+                    "pointwise_gbdt_generated_primary": 0.5702996104955673,
+                    "pointwise_gbdt_fused_primary": 0.5757940411567688,
+                    "pairwise_dense_mlp_selected_primary": 0.5754240304231644,
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "do not repeat listwise trees, pointwise trees, or dense-only MLPs on the "
+                        "39-feature representation; use the newly enabled organizer FM categorical "
+                        "codes to test ranking-loss alignment on the actual interaction backbone"
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_44_feature_campaign_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "representation": (
+                        "39 dense causal companions plus five prefix-fitted organizer FM codes"
+                    ),
+                    "fold_b_control_primary": 0.5754240304231644,
+                    "pairwise_code_fm_generated_primary": 0.5073919147253036,
+                    "pairwise_code_fm_selected_primary": 0.5754240304231644,
+                    "categorical_lambdarank_generated_primary": 0.5730865746736526,
+                    "categorical_lambdarank_fused_primary": 0.5755051374435425,
+                    "categorical_lambdarank_fold_a_fused_primary": 0.6081618070602417,
+                    "categorical_lambdarank_fold_a_control_primary": 0.6071290373802185,
+                    "deep_categorical_fold_a_fused_primary": 0.6076992154121399,
+                    "fieldaware_listwise_fold_a_fused_primary": 0.6077238321304321,
+                    "native_categorical_fold_a_fused_primary": 0.6073779463768005,
+                    "history_reliability_lambdarank_evaluated": False,
+                    "history_reliability_skip_reason": (
+                        "the former loss-only novelty key incorrectly blocked this distinct "
+                        "representation; the mechanism-axis guard now permits it"
+                    ),
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "the exact pairwise-code FM, categorical LambdaRank, and shallow "
+                        "DeepFM-style, field-aware listwise, and native-categorical tree "
+                        "configurations were non-material; categorical LambdaRank was "
+                        "directionally positive on Fold A but nearly neutral on Fold B. Do not "
+                        "repeat those exact configurations. Preserve the FM control and "
+                        "prioritize the not-yet-evaluated exposure-reliability and "
+                        "cross-scope-disagreement strict-past history representation."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_56_feature_campaign_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "representation": (
+                        "44-feature causal/categorical bundle plus 1-day, 3-day, and 7-day "
+                        "strict-past recency horizons"
+                    ),
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "history_reliability_fold_a_fused_primary": 0.6076365411281586,
+                    "deepfm_pairwise_fold_a_fused_primary": 0.60727858543396,
+                    "multihorizon_pointwise_gbdt_fold_a_fused_primary": 0.6073309183120728,
+                    "best_primary_delta": 0.0005075037479400635,
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "multi-horizon long_view recency remained directionally positive but "
+                        "non-material. Do not add more recency horizons or repeat those exact "
+                        "models; test the newly available, causally isolated click-history "
+                        "signal and long_view-versus-click reliability disagreement."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_69_feature_campaign_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "representation": (
+                        "56-feature causal/recency/categorical bundle plus 13 strict-past "
+                        "click-history columns"
+                    ),
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "click_lambdarank_fold_a_fused_primary": 0.607760101556778,
+                    "click_lambdarank_primary_delta": 0.0006310641765595,
+                    "click_anchored_gbdt_fold_a_fused_primary": 0.6078385412693024,
+                    "click_anchored_gbdt_primary_delta": 0.0007095038890839,
+                    "click_pairwise_mlp_fold_b_selected_primary": 0.5754240304231644,
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "strict-past click histories were consistently directionally positive "
+                        "for two tree mechanisms but non-material, while the pairwise MLP added "
+                        "zero selected contribution. Do not repeat those exact models. Test the "
+                        "new graded watch-progress histories as a richer causal representation."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_82_feature_campaign_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "representation": (
+                        "69-feature causal/click/categorical bundle plus 13 strict-past graded "
+                        "watch-progress columns"
+                    ),
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "watch_lambdarank_fold_a_fused_primary": 0.6071290373802185,
+                    "watch_reliability_candidate_status": (
+                        "candidate-local invalid-derived-feature failure; campaign recovered"
+                    ),
+                    "watch_pairwise_fold_b_selected_primary": 0.5754240304231644,
+                    "material_threshold": 0.002,
+                    "scientific_conclusion": (
+                        "the exact watch-progress LambdaRank and pairwise-bilinear candidates "
+                        "added zero selected contribution. Do not repeat them. Use the verified "
+                        "five-field pairwise FM reference as the next interaction backbone and "
+                        "treat watch progress only as an optional complement."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_10_composition_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "pairwise_fm_composite_fold_b_fused_primary": 0.5755205452442169,
+                    "pairwise_fm_composite_fold_b_control_primary": 0.5754240304231644,
+                    "pairwise_fm_composite_selected_generated_weight": 0.2,
+                    "pairwise_fm_composite_fold_a_fused_primary": 0.6077823042869568,
+                    "user_balanced_dart_fold_b_fused_primary": 0.5754691958427429,
+                    "user_balanced_dart_fold_a_fused_primary": 0.6071479320526123,
+                    "query_balanced_xendcg_fold_b_fused_primary": 0.5754531174898148,
+                    "query_balanced_xendcg_fold_a_fused_primary": 0.6071521937847137,
+                    "material_threshold": 0.002,
+                    "diagnosed_pairwise_reimplementation_drift": (
+                        "the generated pairwise helper sampled eligible users uniformly, "
+                        "remapped organizer codes locally, and used plain SGD; the verified "
+                        "reference uses positive-ticket sampling, unmodified global codes, and "
+                        "dense Adam"
+                    ),
+                    "scientific_conclusion": (
+                        "do not repeat these three exact candidates. Their result does not "
+                        "falsify the protected exact pairwise-FM primitive. Reuse that immutable "
+                        "primitive directly, first as an exact standalone score and then only "
+                        "with a genuinely complementary composition whose ablation preserves the "
+                        "reference signal."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_11_exact_reference_result",
+                {
+                    "status": "completed_and_retained_as_specialist_before_this_campaign",
+                    "fold_b_generated_only_primary": 0.5741864740848541,
+                    "fold_b_selected_primary": 0.5763889104127884,
+                    "fold_b_control_primary": 0.5754240304231644,
+                    "fold_b_selected_generated_weight": 0.4,
+                    "fold_b_selected_control_weight": 0.6,
+                    "fold_a_selected_primary": 0.6081787645816803,
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "best_primary_delta": 0.0010497272014618,
+                    "material_threshold": 0.002,
+                    "primitive_implementation_exact": True,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "the autonomous campaign has already reproduced the immutable exact "
+                        "pairwise-FM specialist. Do not repeat it standalone. Preserve its "
+                        "reference_* state and score while testing one genuinely complementary "
+                        "listwise, neural, or pointwise composition."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "protected_candidate_categorical_ranker_primitive",
+                {
+                    "status": "available_and_immutable_in_candidate_parent",
+                    "protected_path": "reference_categorical_ranker.py",
+                    "train_function": (
+                        "train_reference_categorical_ranker(features, targets, user_groups, "
+                        "*, seed)"
+                    ),
+                    "predict_function": (
+                        "reference_categorical_ranker_scores(features, checkpoint)"
+                    ),
+                    "diagnostics_function": (
+                        "reference_categorical_ranker_diagnostics(checkpoint)"
+                    ),
+                    "checkpoint_prefixes_csv": "reference_,categorical_rank_",
+                    "mechanism": (
+                        "exact protected pairwise FM plus native-categorical LightGBM "
+                        "LambdaRank over positions 0 through 82"
+                    ),
+                    "feature_count": 83,
+                    "categorical_feature_positions_zero_based_csv": "51,52,53,54,55,82",
+                    "historical_metrics_apply_to": "legacy first-82 predecessor only",
+                    "current_83_column_fold_evidence": "not yet measured",
+                    "tree_count": 300,
+                    "learning_rate": 0.05,
+                    "num_leaves": 63,
+                    "min_data_in_leaf": 200,
+                    "lambdarank_truncation_level": 8,
+                    "tree_score_scale": 0.2,
+                    "fold_b_generated_only_primary": 0.5747565031051636,
+                    "fold_b_selected_primary": 0.5769727230072021,
+                    "fold_b_control_primary": 0.5754240155220032,
+                    "fold_b_selected_generated_weight": 0.45,
+                    "fold_b_selected_control_weight": 0.55,
+                    "fold_b_primary_delta": 0.0015487074851989,
+                    "fold_a_generated_only_primary": 0.607783854007721,
+                    "fold_a_frozen_fusion_primary": 0.608400821685791,
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "fold_a_primary_delta": 0.0012717843055725,
+                    "material_threshold": 0.002,
+                    "uses_public_labels_for_tuning": False,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "the recorded scores describe the legacy first-82 predecessor, not the "
+                        "current video_type-aware expansion. Evaluate the current 83-column arm "
+                        "against the byte-preserved legacy or official-FM control on both "
+                        "train-derived folds before using it in any deployable portfolio."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_12_composition_result",
+                {
+                    "status": "completed_and_plateaued_before_this_campaign",
+                    "listwise_composition_fold_b_selected_primary": 0.5764372497797012,
+                    "listwise_composition_fold_a_frozen_primary": 0.608370840549469,
+                    "hardness_pointwise_fold_b_selected_primary": 0.5755130499601364,
+                    "hardness_pointwise_fold_a_frozen_primary": 0.607568770647049,
+                    "neural_ranknet_execution_failure": (
+                        "Adam moment shape (64,1) did not match gradient shape (128,1)"
+                    ),
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "do not repeat the exact conditional LambdaRank or hardness-weighted "
+                        "pointwise compositions. The neural mechanism was not scientifically "
+                        "falsified because its implementation failed before evaluation; any "
+                        "neural successor must use shape-derived optimizer state and retain the "
+                        "protected categorical ranker."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_14_composition_result",
+                {
+                    "status": "completed_with_three_valid_nonmaterial_trials",
+                    "shape_safe_pairwise_neural_fold_b_selected_primary": 0.5759039670228958,
+                    "shape_safe_pairwise_neural_fold_a_frozen_primary": 0.6082998812198639,
+                    "user_balanced_listnet_fold_b_selected_primary": 0.5770719051361084,
+                    "user_balanced_listnet_fold_b_control_primary": 0.5754240304231644,
+                    "user_balanced_listnet_fold_b_primary_delta": 0.001647874712944,
+                    "user_balanced_listnet_fold_a_frozen_primary": 0.6086478531360626,
+                    "user_balanced_listnet_fold_a_control_primary": 0.6071290373802185,
+                    "user_balanced_listnet_fold_a_primary_delta": 0.0015188157558441,
+                    "pointwise_offset_fold_b_selected_primary": 0.5773457437753677,
+                    "pointwise_offset_fold_b_primary_delta": 0.0019217133522033,
+                    "pointwise_offset_fold_a_frozen_primary": 0.6081205904483795,
+                    "pointwise_offset_fold_a_primary_delta": 0.000991553068161,
+                    "material_threshold": 0.002,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "retain the user-balanced ListNet composition because it was strongest "
+                        "across both temporal folds. Do not repeat these three exact candidates. "
+                        "Compose a genuinely distinct mechanism around the protected ListNet "
+                        "score, prioritizing a gain consistent on both folds rather than the "
+                        "pointwise candidate's larger Fold-B-only result."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_15_listnet_residual_plateau",
+                {
+                    "status": "completed_with_three_valid_nonmaterial_trials",
+                    "gated_pairwise_fold_b_primary_delta": 0.0008881092071533,
+                    "gated_pairwise_fold_a_primary_delta": 0.0015944838523865,
+                    "deep_cross_fold_b_primary_delta": 0.0016001611948013,
+                    "deep_cross_fold_a_primary_delta": 0.0016562640666962,
+                    "denoising_listmle_fold_b_primary_delta": 0.0016210377216339,
+                    "denoising_listmle_fold_a_primary_delta": 0.0015794038772583,
+                    "material_threshold": 0.002,
+                    "execution_failures": 0,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "three additional neural heads around the protected ListNet backbone "
+                        "converged to the same sub-material band. Do not spend another trial on "
+                        "a renamed MLP, deeper cross network, denoising head, pairwise residual, "
+                        "or listwise residual unless the proposal identifies a genuinely new "
+                        "ranking signal and an ablation that isolates it."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "train_only_static_metadata_probe_result",
+                {
+                    "status": "video_type_enabled_after_bounded_portfolio_confirmation",
+                    "backbone": (
+                        "protected user-balanced ListNet plus one fixed LambdaRank residual"
+                    ),
+                    "video_type_fold_b_primary_delta": 0.0017284750938416,
+                    "video_type_fold_a_frozen_primary_delta": 0.0018436312675476,
+                    "upload_type_fold_b_primary_delta": 0.001442015171051,
+                    "upload_type_fold_a_frozen_primary_delta": 0.0019646286964417,
+                    "music_type_fold_b_primary_delta": 0.0014432668685913,
+                    "music_type_fold_a_frozen_primary_delta": 0.0017603039741516,
+                    "tag_fold_b_primary_delta": 0.0012959837913513,
+                    "tag_fold_a_frozen_primary_delta": 0.0017802119255066,
+                    "upload_age_fold_b_primary_delta": 0.0016232132911682,
+                    "upload_age_fold_a_frozen_primary_delta": 0.001731276512146,
+                    "server_height_fold_b_primary_delta": 0.0015340447425842,
+                    "server_height_fold_a_frozen_primary_delta": 0.0018971562385559,
+                    "material_threshold": 0.002,
+                    "public_validation_used": False,
+                    "outer_query_used": False,
+                    "production_schema_changed": True,
+                    "enabled_feature_name": "video_type_code",
+                    "enabled_feature_position_zero_based": 82,
+                    "enabled_feature_encoding": (
+                        "lexical categories fit on each exact temporal-fold prefix; zero is the "
+                        "query unknown slot"
+                    ),
+                    "other_five_fields_enabled": False,
+                    "scientific_conclusion": (
+                        "no single field cleared materiality alone, but video_type was the most "
+                        "cross-fold-stable field and was the only member that complemented the "
+                        "strongest pointwise ranker to the material boundary. Only its encoded "
+                        "column is now present; the other side fields, snapshots, and outcome "
+                        "statistics remain disabled."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_16_distinct_signal_result",
+                {
+                    "status": "completed_with_three_valid_nonmaterial_trials",
+                    "watch_reliability_fold_b_primary_delta": 0.0016452074050903,
+                    "watch_reliability_fold_a_primary_delta": 0.001433253288269,
+                    "objective_disagreement_fold_b_primary_delta": 0.0017493963241577,
+                    "objective_disagreement_fold_a_primary_delta": 0.0016002058982849,
+                    "lightgcn_fold_b_primary_delta": 0.0010381191968918,
+                    "lightgcn_fold_a_primary_delta": 0.0018841922283173,
+                    "three_way_fold_b_selected_disagreement_weight": 0.45,
+                    "three_way_fold_b_selected_lightgcn_weight": 0.0,
+                    "three_way_fold_b_selected_control_weight": 0.55,
+                    "malformed_implementation_retries": 1,
+                    "execution_failures": 0,
+                    "material_threshold": 0.002,
+                    "public_validation_used": False,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "watch-reliability and protected-specialist disagreement remained in "
+                        "the same sub-material band as earlier residual heads. The LightGCN "
+                        "branch was weaker on Fold B, and a bounded three-way ensemble assigned "
+                        "it zero weight. Do not repeat these exact branches or another generic "
+                        "residual around the protected ListNet backbone."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_17_listnet_composition_result",
+                {
+                    "status": "completed_with_three_valid_nonmaterial_trials",
+                    "tab_context_fold_b_primary_delta": 0.0012983679771423,
+                    "tab_context_fold_a_primary_delta": 0.0016146004199982,
+                    "causal_manifold_fold_b_primary_delta": 0.0015360713005066,
+                    "causal_manifold_fold_a_primary_delta": 0.0016940832138062,
+                    "temporal_localization_fold_b_primary_delta": 0.001493752002716,
+                    "temporal_localization_fold_a_primary_delta": 0.0013605654239655,
+                    "execution_failures": 0,
+                    "malformed_retries": 0,
+                    "material_threshold": 0.002,
+                    "public_validation_used": False,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "three more contextual, manifold, and temporally weighted residuals "
+                        "around the protected ListNet score remained sub-material. The next "
+                        "portfolio must prioritize a standalone independently trained ranker "
+                        "rather than another additive or gated ListNet composition."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_18_standalone_result",
+                {
+                    "status": "completed_with_three_valid_nonmaterial_trials",
+                    "query_set_attention_fold_b_primary_delta": 0.0,
+                    "query_set_attention_fold_a_primary_delta": 0.0,
+                    "pairwise_leaf_region_fold_b_primary_delta": 0.0000923871994019,
+                    "pairwise_leaf_region_fold_a_primary_delta": 0.0003617405891418,
+                    "dcnv2_fold_b_primary_delta": 0.0001070499420166,
+                    "dcnv2_fold_a_primary_delta": 0.0000415444374084,
+                    "execution_failures": 0,
+                    "malformed_retries": 0,
+                    "material_threshold": 0.002,
+                    "public_validation_used": False,
+                    "outer_query_used": False,
+                    "scientific_conclusion": (
+                        "the three standalone 82-column mechanisms were substantially weaker "
+                        "than retained residual specialists. Do not repeat them now that the "
+                        "new video_type_code signal is available at column 82."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "train_only_candidate_portfolio_result",
+                {
+                    "status": "video_type_is_the_only_supported_new_portfolio_member",
+                    "candidate_count": 16,
+                    "pointwise_video_type_control_weights_csv": "0.15,0.30,0.55",
+                    "pointwise_video_type_fold_b_primary_delta": 0.0020057559013367,
+                    "pointwise_video_type_fold_a_frozen_primary_delta": 0.0019877552986145,
+                    "best_other_pair_fold_b_primary_delta": 0.0018074512481689,
+                    "best_other_pair_fold_a_primary_delta": 0.0016923546791077,
+                    "six_field_metadata_bundle_fold_b_primary_delta": 0.0015469193458557,
+                    "six_field_metadata_bundle_fold_a_primary_delta": 0.0017505288124084,
+                    "public_validation_used": False,
+                    "outer_query_used": False,
+                    "recommended_experiment": (
+                        "use video_type_code in one ablated grouped-ranking mechanism that "
+                        "preserves the first 82 columns and tests complementarity with a strong "
+                        "pointwise or protected-specialist score; do not add the other five "
+                        "metadata fields and do not repeat an 82-column standalone model"
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_20_video_type_result",
+                {
+                    "status": "completed_with_one_valid_trial_and_two_candidate_local_failures",
+                    "valid_grouped_calibrator_fold_b_primary_delta": 0.0014815777540207,
+                    "valid_grouped_calibrator_fold_a_primary_delta": 0.0012162327766419,
+                    "fieldaware_pairwise_failure": (
+                        "prediction derived categorical table sizes from training maxima and "
+                        "rejected a legal reserved query unknown code"
+                    ),
+                    "pointwise_reliability_failure": (
+                        "helper projected 32 compact columns then reused absolute feature "
+                        "positions 32, 35, and 38 against that local matrix"
+                    ),
+                    "outer_query_used": False,
+                    "public_validation_used": False,
+                    "scientific_conclusion": (
+                        "the grouped categorical-specialist calibration was valid but weaker "
+                        "than the prior pointwise-plus-video_type portfolio evidence. The two "
+                        "candidate-local failures did not test their scientific mechanisms. "
+                        "Repair reserved-unknown handling and projection-local indexing rather "
+                        "than treating either mechanism as falsified; prioritize a pointwise "
+                        "and video_type composition for the next valid trial."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "historical_attempt_21_repaired_video_type_result",
+                {
+                    "status": "completed_with_three_valid_nonmaterial_trials",
+                    "pointwise_reliability_fold_b_primary_delta": 0.0003320574760437,
+                    "pointwise_reliability_fold_a_primary_delta": 0.0005849897861481,
+                    "fieldaware_pairwise_fold_b_primary_delta": 0.0,
+                    "fieldaware_pairwise_selected_generated_weight": 0.0,
+                    "lambdarank_video_type_fold_b_primary_delta": 0.0001890808343887,
+                    "lambdarank_video_type_fold_a_primary_delta": 0.0005322396755219,
+                    "execution_failures": 0,
+                    "malformed_retries": 0,
+                    "outer_query_used": False,
+                    "public_validation_used": False,
+                    "scientific_conclusion": (
+                        "the two Attempt-20 execution mechanisms were repaired and all three "
+                        "trials completed reproducibly, but none approached materiality. The "
+                        "reserved-unknown and projection-local fixes are now verified. Do not "
+                        "repeat these exact reliability, field-aware pairwise, or standalone "
+                        "LambdaRank mechanisms; use the protected Attempt-14 pointwise score "
+                        "for the evidence-backed three-way video_type portfolio instead."
+                    ),
+                },
+            ),
+            AggregateRecord(
+                "protected_candidate_pointwise_ranker_primitive",
+                {
+                    "status": "available_and_immutable_in_candidate_parent",
+                    "protected_path": "reference_pointwise_ranker.py",
+                    "train_function": (
+                        "train_reference_pointwise_ranker(features, targets, user_groups, *, seed)"
+                    ),
+                    "predict_function": (
+                        "reference_pointwise_ranker_scores(features, checkpoint)"
+                    ),
+                    "diagnostics_function": (
+                        "reference_pointwise_ranker_diagnostics(checkpoint)"
+                    ),
+                    "checkpoint_prefixes_csv": "reference_,categorical_rank_,pointwise_",
+                    "frozen_input_slice": "features[:, :82]",
+                    "nested_categorical_video_type_policy": "neutral zero column",
+                    "mechanism": (
+                        "exact protected categorical ranker plus the frozen query-balanced "
+                        "pointwise neural correction retained from Attempt 14"
+                    ),
+                    "hidden_widths_csv": "256,64",
+                    "epochs": 3,
+                    "batch_size": 4096,
+                    "learning_rate": 0.001,
+                    "weight_decay": 0.00001,
+                    "score_scale": 0.5,
+                    "fold_b_selected_primary": 0.5773457437753677,
+                    "fold_b_control_primary": 0.5754240304231644,
+                    "fold_b_primary_delta": 0.0019217133522033,
+                    "fold_a_frozen_primary": 0.6081205904483795,
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "fold_a_primary_delta": 0.000991553068161,
+                    "reviewed_video_type_portfolio_weights_csv": "0.15,0.30,0.55",
+                    "reviewed_video_type_portfolio_fold_b_delta": 0.0020057559013367,
+                    "reviewed_video_type_portfolio_fold_a_delta": 0.0019877552986145,
+                    "material_threshold": 0.002,
+                    "uses_public_labels_for_tuning": False,
+                    "outer_query_used": False,
+                    "composition_policy": (
+                        "generated model_impl.py should import this exact specialist and add one "
+                        "isolated video_type_code mechanism; it must retain all protected state "
+                        "and must not reimplement or retune the pointwise composition"
+                    ),
+                    "protected_from_generated_overlay": True,
+                    "metric_or_scorer_access": False,
+                },
+            ),
+            AggregateRecord(
+                "protected_candidate_listnet_ranker_primitive",
+                {
+                    "status": "available_and_immutable_in_candidate_parent",
+                    "protected_path": "reference_listnet_ranker.py",
+                    "train_function": (
+                        "train_reference_listnet_ranker(features, targets, user_groups, *, seed)"
+                    ),
+                    "predict_function": "reference_listnet_ranker_scores(features, checkpoint)",
+                    "diagnostics_function": (
+                        "reference_listnet_ranker_diagnostics(checkpoint)"
+                    ),
+                    "checkpoint_prefixes_csv": "reference_,categorical_rank_,listwise_",
+                    "frozen_input_slice": "features[:, :82]",
+                    "nested_categorical_video_type_policy": "neutral zero column",
+                    "mechanism": (
+                        "exact protected pairwise FM and native-categorical LambdaRank plus an "
+                        "equally user-weighted complete-query ListNet neural composition"
+                    ),
+                    "hidden_widths_csv": "192,64",
+                    "epochs": 8,
+                    "learning_rate": 0.001,
+                    "weight_decay": 0.00001,
+                    "query_batch_size": 128,
+                    "score_scale": 0.15,
+                    "fold_b_selected_primary": 0.5770719051361084,
+                    "fold_b_control_primary": 0.5754240304231644,
+                    "fold_b_selected_generated_weight": 0.45,
+                    "fold_b_selected_control_weight": 0.55,
+                    "fold_b_primary_delta": 0.001647874712944,
+                    "fold_a_frozen_primary": 0.6086478531360626,
+                    "fold_a_control_primary": 0.6071290373802185,
+                    "fold_a_primary_delta": 0.0015188157558441,
+                    "material_threshold": 0.002,
+                    "uses_public_labels_for_tuning": False,
+                    "outer_query_used": False,
+                    "composition_policy": (
+                        "generated model_impl.py may import this specialist and compose a new "
+                        "mechanism around its score; it must retain all reference_*, "
+                        "categorical_rank_*, and listwise_* arrays and must not reimplement or "
+                        "retune the protected composition"
+                    ),
+                    "protected_from_generated_overlay": True,
+                    "metric_or_scorer_access": False,
                 },
             ),
         ),
@@ -834,6 +1785,7 @@ class _ScientificRuntime:
     fold_a_scorer: FoldScoringContext
     fold_b_scorer: FoldScoringContext
     outer_scorer: _ProtectedTierScorer
+    outer_admission: ReceiptAwareOuterEvaluationLedger | None
     qualification: OfficialFMQualificationEvidence
     repository: FileScientificRunEvidenceRepository
     evidence_registry: dict[tuple[str, int], TrustedOuterSeedEvidence]
@@ -978,7 +1930,24 @@ class _ScientificRuntime:
             alignment_digest = context.query_alignment_digest
             rows = context.row_count
         else:
-            callback = cast(ProtectedScoreCallback, self.outer_scorer.score)
+            if self.outer_admission is None:
+                raise FullCampaignError("outer scoring requires lazy receipt-aware admission")
+            promotion = self._promotion_request()
+            admission = self.outer_admission
+            protected = self.outer_scorer.score
+            users = len(set(self.outer_scorer.alignment.user_ids))
+
+            def score_outer(scores: npt.NDArray[np.float64]) -> ScoreResult:
+                return admission.score(
+                    request=promotion,
+                    seed=request.seed,
+                    scores=scores,
+                    users=users,
+                    rows=len(self.outer_scorer.labels),
+                    protected_callback=protected,
+                )
+
+            callback = cast(ProtectedScoreCallback, score_outer)
             alignment_digest = self.outer_scorer.alignment.digest
             rows = len(self.outer_scorer.labels)
         return ProtectedScoringCapability(
@@ -989,6 +1958,24 @@ class _ScientificRuntime:
             alignment_digest=alignment_digest,
             row_count=rows,
             callback=callback,
+        )
+
+    def _promotion_request(self) -> OuterPromotionRequest:
+        return OuterPromotionRequest(
+            campaign_digest=self.config.campaign_digest,
+            candidate_id=self.candidate.candidate_id,
+            candidate_fingerprint=self.candidate.fingerprint,
+            source_digest=self.candidate.source_digest,
+            parent_source_digest=self.candidate.parent_source_digest,
+            executable_diff_digest=self.candidate.executable_change.executable_diff_digest,
+            material_change_digest=self.candidate.executable_change.digest,
+            controller_attestation_digest=(
+                self.candidate.executable_change.controller_attestation_digest
+            ),
+            benchmark_digest=self.config.benchmark_digest,
+            dataset_digest=self.config.dataset_digest,
+            scorer_digest=self.config.scorer_digest,
+            training_policy_digest=self.candidate.training_policy_digest,
         )
 
     def __call__(self, request: ScientificRunRequest) -> ScientificRunEvidence:
@@ -1023,30 +2010,20 @@ class _ScientificRuntime:
             raise FullCampaignError("generated scientific record was not durably committed")
         self.records[(request.tier, request.seed)] = record
         if request.tier is ScientificTier.OUTER_MATCHED_SEED:
-            promotion = OuterPromotionRequest(
-                campaign_digest=self.config.campaign_digest,
-                candidate_id=self.candidate.candidate_id,
-                candidate_fingerprint=self.candidate.fingerprint,
-                source_digest=self.candidate.source_digest,
-                parent_source_digest=self.candidate.parent_source_digest,
-                executable_diff_digest=self.candidate.executable_change.executable_diff_digest,
-                material_change_digest=self.candidate.executable_change.digest,
-                controller_attestation_digest=(
-                    self.candidate.executable_change.controller_attestation_digest
-                ),
-                benchmark_digest=self.config.benchmark_digest,
-                dataset_digest=self.config.dataset_digest,
-                scorer_digest=self.config.scorer_digest,
-                training_policy_digest=self.candidate.training_policy_digest,
-            )
+            promotion = self._promotion_request()
             if evidence.metrics is None:
                 raise FullCampaignError("outer generated run lacks protected aggregate metrics")
+            receipt = (
+                None
+                if self.outer_admission is None
+                else self.outer_admission.receipt_for(promotion.digest, request.seed)
+            )
             trusted = TrustedOuterSeedEvidence(
                 request_digest=promotion.digest,
                 seed=request.seed,
                 metrics=evidence.metrics,
                 prediction_digest=record.scored_prediction_digest,
-                score_evidence_digest=evidence.digest,
+                score_evidence_digest=(evidence.digest if receipt is None else receipt.digest),
             )
             key = (promotion.digest, request.seed)
             prior = self.evidence_registry.get(key)
@@ -1054,6 +2031,64 @@ class _ScientificRuntime:
                 raise FullCampaignError("outer trusted evidence retry is contradictory")
             self.evidence_registry[key] = trusted
         return evidence
+
+
+def _candidate_artifact_clears_deployment_gate(
+    *,
+    result: ScientificCampaignResult,
+    candidate_result: CandidateCampaignResult,
+    representative_record: GeneratedScientificRunRecord,
+    qualification: OfficialFMQualificationEvidence,
+) -> bool:
+    """Require the exact seed-0 artifact to materially beat immutable seed 4.
+
+    Scientific selection remains a matched-seed mean decision.  Finalization is deliberately
+    more conservative because it deploys one concrete representative artifact, not that mean.
+    Any disagreement among the scientific result, its retained run evidence, and the immutable
+    fallback identity therefore rejects deployment without changing the research incumbent.
+    """
+
+    candidate_id = candidate_result.candidate.candidate_id
+    selection = candidate_result.selection
+    fallback = qualification.fallback
+    if (
+        candidate_result.outcome is not CandidateOutcome.PROMOTED_CONFIRMED
+        or selection is None
+        or selection.selected_candidate_id != candidate_id
+        or selection.challenger_candidate_id != candidate_id
+        or result.incumbent.candidate_id != candidate_id
+        or result.incumbent.official_fm
+        or not result.incumbent.replayable
+        or not result.incumbent.eligible
+        or result.fallback.candidate_id != SCRIPTED_PARENT_ID
+        or not result.fallback.official_fm
+        or not result.fallback.replayable
+        or not result.fallback.eligible
+        or type(fallback.seed) is not int
+        or fallback.seed != 4
+    ):
+        return False
+
+    representative_metrics = representative_record.evidence.metrics
+    if not isinstance(representative_metrics, OrganizerMetrics):
+        return False
+    incumbent_seed_zero = tuple(
+        item for item in result.incumbent.outer_by_seed if item.seed == 0
+    )
+    if (
+        len(incumbent_seed_zero) != 1
+        or incumbent_seed_zero[0].metrics != representative_metrics
+        or sum(run == representative_record.evidence for run in candidate_result.runs) != 1
+    ):
+        return False
+    try:
+        fallback_metrics = _metrics(fallback.metrics)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        representative_metrics.primary_decimal - fallback_metrics.primary_decimal
+        > MATERIAL_PRIMARY_DELTA
+    )
 
 
 def _candidate_selection(
@@ -1071,17 +2106,21 @@ def _candidate_selection(
 ) -> FinalizationSelectionPlan | None:
     if result.incumbent.candidate_id != runtime.candidate.candidate_id:
         return None
-    candidate_result = next(
-        (
-            item
-            for item in result.candidates
-            if item.candidate.candidate_id == runtime.candidate.candidate_id
-        ),
-        None,
+    candidate_result = _candidate_result_for(
+        result,
+        candidate_id=runtime.candidate.candidate_id,
     )
     if candidate_result is None or candidate_result.selection is None:
-        raise FullCampaignError("generated incumbent lacks trusted selector evidence")
+        return None
     records = runtime.records
+    representative_record = records.get((ScientificTier.OUTER_MATCHED_SEED, 0))
+    if representative_record is None or not _candidate_artifact_clears_deployment_gate(
+        result=result,
+        candidate_result=candidate_result,
+        representative_record=representative_record,
+        qualification=qualification,
+    ):
+        return None
     fold_a_record = records.get((ScientificTier.FOLD_A_CONFIRMATION, 0))
     fold_b_record = records.get((ScientificTier.FOLD_B_SCREEN, 0))
     if fold_a_record is None or fold_b_record is None:
@@ -1293,26 +2332,7 @@ def _reflect(
     artifacts: ArtifactStore,
     research_model: ResearchModel | None = None,
 ) -> tuple[str, str, ArtifactRef, Reflection]:
-    candidate_result = result.candidates[0] if result.candidates else None
-    run = None
-    if candidate_result is not None and candidate_result.runs:
-        outer = [item for item in candidate_result.runs if item.metrics is not None]
-        run = outer[-1] if outer else None
-    metrics = (
-        _metrics(result.fallback.outer_by_seed[0].metrics)
-        if run is None or run.metrics is None
-        else run.metrics
-    )
-    promoted = result.incumbent.candidate_id == candidate_id
-    summary = ExperimentResultSummary(
-        tier="outer" if promoted else "inner",
-        status="promoted" if promoted else "rejected",
-        gauc=metrics.gauc,
-        ndcg_at_5=metrics.ndcg_at_5,
-        primary=metrics.primary,
-        runtime_seconds=0.0 if run is None else run.resources.wall_seconds,
-        peak_memory_mb=(0.0 if run is None else run.resources.peak_rss_bytes / float(1024**2)),
-    )
+    summary = _scientific_reflection_summary(result, candidate_id=candidate_id)
     request = ReflectionRequest.create(
         request_id=f"iteration-{scientific_iteration:02d}-reflect",
         proposal_id=lineage.proposal.proposal_id,
@@ -1322,11 +2342,15 @@ def _reflect(
         result=summary,
         safe_context=safe_context.to_wire(),
     )
+    completed_scientific_evaluation = summary.status in {"promoted", "rejected"}
     scripted = Reflection(
         response_id="generated-causal-lambdarank-v1-reflection",
         summary=(
-            "The bounded generated LambdaRank branch completed protected fold and matched-seed "
-            "evaluation while preserving the qualified official-FM fallback."
+            "The bounded generated branch completed scientific evaluation; the typed result "
+            "contains only metrics actually produced by that branch."
+            if completed_scientific_evaluation
+            else "The bounded generated branch did not complete a valid scientific evaluation; "
+            "no incumbent metrics were substituted for the missing challenger result."
         ),
         recommendation="close_branch",
         lessons=(
@@ -1405,6 +2429,121 @@ def _reflect(
     return request.digest, reflection.digest, transcript, reflection
 
 
+def _candidate_result_for(
+    result: ScientificCampaignResult,
+    *,
+    candidate_id: str,
+) -> CandidateCampaignResult | None:
+    matches = tuple(
+        item for item in result.candidates if item.candidate.candidate_id == candidate_id
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _run_is_valid_scientific_evidence(run: ScientificRunEvidence) -> bool:
+    return (
+        run.metrics is not None
+        and run.gates.failures == ()
+        and run.replay_verified
+    )
+
+
+def _is_completed_scientific_rejection(candidate_result: CandidateCampaignResult) -> bool:
+    if candidate_result.outcome not in {
+        CandidateOutcome.SCREEN_REJECTED,
+        CandidateOutcome.INNER_REJECTED,
+        CandidateOutcome.RETAINED,
+    }:
+        return False
+    return (
+        candidate_result.candidate.gates.failures == ()
+        and bool(candidate_result.runs)
+        and all(_run_is_valid_scientific_evidence(run) for run in candidate_result.runs)
+    )
+
+
+def _scientific_reflection_summary(
+    result: ScientificCampaignResult,
+    *,
+    candidate_id: str,
+) -> ExperimentResultSummary:
+    """Return only challenger evidence that the scientific loop actually produced."""
+
+    candidate_result = _candidate_result_for(result, candidate_id=candidate_id)
+    resource_run = (
+        None
+        if candidate_result is None or not candidate_result.runs
+        else candidate_result.runs[-1]
+    )
+    runtime_seconds = None if resource_run is None else resource_run.resources.wall_seconds
+    peak_memory_mb = (
+        None
+        if resource_run is None
+        else resource_run.resources.peak_rss_bytes / float(1024**2)
+    )
+    outcome = None if candidate_result is None else candidate_result.outcome
+    outer_outcomes = {
+        CandidateOutcome.OUTER_FAILED,
+        CandidateOutcome.RETAINED,
+        CandidateOutcome.PROMOTED_CONFIRMED,
+        CandidateOutcome.PROMOTED_UNCONFIRMED,
+    }
+    tier = "outer" if outcome in outer_outcomes else "inner"
+    if outcome is CandidateOutcome.BUDGET_REJECTED:
+        return ExperimentResultSummary(
+            tier=tier,
+            status="budget_blocked",
+            gauc=None,
+            ndcg_at_5=None,
+            primary=None,
+            runtime_seconds=runtime_seconds,
+            peak_memory_mb=peak_memory_mb,
+        )
+
+    promotion_outcomes = {
+        CandidateOutcome.PROMOTED_CONFIRMED,
+        CandidateOutcome.PROMOTED_UNCONFIRMED,
+    }
+    promoted_by_outcome = outcome in promotion_outcomes
+    promoted_by_incumbent = result.incumbent.candidate_id == candidate_id
+    valid_runs = (
+        candidate_result is not None
+        and candidate_result.candidate.gates.failures == ()
+        and bool(candidate_result.runs)
+        and all(_run_is_valid_scientific_evidence(run) for run in candidate_result.runs)
+    )
+    completed_outcomes = {
+        CandidateOutcome.SCREEN_REJECTED,
+        CandidateOutcome.INNER_REJECTED,
+        CandidateOutcome.RETAINED,
+        *promotion_outcomes,
+    }
+    consistent_promotion = promoted_by_outcome == promoted_by_incumbent
+    if outcome not in completed_outcomes or not valid_runs or not consistent_promotion:
+        return ExperimentResultSummary(
+            tier=tier,
+            status="execution_failed",
+            gauc=None,
+            ndcg_at_5=None,
+            primary=None,
+            runtime_seconds=runtime_seconds,
+            peak_memory_mb=peak_memory_mb,
+        )
+
+    assert resource_run is not None
+    assert resource_run.metrics is not None
+    metrics = resource_run.metrics
+    return ExperimentResultSummary(
+        tier=tier,
+        status="promoted" if promoted_by_outcome else "rejected",
+        gauc=metrics.gauc,
+        ndcg_at_5=metrics.ndcg_at_5,
+        primary=metrics.primary,
+        runtime_seconds=runtime_seconds,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _AutonomousFollowupResult:
     result: ScientificCampaignResult
@@ -1421,8 +2560,47 @@ def _iteration_record(
     reflection: Reflection,
     *,
     scientific_iteration: int,
+    lineage: ScriptedLambdaRankLineage | LiveResearchLineage,
+    run_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord],
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
+    fold_b = run_records.get((ScientificTier.FOLD_B_SCREEN, 0))
+    fold_a = run_records.get((ScientificTier.FOLD_A_CONFIRMATION, 0))
+    fold_b_generated = None
+    fold_b_selected_weights = None
+    if fold_b is not None and fold_b.fusion_selection is not None:
+        fold_b_selected_weights = fold_b.fusion_selection.selected_weights
+        fold_b_generated = next(
+            (
+                point.metrics
+                for point in fold_b.fusion_selection.points
+                if point.weights == (1.0, 0.0)
+            ),
+            None,
+        )
+    promoted = result.incumbent.candidate_id == (
+        None if candidate_result is None else candidate_result.candidate.candidate_id
+    )
+    proposal = getattr(lineage, "proposal", None)
+    if isinstance(proposal, Proposal):
+        family = classify_proposal_family(proposal)
+        proposal_id: str | None = proposal.proposal_id
+        proposal_objective: str | None = proposal.objective
+        proposal_principal_change: str | None = proposal.principal_change
+        proposal_mechanism: str | None = proposal.mechanism
+    else:
+        # Compatibility with provider-free typed test seams. Production lineages always carry
+        # the admitted Proposal, so an absent proposal must never create a blocking family.
+        family = "unknown"
+        proposal_id = None
+        proposal_objective = None
+        proposal_principal_change = None
+        proposal_mechanism = None
+    completed_scientific_rejection = (
+        candidate_result is not None
+        and _is_completed_scientific_rejection(candidate_result)
+        and not promoted
+    )
     return AggregateRecord(
         name=f"scientific_iteration_{scientific_iteration:02d}",
         values={
@@ -1434,6 +2612,40 @@ def _iteration_record(
                 None if candidate_result is None else candidate_result.outcome.value
             ),
             "candidate_reason": None if candidate_result is None else candidate_result.reason,
+            "proposal_id": proposal_id,
+            "proposal_family": family,
+            "proposal_family_blocked": (
+                proposal is not None and completed_scientific_rejection
+            ),
+            "proposal_objective": proposal_objective,
+            "proposal_principal_change": proposal_principal_change,
+            "proposal_mechanism": proposal_mechanism,
+            "candidate_promoted": promoted,
+            "fold_b_generated_only_gauc": (
+                None if fold_b_generated is None else fold_b_generated.gauc
+            ),
+            "fold_b_generated_only_ndcg_at_5": (
+                None if fold_b_generated is None else fold_b_generated.ndcg_at_5
+            ),
+            "fold_b_generated_only_primary": (
+                None if fold_b_generated is None else fold_b_generated.primary
+            ),
+            "fold_b_selected_generated_weight": (
+                None if fold_b_selected_weights is None else fold_b_selected_weights[0]
+            ),
+            "fold_b_selected_control_weight": (
+                None if fold_b_selected_weights is None else fold_b_selected_weights[1]
+            ),
+            "fold_b_selected_primary": (
+                None
+                if fold_b is None or fold_b.evidence.metrics is None
+                else fold_b.evidence.metrics.primary
+            ),
+            "fold_a_selected_primary": (
+                None
+                if fold_a is None or fold_a.evidence.metrics is None
+                else fold_a.evidence.metrics.primary
+            ),
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
@@ -2125,6 +3337,8 @@ def _run_autonomous_followups(
             result,
             reflection,
             scientific_iteration=runtime_template.scientific_iteration,
+            lineage=lineage,
+            run_records=runtime_template.records,
         ),
     ]
     rejected_records = list(prior_records)
@@ -2152,7 +3366,18 @@ def _run_autonomous_followups(
             terminal = result.stop_reason
             break
         status = runtime_template.engine.status(runtime_template.run_dir)
-        if status.outer_queries_remaining <= 0:
+        reusable_receipt_count = (
+            _reusable_score_receipt_count(
+                outer_ledger_path,
+                maximum=request.config.validation.outer_promotion_limit,
+            )
+            if status.outer_queries_remaining <= 0
+            else 0
+        )
+        if not _may_attempt_outer_evaluation(
+            outer_queries_remaining=status.outer_queries_remaining,
+            reusable_receipt_count=reusable_receipt_count,
+        ):
             terminal = CampaignStopReason.OUTER_PROMOTION_LIMIT
             break
 
@@ -2221,12 +3446,17 @@ def _run_autonomous_followups(
                 evidence_registry=iteration_runtime.evidence_registry,
                 representative_seed=0,
             )
+            admission = ReceiptAwareOuterEvaluationLedger(
+                adapter,
+                ScoringReceiptBook.from_projection(project_ledger.projection()),
+            )
+            iteration_runtime.outer_admission = admission
             result = run_scientific_campaign(
                 config=scientific_config,
                 fallback=fallback,
                 candidates=(candidate,),
                 runner=iteration_runtime,
-                outer_ledger=adapter,
+                outer_ledger=admission,
                 initial_incumbent=result.incumbent,
                 initial_convergence=result.convergence,
                 initial_launches_used=result.launches_used,
@@ -2270,7 +3500,15 @@ def _run_autonomous_followups(
             artifacts=runtime_template.artifacts,
             research_model=research_model,
         )
-        records.append(_iteration_record(result, reflection, scientific_iteration=iteration))
+        records.append(
+            _iteration_record(
+                result,
+                reflection,
+                scientific_iteration=iteration,
+                lineage=lineage,
+                run_records=iteration_runtime.records,
+            )
+        )
         if result.incumbent.candidate_id == candidate_id:
             parent = snapshot_materialized_candidate(
                 lineage.materialized,
@@ -2850,6 +4088,25 @@ def _open_outer_ledger(path: Path, *, maximum: int) -> OuterQueryLedger:
         return OuterQueryLedger.create(path, max_queries=maximum)
     except OSError as exc:
         raise FullCampaignError("outer-query ledger is unavailable") from exc
+
+
+def _may_attempt_outer_evaluation(
+    *,
+    outer_queries_remaining: int,
+    reusable_receipt_count: int,
+) -> bool:
+    """Allow an exhausted campaign to reach exact receipt lookup, never a new score call."""
+
+    if type(outer_queries_remaining) is not int or outer_queries_remaining < 0:
+        raise FullCampaignError("remaining outer-query count must be a non-negative integer")
+    if type(reusable_receipt_count) is not int or reusable_receipt_count < 0:
+        raise FullCampaignError("reusable receipt count must be a non-negative integer")
+    return outer_queries_remaining > 0 or reusable_receipt_count > 0
+
+
+def _reusable_score_receipt_count(path: Path, *, maximum: int) -> int:
+    with _open_outer_ledger(path, maximum=maximum) as ledger:
+        return len(ScoringReceiptBook.from_projection(ledger.projection()))
 
 
 def _outer_ledger_location(
@@ -3727,6 +4984,7 @@ def run_provider_free_campaign(
                 data.fold_b.query_labels,
             ),
             outer_scorer=outer_scorer,
+            outer_admission=None,
             qualification=qualification,
             repository=FileScientificRunEvidenceRepository(production / "scientific-records"),
             evidence_registry={},
@@ -3750,13 +5008,18 @@ def run_provider_free_campaign(
                 evidence_registry=runtime.evidence_registry,
                 representative_seed=0,
             )
+            admission = ReceiptAwareOuterEvaluationLedger(
+                adapter,
+                ScoringReceiptBook.from_projection(project_ledger.projection()),
+            )
+            runtime.outer_admission = admission
             try:
                 result = run_scientific_campaign(
                     config=scientific_config,
                     fallback=fallback_incumbent,
                     candidates=(candidate,),
                     runner=runtime,
-                    outer_ledger=adapter,
+                    outer_ledger=admission,
                 )
             except ScientificCampaignCancelled as exc:
                 raise FullCampaignCancelled(

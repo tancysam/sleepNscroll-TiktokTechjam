@@ -40,9 +40,43 @@ def _convergence(
     iterations: int = 0,
     pending: bool = False,
 ) -> dict[str, object]:
+    return _convergence_v2(
+        best=best,
+        window_start=best,
+        streak=streak,
+        iterations=iterations,
+        pending=pending,
+    )
+
+
+def _legacy_convergence(
+    *,
+    best: float = 0.6016,
+    streak: int = 0,
+    iterations: int = 0,
+    pending: bool = False,
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "best_primary": best,
+        "non_material_streak": streak,
+        "completed_iterations": iterations,
+        "required_completion_pending": pending,
+    }
+
+
+def _convergence_v2(
+    *,
+    best: float = 0.6016,
+    window_start: float = 0.6016,
+    streak: int = 0,
+    iterations: int = 0,
+    pending: bool = False,
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "best_primary": best,
+        "patience_window_start_primary": window_start,
         "non_material_streak": streak,
         "completed_iterations": iterations,
         "required_completion_pending": pending,
@@ -55,6 +89,7 @@ def _create_campaign(
     campaign_id: str = "campaign-001",
     max_launches: int = 50,
     outer_query_limit: int = 6,
+    initial_convergence: Mapping[str, object] | None = None,
 ) -> CampaignStore:
     return CampaignStore.create(
         path,
@@ -68,7 +103,7 @@ def _create_campaign(
         hard_deadline_utc="2030-01-01T00:00:00Z",
         max_launches=max_launches,
         outer_query_limit=outer_query_limit,
-        initial_convergence=_convergence(),
+        initial_convergence=_convergence() if initial_convergence is None else initial_convergence,
     )
 
 
@@ -175,6 +210,66 @@ def test_create_open_strict_schema_and_existing_run_refusal(tmp_path: Path) -> N
         raw.execute("PRAGMA user_version = 999")
     with pytest.raises(StoreVersionError, match="unsupported database identity"):
         CampaignStore.open(path)
+
+
+def test_convergence_state_migrates_v1_and_round_trips_v2(tmp_path: Path) -> None:
+    path = tmp_path / "campaign.sqlite"
+    legacy = _legacy_convergence(best=0.6014, streak=2, iterations=2)
+    expected = _convergence_v2(best=0.6014, window_start=0.6014, streak=2, iterations=2)
+    current = _convergence_v2(best=0.6021, window_start=0.6000, streak=0, iterations=3)
+
+    with _create_campaign(path, initial_convergence=legacy) as store:
+        assert store.snapshot().convergence_state == expected
+        updated = store.set_convergence_state(current, expected_revision=0)
+        assert updated.convergence_state == current
+
+    with CampaignStore.open(path, read_only=True) as reopened:
+        assert reopened.snapshot().convergence_state == current
+
+
+def test_existing_v1_convergence_row_projects_as_v2_without_mutating_storage(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "campaign.sqlite"
+    legacy = _legacy_convergence(best=0.6014, streak=2, iterations=2)
+    encoded_legacy = json.dumps(
+        legacy, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    )
+    with _create_campaign(path):
+        pass
+    with sqlite3.connect(path) as raw:
+        raw.execute("UPDATE campaigns SET convergence_json = ?", (encoded_legacy,))
+
+    with CampaignStore.open(path, read_only=True) as reopened:
+        assert reopened.snapshot().convergence_state == _convergence_v2(
+            best=0.6014,
+            window_start=0.6014,
+            streak=2,
+            iterations=2,
+        )
+
+    with sqlite3.connect(path) as raw:
+        persisted = raw.execute("SELECT convergence_json FROM campaigns").fetchone()
+    assert persisted == (encoded_legacy,)
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        {**_convergence_v2(), "unexpected": True},
+        {
+            key: value
+            for key, value in _convergence_v2().items()
+            if key != "patience_window_start_primary"
+        },
+    ),
+)
+def test_convergence_state_rejects_extra_or_missing_versioned_fields(
+    tmp_path: Path,
+    state: Mapping[str, object],
+) -> None:
+    with pytest.raises(StoreInvariantError, match="convergence"):
+        _create_campaign(tmp_path / "campaign.sqlite", initial_convergence=state)
 
 
 def test_execution_projection_reconciles_starting_running_and_terminal_restart(

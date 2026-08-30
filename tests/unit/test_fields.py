@@ -146,8 +146,15 @@ def test_basic_video_alignment_enabled_author_and_conditional_static_policy() ->
     assert video_id.role is FieldRole.TRUSTED_ALIGNMENT_ONLY and video_id.enabled
     assert author_id.role is FieldRole.INFERENCE_INPUT and author_id.enabled
     assert visible.role is FieldRole.BLOCKED and not visible.enabled
+    video_type = field_spec(FieldKey(VIDEO_BASIC_MEMBER, "video_type"))
+    assert video_type.role is FieldRole.INFERENCE_INPUT and video_type.enabled
 
-    conditional = set(VIDEO_BASIC_HEADER) - {"video_id", "author_id", "visible_status"}
+    conditional = set(VIDEO_BASIC_HEADER) - {
+        "video_id",
+        "author_id",
+        "video_type",
+        "visible_status",
+    }
     for name in conditional:
         spec = field_spec(FieldKey(VIDEO_BASIC_MEMBER, name))
         assert spec.role is FieldRole.INFERENCE_INPUT

@@ -24,25 +24,18 @@ from typing import Final, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from kuairand_agent.data.canonical import APPROVED_AUXILIARY_TARGETS, PRIMARY_TARGET
+
 _SCHEMA_VERSION: Final = 1
 _INT64_MIN: Final = -(2**63)
 _INT64_MAX: Final = 2**63 - 1
 _SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+# Keep this boundary derived from the canonical target registry.  The two
+# legacy spellings remain blocked because older callers used them before the
+# archive schema was centralized; they are aliases, not approved targets.
+_COMPATIBILITY_OUTCOME_ALIASES: Final = frozenset({"hate", "play_time_truncate"})
 _OUTCOME_FIELDS: Final = frozenset(
-    {
-        "long_view",
-        "is_click",
-        "is_like",
-        "is_follow",
-        "is_comment",
-        "is_forward",
-        "hate",
-        "is_hate",
-        "play_time_ms",
-        "play_time_truncate",
-        "profile_stay_time",
-        "comment_stay_time",
-    }
+    (PRIMARY_TARGET, *APPROVED_AUXILIARY_TARGETS, *_COMPATIBILITY_OUTCOME_ALIASES)
 )
 _ROW_ID_FIELDS: Final = frozenset(
     {"row_id", "split_row_id", "source_row_id", "source_ordinal", "record_ordinal"}

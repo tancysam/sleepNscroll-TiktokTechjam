@@ -161,6 +161,7 @@ def test_research_context_evidence_contains_train_eda_and_input_only_late_period
         ("final_inputs", "final"),
     }
     assert evidence.train_eda[1].values["long_view_positive_rate"] == 0.5
+    assert evidence.train_eda[1].values["click_positive_rate"] == 0.0
     assert {item.name for item in evidence.validation_input_eda} == {
         "public_validation_inputs_only",
         "prediction_period_inputs_only",
@@ -170,6 +171,136 @@ def test_research_context_evidence_contains_train_eda_and_input_only_late_period
     assert "label" not in rendered
     assert "outcome" not in rendered
     assert evidence.method_cards[0].values["uses_public_labels_for_features"] is False
+    cards = {card.name: card for card in evidence.method_cards}
+    assert cards["controller_causal_feature_bundle"].values["feature_count"] == 95
+    input_exposure = cards["input_only_strict_past_exposure"].values
+    assert input_exposure["query_outcomes_accepted_by_interface"] is False
+    assert input_exposure["feature_positions_zero_based_csv"] == (
+        "83,84,85,86,87,88,89,90,91,92,93,94"
+    )
+    assert cards["generated_model_runtime"].values["lightgbm_version"] == "4.7.0"
+    assert cards["generated_model_runtime"].values["lightgbm_import_allowed"] is True
+    assert cards["causal_feature_semantics"].values["history_smoothing"] == 20.0
+    assert "simultaneous" in str(
+        cards["causal_feature_semantics"].values["training_history_policy"]
+    )
+    assert cards["lightgbm_lambdarank_pattern"].values["objective"] == "lambdarank"
+    assert cards["lightgbm_lambdarank_pattern"].values["uses_protected_outcomes"] is False
+    click_history = cards["strict_past_click_history"].values
+    assert click_history["source_target"] == "official_train_is_click_only"
+    assert click_history["same_row_click_exposed"] is False
+    assert click_history["uses_late_period_outcomes"] is False
+    watch_history = cards["strict_past_watch_progress_history"].values
+    assert watch_history["source_target"] == "official_train_play_time_ms_only"
+    assert watch_history["same_row_play_time_exposed"] is False
+    assert watch_history["uses_late_period_outcomes"] is False
+    historical = cards["historical_33_feature_lambdarank_result"].values
+    assert historical["selected_generated_weight"] == 0.25
+    assert "do not repeat" in str(historical["scientific_conclusion"])
+    categorical_history = cards["historical_44_feature_campaign_result"].values
+    assert categorical_history["categorical_lambdarank_fold_a_fused_primary"] == pytest.approx(
+        0.6081618070602417
+    )
+    assert "strict-past history" in str(categorical_history["scientific_conclusion"])
+    multihorizon_history = cards["historical_56_feature_campaign_result"].values
+    assert multihorizon_history["best_primary_delta"] == pytest.approx(0.0005075037479400635)
+    assert "click-history" in str(multihorizon_history["scientific_conclusion"])
+    click_campaign = cards["historical_69_feature_campaign_result"].values
+    assert click_campaign["click_anchored_gbdt_primary_delta"] == pytest.approx(0.0007095038890839)
+    assert "watch-progress" in str(click_campaign["scientific_conclusion"])
+    pairwise_reference = cards["trusted_pairwise_fm_reference"].values
+    assert pairwise_reference["uses_public_labels_for_tuning"] is False
+    assert pairwise_reference["frozen_candidate_weight"] == 0.4
+    assert pairwise_reference["fold_a_primary_delta"] == pytest.approx(0.0010496973991394)
+    watch_campaign = cards["historical_82_feature_campaign_result"].values
+    assert watch_campaign["watch_pairwise_fold_b_selected_primary"] == pytest.approx(
+        0.5754240304231644
+    )
+    assert "pairwise FM" in str(watch_campaign["scientific_conclusion"])
+    protected_pairwise = cards["protected_candidate_pairwise_fm_primitive"].values
+    assert protected_pairwise["protected_from_generated_overlay"] is True
+    assert protected_pairwise["metric_or_scorer_access"] is False
+    assert "positive-ticket" in str(protected_pairwise["sampler"])
+    assert "sample_reference_logged_pairs" in str(
+        protected_pairwise["pair_sampler_function"]
+    )
+    assert "row-index maps" in str(protected_pairwise["composition_policy"])
+    duration_ablation = cards["protected_duration_conditioned_pair_ablation"].values
+    assert duration_ablation["duration_feature_position_zero_based"] == 46
+    assert duration_ablation["equal_compute_budget"] is True
+    assert duration_ablation["prediction_accepts_targets_or_groups"] is False
+    composition = cards["historical_attempt_10_composition_result"].values
+    assert composition["pairwise_fm_composite_selected_generated_weight"] == 0.2
+    assert "uniformly" in str(composition["diagnosed_pairwise_reimplementation_drift"])
+    exact_reference = cards["historical_attempt_11_exact_reference_result"].values
+    assert exact_reference["primitive_implementation_exact"] is True
+    assert exact_reference["fold_b_selected_generated_weight"] == 0.4
+    assert "Do not repeat" in str(exact_reference["scientific_conclusion"])
+    categorical_ranker = cards["protected_candidate_categorical_ranker_primitive"].values
+    assert categorical_ranker["fold_b_primary_delta"] == pytest.approx(0.0015487074851989)
+    assert categorical_ranker["fold_a_primary_delta"] == pytest.approx(0.0012717843055725)
+    assert categorical_ranker["uses_public_labels_for_tuning"] is False
+    assert categorical_ranker["feature_count"] == 83
+    assert categorical_ranker["current_83_column_fold_evidence"] == "not yet measured"
+    attempt_12 = cards["historical_attempt_12_composition_result"].values
+    assert attempt_12["listwise_composition_fold_b_selected_primary"] == pytest.approx(
+        0.5764372497797012
+    )
+    assert "shape-derived" in str(attempt_12["scientific_conclusion"])
+    attempt_14 = cards["historical_attempt_14_composition_result"].values
+    assert attempt_14["user_balanced_listnet_fold_b_primary_delta"] == pytest.approx(
+        0.001647874712944
+    )
+    assert attempt_14["user_balanced_listnet_fold_a_primary_delta"] == pytest.approx(
+        0.0015188157558441
+    )
+    attempt_15 = cards["historical_attempt_15_listnet_residual_plateau"].values
+    assert attempt_15["execution_failures"] == 0
+    assert attempt_15["deep_cross_fold_a_primary_delta"] == pytest.approx(
+        0.0016562640666962
+    )
+    metadata_probes = cards["train_only_static_metadata_probe_result"].values
+    assert metadata_probes["production_schema_changed"] is True
+    assert metadata_probes["enabled_feature_position_zero_based"] == 82
+    assert metadata_probes["other_five_fields_enabled"] is False
+    assert metadata_probes["public_validation_used"] is False
+    assert metadata_probes["video_type_fold_b_primary_delta"] == pytest.approx(
+        0.0017284750938416
+    )
+    attempt_16 = cards["historical_attempt_16_distinct_signal_result"].values
+    assert attempt_16["execution_failures"] == 0
+    assert attempt_16["three_way_fold_b_selected_lightgcn_weight"] == 0.0
+    assert attempt_16["objective_disagreement_fold_b_primary_delta"] == pytest.approx(
+        0.0017493963241577
+    )
+    attempt_17 = cards["historical_attempt_17_listnet_composition_result"].values
+    assert attempt_17["execution_failures"] == 0
+    assert attempt_17["malformed_retries"] == 0
+    assert attempt_17["causal_manifold_fold_a_primary_delta"] == pytest.approx(
+        0.0016940832138062
+    )
+    attempt_18 = cards["historical_attempt_18_standalone_result"].values
+    assert attempt_18["execution_failures"] == 0
+    assert attempt_18["query_set_attention_fold_b_primary_delta"] == 0.0
+    portfolio = cards["train_only_candidate_portfolio_result"].values
+    assert portfolio["candidate_count"] == 16
+    assert portfolio["pointwise_video_type_fold_b_primary_delta"] == pytest.approx(
+        0.0020057559013367
+    )
+    assert portfolio["outer_query_used"] is False
+    listnet_ranker = cards["protected_candidate_listnet_ranker_primitive"].values
+    assert listnet_ranker["protected_from_generated_overlay"] is True
+    assert listnet_ranker["uses_public_labels_for_tuning"] is False
+    assert listnet_ranker["fold_b_selected_generated_weight"] == 0.45
+    pointwise_ranker = cards["protected_candidate_pointwise_ranker_primitive"].values
+    assert pointwise_ranker["protected_from_generated_overlay"] is True
+    assert pointwise_ranker["uses_public_labels_for_tuning"] is False
+    assert pointwise_ranker["reviewed_video_type_portfolio_fold_b_delta"] == pytest.approx(
+        0.0020057559013367
+    )
+    attempt_21 = cards["historical_attempt_21_repaired_video_type_result"].values
+    assert attempt_21["execution_failures"] == 0
+    assert attempt_21["fieldaware_pairwise_selected_generated_weight"] == 0.0
 
 
 def test_research_and_finalization_share_candidate_capability_identity_not_raw_input_identity() -> (

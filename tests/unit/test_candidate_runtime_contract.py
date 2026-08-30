@@ -35,7 +35,15 @@ def test_distributed_seed_wrapper_matches_the_canonical_controller_contract() ->
     assert _seed_literal("PREDICT_KEYS") == set(contract.prediction_request_fields)
     assert contract.to_wire()["stable_files"] == {
         "entry_point": "candidate.py",
-        "protected_paths": ["candidate.py"],
+        "protected_paths": [
+            "candidate.py",
+            "reference_categorical_ranker.py",
+            "reference_listnet_ranker.py",
+            "reference_observed_pair_fm.py",
+            "reference_observed_pair_objectives.py",
+            "reference_pairwise_fm.py",
+            "reference_pointwise_ranker.py",
+        ],
     }
     assert len(contract.digest) == 64
 
@@ -69,7 +77,7 @@ def test_executor_payload_builders_have_exact_fields_and_fixed_handles() -> None
 def test_runtime_contract_rejects_protected_model_overlays() -> None:
     with pytest.raises(CandidateRuntimeContractError, match="protected runtime file"):
         CANDIDATE_RUNTIME_CONTRACT.validate_overlay_paths(
-            ("config.json", "candidate.py", "model_impl.py")
+            ("config.json", "candidate.py", "reference_categorical_ranker.py", "model_impl.py")
         )
 
     CANDIDATE_RUNTIME_CONTRACT.validate_overlay_paths(

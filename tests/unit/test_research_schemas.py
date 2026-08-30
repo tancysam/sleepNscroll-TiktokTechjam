@@ -6,6 +6,7 @@ import pytest
 
 from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.research.schemas import (
+    ExperimentResultSummary,
     FailureCategory,
     GeneratedFile,
     GeneratedPackage,
@@ -22,6 +23,78 @@ from kuairand_agent.research.schemas import (
     response_json_schema,
 )
 from kuairand_agent.research.source_policy import DEFAULT_CANDIDATE_SOURCE_POLICY
+
+
+@pytest.mark.parametrize("status", ("execution_failed", "budget_blocked"))
+def test_unscored_experiment_result_requires_explicit_null_metrics(status: str) -> None:
+    result = ExperimentResultSummary(
+        tier="inner",
+        status=status,
+        gauc=None,
+        ndcg_at_5=None,
+        primary=None,
+        runtime_seconds=1.5,
+        peak_memory_mb=32.0,
+    )
+
+    assert result.to_wire() == {
+        "tier": "inner",
+        "status": status,
+        "GAUC": None,
+        "nDCG@5": None,
+        "primary": None,
+        "runtime_seconds": 1.5,
+        "peak_memory_mb": 32.0,
+    }
+
+
+def test_unscored_experiment_result_can_report_unknown_resources_as_null() -> None:
+    result = ExperimentResultSummary(
+        tier="inner",
+        status="execution_failed",
+        gauc=None,
+        ndcg_at_5=None,
+        primary=None,
+        runtime_seconds=None,
+        peak_memory_mb=None,
+    )
+
+    assert result.to_wire()["runtime_seconds"] is None
+    assert result.to_wire()["peak_memory_mb"] is None
+
+
+def test_unscored_experiment_result_rejects_partial_metrics() -> None:
+    with pytest.raises(SchemaValidationError, match="must all be null"):
+        ExperimentResultSummary(
+            tier="inner",
+            status="execution_failed",
+            gauc=0.5,
+            ndcg_at_5=None,
+            primary=None,
+            runtime_seconds=1.5,
+            peak_memory_mb=32.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("gauc", "ndcg_at_5", "primary"),
+    ((None, None, None), (0.5, None, None)),
+)
+def test_scientific_experiment_result_rejects_null_metrics(
+    gauc: float | None,
+    ndcg_at_5: float | None,
+    primary: float | None,
+) -> None:
+    with pytest.raises(SchemaValidationError, match="must all be present"):
+        ExperimentResultSummary(
+            tier="inner",
+            status="rejected",
+            gauc=gauc,
+            ndcg_at_5=ndcg_at_5,
+            primary=primary,
+            runtime_seconds=1.5,
+            peak_memory_mb=32.0,
+        )
 
 
 def proposal_payload() -> dict[str, object]:

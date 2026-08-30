@@ -11,6 +11,7 @@ from kuairand_agent.campaign.selector import (
     GateEvidence,
     IncumbentEvidence,
     OrganizerMetrics,
+    OuterEligibilityClass,
     SeedMetrics,
     SelectionContext,
     SelectionOutcome,
@@ -107,6 +108,37 @@ def test_every_structural_gate_fails_closed_before_outer_scoring(gate: str) -> N
     assert decision.reason is SelectionReason.STRUCTURAL_GATE_FAILED
     assert decision.selected_candidate_id == "incumbent"
     assert decision.outer.failed_gates == (gate,)
+    assert decision.outer.classification is OuterEligibilityClass.INVALID_EVIDENCE
+
+
+def test_outer_eligibility_classifies_science_evidence_and_budget_fail_closed() -> None:
+    selector = Selector()
+
+    scientific = selector.assess_outer_eligibility(
+        _challenger(folds=_folds(candidate_a=0.599, candidate_b=0.601)),
+        SelectionContext(),
+    )
+    invalid = selector.assess_outer_eligibility(_challenger(folds=()), SelectionContext())
+    budget = selector.assess_outer_eligibility(
+        _challenger(),
+        SelectionContext(outer_candidate_ids=frozenset(f"candidate-{index}" for index in range(6))),
+    )
+    mixed_invalid_and_budget = selector.assess_outer_eligibility(
+        _challenger(folds=()),
+        SelectionContext(outer_candidate_ids=frozenset(f"candidate-{index}" for index in range(6))),
+    )
+    eligible = selector.assess_outer_eligibility(_challenger(), SelectionContext())
+
+    assert scientific.classification is OuterEligibilityClass.SCIENTIFIC_REJECTION
+    assert invalid.classification is OuterEligibilityClass.INVALID_EVIDENCE
+    assert budget.classification is OuterEligibilityClass.BUDGET_BLOCKED
+    assert mixed_invalid_and_budget.classification is OuterEligibilityClass.BUDGET_BLOCKED
+    assert eligible.classification is OuterEligibilityClass.ELIGIBLE
+
+    assert (
+        OuterEligibilityClass.classify_reasons((SelectionReason.MATCHED_SEEDS_REQUIRED,))
+        is OuterEligibilityClass.INVALID_EVIDENCE
+    )
 
 
 def test_fold_b_screen_is_strict_and_diversity_root_is_preallocated_exception() -> None:
@@ -169,6 +201,7 @@ def test_outer_promotion_requires_sufficient_finalization_time() -> None:
     )
     assert not decision.eligible
     assert SelectionReason.INSUFFICIENT_FINALIZATION_TIME in decision.reasons
+    assert decision.classification is OuterEligibilityClass.BUDGET_BLOCKED
 
 
 def test_no_outer_score_is_eligible_but_partial_matched_seeds_cannot_promote() -> None:
@@ -186,15 +219,16 @@ def test_no_outer_score_is_eligible_but_partial_matched_seeds_cannot_promote() -
     assert partial.reason is SelectionReason.MATCHED_SEEDS_REQUIRED
 
 
-def test_exact_public_delta_point_002_is_unconfirmed_and_just_above_is_material() -> None:
+def test_exact_public_delta_point_002_retains_deployable_incumbent_and_above_is_material() -> None:
     selector = Selector()
     exact = selector.decide(
         _incumbent(0.600),
         _challenger(outer=_seeds(0.602)),
         SelectionContext(),
     )
-    assert exact.outcome is SelectionOutcome.PROMOTE_UNCONFIRMED
-    assert exact.reason is SelectionReason.PROMOTED_UNCONFIRMED
+    assert exact.outcome is SelectionOutcome.RETAIN_INCUMBENT
+    assert exact.reason is SelectionReason.MATERIALITY_NOT_MET
+    assert exact.selected_candidate_id == "incumbent"
     assert exact.confirmation is not None
     assert exact.confirmation.mean_primary_delta == 0.002
 

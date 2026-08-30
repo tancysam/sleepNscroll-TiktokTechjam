@@ -28,8 +28,10 @@ from kuairand_agent.campaign.full_campaign import (
 )
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateOutcome,
     ScientificCampaignConfig,
     ScientificCampaignResult,
+    ScientificTier,
 )
 from kuairand_agent.campaign.selector import IncumbentEvidence, OrganizerMetrics
 from kuairand_agent.campaign.store import CampaignStore
@@ -46,6 +48,165 @@ from tests.unit.test_full_campaign import _dataset
 from tests.unit.test_scientific_campaign import _config, _fallback
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _deployment_gate_fixture(
+    *,
+    representative_primary: float,
+    fallback_primary: float = 0.6,
+    other_candidate_primaries: tuple[float, float] | None = None,
+) -> tuple[object, object, object, object]:
+    candidate_id = "generated-candidate"
+    representative_metrics = OrganizerMetrics(
+        representative_primary,
+        representative_primary,
+    )
+    other_primaries = (
+        (representative_primary, representative_primary)
+        if other_candidate_primaries is None
+        else other_candidate_primaries
+    )
+    representative_evidence = SimpleNamespace(metrics=representative_metrics)
+    candidate_result = SimpleNamespace(
+        candidate=SimpleNamespace(candidate_id=candidate_id),
+        outcome=CandidateOutcome.PROMOTED_CONFIRMED,
+        runs=(representative_evidence,),
+        selection=SimpleNamespace(
+            selected_candidate_id=candidate_id,
+            challenger_candidate_id=candidate_id,
+        ),
+    )
+    result = SimpleNamespace(
+        fallback=SimpleNamespace(
+            candidate_id="official-fm-fallback-seed-4",
+            official_fm=True,
+            replayable=True,
+            eligible=True,
+            outer_by_seed=tuple(
+                SimpleNamespace(seed=seed, metrics=OrganizerMetrics(0.6, 0.6))
+                for seed in (0, 1, 2)
+            ),
+        ),
+        incumbent=SimpleNamespace(
+            candidate_id=candidate_id,
+            official_fm=False,
+            replayable=True,
+            eligible=True,
+            outer_by_seed=(
+                SimpleNamespace(seed=0, metrics=representative_metrics),
+                *(
+                    SimpleNamespace(seed=seed, metrics=OrganizerMetrics(primary, primary))
+                    for seed, primary in zip((1, 2), other_primaries, strict=True)
+                ),
+            ),
+        ),
+        candidates=(candidate_result,),
+    )
+    representative_record = SimpleNamespace(evidence=representative_evidence)
+    qualification = SimpleNamespace(
+        fallback=SimpleNamespace(
+            seed=4,
+            metrics=SimpleNamespace(gauc=fallback_primary, ndcg_at_5=fallback_primary),
+        )
+    )
+    return result, candidate_result, representative_record, qualification
+
+
+@pytest.mark.parametrize(
+    ("representative_primary", "expected"),
+    (
+        (0.602, False),
+        (0.6020000000000001, True),
+    ),
+)
+def test_candidate_artifact_deployment_gate_is_strict_at_material_boundary(
+    representative_primary: float,
+    expected: bool,
+) -> None:
+    result, candidate_result, representative_record, qualification = (
+        _deployment_gate_fixture(representative_primary=representative_primary)
+    )
+
+    assert (
+        runtime._candidate_artifact_clears_deployment_gate(
+            result=cast(Any, result),
+            candidate_result=cast(Any, candidate_result),
+            representative_record=cast(Any, representative_record),
+            qualification=cast(Any, qualification),
+        )
+        is expected
+    )
+
+
+def test_research_incumbent_with_tiny_mean_gain_keeps_seed_four_deployment_fallback() -> None:
+    # The three candidate seeds average to +0.0000422497590383 over the matched FM controls,
+    # while the exact representative seed-0 artifact remains below immutable fallback seed 4.
+    result, candidate_result, representative_record, qualification = _deployment_gate_fixture(
+        representative_primary=0.599,
+        other_candidate_primaries=(0.6005, 0.6006267492771149),
+    )
+
+    assert cast(Any, result).incumbent.candidate_id == "generated-candidate"
+    assert float(
+        sum(item.metrics.primary_decimal for item in cast(Any, result).incumbent.outer_by_seed)
+        / 3
+        - OrganizerMetrics(0.6, 0.6).primary_decimal
+    ) == pytest.approx(
+        0.0000422497590383
+    )
+    assert not runtime._candidate_artifact_clears_deployment_gate(
+        result=cast(Any, result),
+        candidate_result=cast(Any, candidate_result),
+        representative_record=cast(Any, representative_record),
+        qualification=cast(Any, qualification),
+    )
+    candidate_runtime = SimpleNamespace(
+        candidate=SimpleNamespace(candidate_id="generated-candidate"),
+        records={(ScientificTier.OUTER_MATCHED_SEED, 0): representative_record},
+    )
+    assert (
+        runtime._candidate_selection(
+            experiment_id="iteration-01",
+            result=cast(Any, result),
+            runtime=cast(Any, candidate_runtime),
+            qualification=cast(Any, qualification),
+            features=cast(Any, object()),
+            feature_artifacts=cast(Any, object()),
+            dataset_digest="d" * 64,
+            validation_inputs=cast(Any, object()),
+            final_inputs=cast(Any, object()),
+            limits=cast(Any, object()),
+        )
+        is None
+    )
+
+
+def test_candidate_artifact_deployment_gate_fails_closed_on_identity_mismatch() -> None:
+    result, candidate_result, representative_record, qualification = _deployment_gate_fixture(
+        representative_primary=0.603
+    )
+    cast(Any, qualification).fallback.seed = 0
+
+    assert not runtime._candidate_artifact_clears_deployment_gate(
+        result=cast(Any, result),
+        candidate_result=cast(Any, candidate_result),
+        representative_record=cast(Any, representative_record),
+        qualification=cast(Any, qualification),
+    )
+
+
+def test_unconfirmed_research_result_cannot_pass_artifact_deployment_gate() -> None:
+    result, candidate_result, representative_record, qualification = _deployment_gate_fixture(
+        representative_primary=0.603
+    )
+    cast(Any, candidate_result).outcome = CandidateOutcome.PROMOTED_UNCONFIRMED
+
+    assert not runtime._candidate_artifact_clears_deployment_gate(
+        result=cast(Any, result),
+        candidate_result=cast(Any, candidate_result),
+        representative_record=cast(Any, representative_record),
+        qualification=cast(Any, qualification),
+    )
 
 
 def _typed_branch_rejection(
@@ -482,6 +643,7 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
             Any,
             SimpleNamespace(scorer=SimpleNamespace(scorer_digest="a" * 64)),
         ),
+        outer_admission=None,
         qualification=opaque,
         repository=opaque,
         evidence_registry={},
@@ -561,8 +723,23 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
         "_generated_scientific_candidate",
         lambda **kwargs: SimpleNamespace(candidate_id=kwargs["candidate_id"]),
     )
-    monkeypatch.setattr(runtime, "_open_outer_ledger", lambda *_args, **_kwargs: nullcontext())
+    fake_project_ledger = SimpleNamespace(projection=lambda: opaque)
+    monkeypatch.setattr(
+        runtime,
+        "_open_outer_ledger",
+        lambda *_args, **_kwargs: nullcontext(fake_project_ledger),
+    )
     monkeypatch.setattr(runtime, "DurableScientificLedgerAdapter", lambda *_args, **_kwargs: opaque)
+    monkeypatch.setattr(
+        runtime,
+        "ScoringReceiptBook",
+        SimpleNamespace(from_projection=lambda _projection: opaque),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "ReceiptAwareOuterEvaluationLedger",
+        lambda *_args, **_kwargs: opaque,
+    )
     monkeypatch.setattr(runtime, "run_scientific_campaign", continue_campaign)
     monkeypatch.setattr(runtime, "_candidate_selection", lambda **_kwargs: None)
     monkeypatch.setattr(runtime, "_reflect", reflect)

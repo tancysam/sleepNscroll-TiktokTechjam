@@ -18,6 +18,7 @@ from kuairand_agent.research.production import (
     LiveResearchBranchRejected,
     ProductionResearchError,
     ResearchFailureObservation,
+    classify_proposal_family,
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
     prepare_scripted_lambdarank_lineage,
@@ -52,6 +53,17 @@ def _safe_context() -> SafeResearchContext:
 def _unexpected_model_call(*args: object, **kwargs: object) -> None:
     del args, kwargs
     raise AssertionError("rehydration must not invoke the research model")
+
+
+def _fixture_proposal() -> Proposal:
+    request = ProposalRequest.create(
+        request_id="family-classifier-fixture",
+        campaign_id="family-classifier-campaign",
+        scientific_iteration=1,
+        parent_candidate_id="official-fm-fallback-seed-4",
+        safe_context=_safe_context().to_wire(),
+    )
+    return _LiveFixtureModel().propose(request)
 
 
 class _LiveFixtureModel:
@@ -319,6 +331,121 @@ class _RepairingMaterializedPoisonModel(_LiveFixtureModel):
         )
 
 
+@pytest.mark.parametrize(
+    ("mechanism", "principal_change", "expected_family"),
+    (
+        (
+            "Train a deterministic pointwise LightGBM binary classifier; this is not a "
+            "listwise or pairwise loss variant.",
+            "Replace FM with a pointwise boosted-tree probability model.",
+            "pointwise",
+        ),
+        (
+            "Train a deterministic residual multilayer perceptron with group-normalized "
+            "pointwise binary cross-entropy, not another pairwise or listwise model.",
+            "Use a neural representation rather than another boosted-tree loss variant.",
+            "neural",
+        ),
+        (
+            "Train LambdaRank while avoiding pairwise BPR.",
+            "Use a listwise objective, not a pairwise objective.",
+            "listwise",
+        ),
+        (
+            "Train a pairwise BPR model without a listwise objective.",
+            "Use pairwise preference learning.",
+            "pairwise",
+        ),
+        (
+            "Use grouped LambdaRank over all controller features.",
+            "Replace the parent's official pointwise FM fallback with deterministic "
+            "categorical-aware LightGBM LambdaRank.",
+            "listwise",
+        ),
+        (
+            "Use within-user contrastive batches.",
+            "Replace the parent's pointwise FM scoring form with a residual neural network.",
+            "neural",
+        ),
+    ),
+)
+def test_proposal_family_classifier_ignores_negated_comparison_families(
+    mechanism: str,
+    principal_change: str,
+    expected_family: str,
+) -> None:
+    proposal = replace(
+        _fixture_proposal(),
+        mechanism=mechanism,
+        principal_change=principal_change,
+    )
+
+    assert classify_proposal_family(proposal) == expected_family
+
+
+def test_proposal_family_classifier_preserves_substantive_representation_axis() -> None:
+    field_aware = replace(
+        _fixture_proposal(),
+        mechanism="Train a field-aware interaction network with listwise softmax.",
+        principal_change="Add partner-specific embeddings and a listwise objective.",
+    )
+    history_reliability = replace(
+        _fixture_proposal(),
+        mechanism="Train LambdaRank over exposure-reliability features.",
+        principal_change=(
+            "Add a cross-scope-disagreement strict-past history representation and listwise loss."
+        ),
+    )
+    organizer_fm = replace(
+        _fixture_proposal(),
+        mechanism=(
+            "Train a five-field FM on the organizer categorical codes with a GAUC-aligned "
+            "same-user pairwise sampler."
+        ),
+        principal_change="Replace the dense pairwise MLP with the organizer categorical code FM.",
+    )
+
+    assert classify_proposal_family(field_aware) == "listwise:field-aware"
+    assert classify_proposal_family(history_reliability) == "listwise:history-reliability"
+    assert classify_proposal_family(organizer_fm) == "pairwise:organizer-fm"
+
+
+@pytest.mark.parametrize(
+    ("principal_change", "mechanism", "expected_family"),
+    (
+        (
+            "Add a deterministic LightGBM LambdaRank composition that uses the immutable "
+            "protected pairwise-FM score as a learned interaction coordinate alongside all 82 "
+            "causal features, while preserving the complete reference checkpoint and reference "
+            "scoring semantics.",
+            "Train a deterministic listwise LambdaRank model conditioned on the protected "
+            "reference_pairwise_fm score.",
+            "listwise:organizer-fm",
+        ),
+        (
+            "Compose the immutable exact protected pairwise-FM backbone with a deterministic "
+            "nonlinear LightGBM residual model over the complete 82-column causal feature "
+            "bundle, instead of replacing or reimplementing the primitive.",
+            "This is a pointwise nonlinear residual composition, not a new pairwise sampler, "
+            "pairwise reimplementation, unchanged LambdaRank model, or standalone watch model.",
+            "pointwise:organizer-fm",
+        ),
+    ),
+)
+def test_proposal_family_classifier_uses_composition_objective_not_protected_backbone(
+    principal_change: str,
+    mechanism: str,
+    expected_family: str,
+) -> None:
+    proposal = replace(
+        _fixture_proposal(),
+        principal_change=principal_change,
+        mechanism=mechanism,
+    )
+
+    assert classify_proposal_family(proposal) == expected_family
+
+
 def test_rejected_live_package_does_not_persist_immutable_lineage_record(
     tmp_path: Path,
 ) -> None:
@@ -482,6 +609,12 @@ def test_live_lineage_routes_reserved_filename_through_agent_repair_and_rehydrat
         "config.json",
         "model_impl.py",
         "pairwise_helper.py",
+        "reference_categorical_ranker.py",
+        "reference_listnet_ranker.py",
+        "reference_observed_pair_fm.py",
+        "reference_observed_pair_objectives.py",
+        "reference_pairwise_fm.py",
+        "reference_pointwise_ranker.py",
     }
     assert len(model.repair_requests) == 1
     assert model.implementation_package is not None

@@ -1158,33 +1158,50 @@ class ImplementationRequest:
 class ExperimentResultSummary:
     tier: str
     status: str
-    gauc: float
-    ndcg_at_5: float
-    primary: float
-    runtime_seconds: float
-    peak_memory_mb: float
+    gauc: float | None
+    ndcg_at_5: float | None
+    primary: float | None
+    runtime_seconds: float | None
+    peak_memory_mb: float | None
 
     def __post_init__(self) -> None:
         _text(self.tier, "experiment_result.tier", identifier=True)
         if self.tier not in {"fixture", "inner", "outer"}:
             raise SchemaValidationError("experiment_result.tier is unsupported")
         _text(self.status, "experiment_result.status", identifier=True)
-        if self.status not in {"passed", "rejected", "promoted"}:
+        scientific_statuses = {"passed", "rejected", "promoted"}
+        unscored_statuses = {"execution_failed", "budget_blocked"}
+        if self.status not in scientific_statuses | unscored_statuses:
             raise SchemaValidationError("experiment_result.status is unsupported")
-        for name, value in (
+        metric_fields = (
             ("gauc", self.gauc),
             ("ndcg_at_5", self.ndcg_at_5),
             ("primary", self.primary),
-        ):
+        )
+        if self.status in unscored_statuses:
+            if any(value is not None for _, value in metric_fields):
+                raise SchemaValidationError("unscored experiment_result metrics must all be null")
+        elif any(value is None for _, value in metric_fields):
+            raise SchemaValidationError("scientific experiment_result metrics must all be present")
+        for name, value in metric_fields:
+            if value is None:
+                continue
             metric = _finite_number(value, f"experiment_result.{name}")
             if not 0.0 <= metric <= 1.0:
                 raise SchemaValidationError(f"experiment_result.{name} must be in [0, 1]")
-        if abs(self.primary - (self.gauc + self.ndcg_at_5) / 2.0) > 1e-12:
+        if (
+            self.primary is not None
+            and self.gauc is not None
+            and self.ndcg_at_5 is not None
+            and abs(self.primary - (self.gauc + self.ndcg_at_5) / 2.0) > 1e-12
+        ):
             raise SchemaValidationError("experiment_result.primary must be the metric mean")
         for name, value in (
             ("runtime_seconds", self.runtime_seconds),
             ("peak_memory_mb", self.peak_memory_mb),
         ):
+            if value is None:
+                continue
             if _finite_number(value, f"experiment_result.{name}") < 0:
                 raise SchemaValidationError(f"experiment_result.{name} cannot be negative")
 

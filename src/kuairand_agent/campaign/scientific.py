@@ -19,17 +19,19 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Final, Protocol
 
-from kuairand_agent.campaign.convergence import ConvergenceState
+from kuairand_agent.campaign.convergence import CompletedScientificIteration, ConvergenceState
 from kuairand_agent.campaign.selector import (
     CandidateEvidence,
     FoldEvidence,
     GateEvidence,
     IncumbentEvidence,
     OrganizerMetrics,
+    OuterEligibilityClass,
     SeedMetrics,
     SelectionContext,
     SelectionDecision,
     SelectionOutcome,
+    SelectionReason,
     Selector,
 )
 
@@ -1172,20 +1174,20 @@ def run_scientific_campaign(
                     reason=f"callback_failed:{callback_failure}",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             continue
         elapsed_seconds += evidence.resources.wall_seconds
         parent_fold_b = dict(incumbent.inner_by_fold)["B"]
-        passed = (
+        scientifically_valid_screen = (
             evidence.metrics is not None
             and not _effective_gates(evidence).failures
             and candidate.gates.failures == ()
-            and (
-                candidate.diversity_root
-                or _primary(evidence.metrics) - _primary(parent_fold_b)
-                > Decimal(str(config.screen_margin))
-            )
         )
+        passed = False
+        if scientifically_valid_screen:
+            assert evidence.metrics is not None  # narrowed by the validity predicate above.
+            passed = candidate.diversity_root or _primary(evidence.metrics) - _primary(
+                parent_fold_b
+            ) > Decimal(str(config.screen_margin))
         if not passed:
             results.append(
                 CandidateCampaignResult(
@@ -1195,7 +1197,12 @@ def run_scientific_campaign(
                     reason="fold_b_screen_failed",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
+            # A valid below-threshold result is non-material science.  Missing metrics or failed
+            # execution/policy gates are implementation attempts, not scientific observations;
+            # they remain launch- and iteration-budgeted by the outer controller but must not
+            # satisfy the convergence patience rule.
+            if scientifically_valid_screen:
+                convergence = convergence.observe(CompletedScientificIteration(None))
             continue
         assert evidence.metrics is not None  # narrowed by the trusted screen predicate
 
@@ -1208,7 +1215,6 @@ def run_scientific_campaign(
                     reason="launch_cap_before_fold_a",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             stop_reason = CampaignStopReason.LAUNCH_CAP
             break
         admission_stop = _time_admission_reason(
@@ -1226,7 +1232,6 @@ def run_scientific_campaign(
                     reason=admission_stop.value,
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             stop_reason = admission_stop
             break
         fold_a_request = _request(
@@ -1248,7 +1253,6 @@ def run_scientific_campaign(
                     reason=f"fold_a_callback_failed:{callback_failure}",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             continue
         elapsed_seconds += fold_a_evidence.resources.wall_seconds
         runs: list[ScientificRunEvidence] = [evidence, fold_a_evidence]
@@ -1261,7 +1265,6 @@ def run_scientific_campaign(
                     reason="fold_a_failed",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             continue
 
         incumbent_folds = dict(incumbent.inner_by_fold)
@@ -1316,6 +1319,32 @@ def run_scientific_campaign(
         selector = Selector()
         eligibility = selector.assess_outer_eligibility(inner_candidate, context)
         if not eligibility.eligible:
+            if eligibility.classification is OuterEligibilityClass.BUDGET_BLOCKED:
+                if SelectionReason.OUTER_CANDIDATE_LIMIT in eligibility.reasons:
+                    reason = SelectionReason.OUTER_CANDIDATE_LIMIT.value
+                    stop_reason = CampaignStopReason.OUTER_PROMOTION_LIMIT
+                else:
+                    reason = SelectionReason.INSUFFICIENT_FINALIZATION_TIME.value
+                    stop_reason = CampaignStopReason.FINALIZATION_RESERVE
+                results.append(
+                    CandidateCampaignResult(
+                        candidate=candidate,
+                        outcome=CandidateOutcome.BUDGET_REJECTED,
+                        runs=tuple(runs),
+                        reason=reason,
+                    )
+                )
+                break
+            if eligibility.classification is OuterEligibilityClass.INVALID_EVIDENCE:
+                results.append(
+                    CandidateCampaignResult(
+                        candidate=candidate,
+                        outcome=CandidateOutcome.CALLBACK_FAILED,
+                        runs=tuple(runs),
+                        reason=eligibility.reasons[0].value,
+                    )
+                )
+                continue
             results.append(
                 CandidateCampaignResult(
                     candidate=candidate,
@@ -1324,7 +1353,7 @@ def run_scientific_campaign(
                     reason=eligibility.reasons[0].value,
                 )
             )
-            convergence = convergence.update_after_iteration(None)
+            convergence = convergence.observe(CompletedScientificIteration(None))
             continue
 
         admission_stop = _outer_bundle_admission_reason(
@@ -1342,7 +1371,6 @@ def run_scientific_campaign(
                     reason=f"{admission_stop.value}_before_outer_reservation",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             stop_reason = admission_stop
             break
 
@@ -1438,7 +1466,6 @@ def run_scientific_campaign(
                     reason="matched_seed_confirmation_incomplete",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
             if launches_used >= config.max_launches:
                 stop_reason = CampaignStopReason.LAUNCH_CAP
                 break
@@ -1519,7 +1546,9 @@ def run_scientific_campaign(
             (item.metrics.primary_decimal for item in outer_seed_metrics),
             Decimal(0),
         ) / len(outer_seed_metrics)
-        convergence = convergence.update_after_iteration(float(eligible_outer_primary_decimal))
+        convergence = convergence.observe(
+            CompletedScientificIteration(float(eligible_outer_primary_decimal))
+        )
 
     if stop_reason is CampaignStopReason.CANDIDATES_EXHAUSTED and convergence.should_stop:
         stop_reason = CampaignStopReason.CONVERGED

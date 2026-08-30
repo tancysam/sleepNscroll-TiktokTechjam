@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from numbers import Integral
@@ -26,12 +27,42 @@ type ScoreInput = Sequence[object] | npt.NDArray[np.generic]
 type Float64Vector = npt.NDArray[np.float64]
 
 FUSION_SCHEMA_VERSION: Final = 1
+N_MEMBER_FUSION_SCHEMA_VERSION: Final = 2
 TIE_POLICY: Final = "descending-average-rank; singleton=0.5"
-FUSION_WEIGHT_GRID: Final = (
+LEGACY_FUSION_WEIGHT_GRID: Final = (
     (1.0, 0.0),
     (0.75, 0.25),
     (0.5, 0.5),
     (0.25, 0.75),
+    (0.0, 1.0),
+)
+# This remains a small, predeclared train-only search rather than an adaptive optimizer.  Five
+# percentage-point resolution is enough to represent the repeatable 0.40/0.60 inner-fold optimum
+# without introducing a continuous hyperparameter search.  The fusion schema itself stays at v1:
+# normalization and prediction bytes are unchanged, while every selection record already carries
+# its exact grid.  The two-member compatibility digest remains bound to the historical five-point
+# grid below so durable v1 identities do not change when the current selection grid evolves.
+FUSION_WEIGHT_GRID: Final = (
+    (1.0, 0.0),
+    (0.95, 0.05),
+    (0.9, 0.1),
+    (0.85, 0.15),
+    (0.8, 0.2),
+    (0.75, 0.25),
+    (0.7, 0.3),
+    (0.65, 0.35),
+    (0.6, 0.4),
+    (0.55, 0.45),
+    (0.5, 0.5),
+    (0.45, 0.55),
+    (0.4, 0.6),
+    (0.35, 0.65),
+    (0.3, 0.7),
+    (0.25, 0.75),
+    (0.2, 0.8),
+    (0.15, 0.85),
+    (0.1, 0.9),
+    (0.05, 0.95),
     (0.0, 1.0),
 )
 _ALLOWED_PREDICTION_PHASES: Final = frozenset(
@@ -133,12 +164,12 @@ class RankNormalizedPrediction:
 
 @dataclass(frozen=True, slots=True)
 class FusionResult:
-    """One immutable two-member rank blend with complete prediction provenance."""
+    """One immutable ordered-member rank blend with complete prediction provenance."""
 
     scores: Float64Vector = field(repr=False)
-    weights: tuple[float, float]
-    member_prediction_digests: tuple[str, str]
-    normalized_prediction_digests: tuple[str, str]
+    weights: tuple[float, ...]
+    member_prediction_digests: tuple[str, ...]
+    normalized_prediction_digests: tuple[str, ...]
     prediction_digest: str
     alignment_digest: str
     fusion_digest: str
@@ -202,6 +233,100 @@ def normalize_within_user_percentiles(
     )
 
 
+def fuse_ranked_members(
+    user_ids: IdentityInput,
+    video_ids: IdentityInput,
+    member_scores: Sequence[ScoreInput],
+    *,
+    weights: tuple[float, ...],
+    phase: DataPhase,
+) -> FusionResult:
+    """Blend two or more ordered, label-free prediction members using frozen simplex weights."""
+
+    _require_prediction_phase(phase)
+    if isinstance(member_scores, (str, bytes)):
+        raise FusionError(
+            "member_scores must be an ordered sequence containing at least two vectors"
+        )
+    try:
+        members = tuple(member_scores)
+    except TypeError as exc:
+        raise FusionError(
+            "member_scores must be an ordered sequence containing at least two vectors"
+        ) from exc
+    if len(members) < 2:
+        raise FusionError("member_scores must contain at least two prediction vectors")
+    if (
+        type(weights) is not tuple
+        or len(weights) != len(members)
+        or any(
+            type(weight) is not float
+            or not math.isfinite(weight)
+            or weight < 0.0
+            or (weight == 0.0 and math.copysign(1.0, weight) < 0.0)
+            for weight in weights
+        )
+        or math.fsum(weights) != 1.0
+    ):
+        raise FusionError(
+            "weights must be a finite non-negative float tuple matching member_scores and summing "
+            "to one"
+        )
+
+    normalized = tuple(
+        normalize_within_user_percentiles(
+            user_ids,
+            video_ids,
+            scores,
+            phase=phase,
+        )
+        for scores in members
+    )
+    alignment_digest = normalized[0].alignment_digest
+    if any(item.alignment_digest != alignment_digest for item in normalized[1:]):
+        raise FusionError("rank-fusion members must use identical canonical alignment")
+    row_count = normalized[0].scores.size
+    raw_members = tuple(
+        _scores(scores, expected=row_count, name=f"member_scores[{index}]")
+        for index, scores in enumerate(members)
+    )
+    member_digests = tuple(prediction_digest(member) for member in raw_members)
+    normalized_digests = tuple(item.prediction_digest for item in normalized)
+    fused = np.zeros(row_count, dtype=np.float64)
+    for weight, member in zip(weights, normalized, strict=True):
+        fused += weight * member.scores
+    fused = np.ascontiguousarray(fused, dtype=np.float64)
+    if not np.isfinite(fused).all():  # defensive; normalized members and weights are finite
+        raise FusionError("rank-fusion output must contain only finite values")
+    output_digest = prediction_digest(fused)
+    manifest = {
+        "schema_version": N_MEMBER_FUSION_SCHEMA_VERSION,
+        "phase": phase.value,
+        "normalization": "within_user_descending_midrank_percentile_v1",
+        "tie_policy": TIE_POLICY,
+        "member_count": len(members),
+        "weights": list(weights),
+        "alignment_digest": alignment_digest,
+        "member_prediction_digests": list(member_digests),
+        "normalized_prediction_digests": list(normalized_digests),
+        "prediction_digest": output_digest,
+    }
+    payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
+        "ascii"
+    )
+    fused.setflags(write=False)
+    return FusionResult(
+        scores=cast(Float64Vector, fused),
+        weights=weights,
+        member_prediction_digests=member_digests,
+        normalized_prediction_digests=normalized_digests,
+        prediction_digest=output_digest,
+        alignment_digest=alignment_digest,
+        fusion_digest=hashlib.sha256(b"kuairand-n-member-rank-fusion-v2\0" + payload).hexdigest(),
+        phase=phase,
+    )
+
+
 def fuse_ranked_predictions(
     user_ids: IdentityInput,
     video_ids: IdentityInput,
@@ -246,7 +371,7 @@ def fuse_ranked_predictions(
         "normalization": "within_user_descending_midrank_percentile_v1",
         "tie_policy": TIE_POLICY,
         "weights": list(weights),
-        "weight_grid": [list(point) for point in FUSION_WEIGHT_GRID],
+        "weight_grid": [list(point) for point in LEGACY_FUSION_WEIGHT_GRID],
         "alignment_digest": first.alignment_digest,
         "member_prediction_digests": list(member_digests),
         "normalized_prediction_digests": list(normalized_digests),
@@ -271,10 +396,13 @@ def fuse_ranked_predictions(
 __all__ = [
     "FUSION_SCHEMA_VERSION",
     "FUSION_WEIGHT_GRID",
+    "LEGACY_FUSION_WEIGHT_GRID",
+    "N_MEMBER_FUSION_SCHEMA_VERSION",
     "TIE_POLICY",
     "FusionError",
     "FusionResult",
     "RankNormalizedPrediction",
+    "fuse_ranked_members",
     "fuse_ranked_predictions",
     "normalize_within_user_percentiles",
 ]

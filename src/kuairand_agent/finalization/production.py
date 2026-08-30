@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -79,6 +80,7 @@ from kuairand_agent.campaign.qualification_evidence import (
 from kuairand_agent.campaign.selector import OrganizerMetrics
 from kuairand_agent.campaign.store import ArtifactSpec, CampaignStore
 from kuairand_agent.candidates.bootstrap import paired_user_cluster_bootstrap
+from kuairand_agent.candidates.fusion import fuse_ranked_members
 from kuairand_agent.contract import (
     BENCHMARK_CONTRACT,
     STARTER_FILE_SHA256,
@@ -118,6 +120,7 @@ from kuairand_agent.finalization.organizer_check import (
     check_final_submission,
 )
 from kuairand_agent.finalization.recipe import (
+    GeneratedLambdaRankEnsembleReplayRecipe,
     GeneratedLambdaRankReplayRecipe,
     OfficialFMMemberRecipe,
     OfficialFMReplayRecipe,
@@ -2025,6 +2028,284 @@ def _recipe_ref(
     return reference
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedLambdaRankReplayMemberBundle:
+    """One complete, independently replayable generated LambdaRank v1 member.
+
+    This is deliberately a *closed* member bundle, rather than a checkpoint plus a few mutable
+    paths.  The production ensemble composer only accepts these four SHA-bound artifacts and the
+    member's own v1 recipe.  Consequently it cannot accidentally blend a checkpoint from one
+    member with the source, preprocessing, or validation reference of another.
+    """
+
+    recipe: GeneratedLambdaRankReplayRecipe
+    source: DirectoryArtifactRef
+    features: DirectoryArtifactRef
+    checkpoint: DirectoryArtifactRef
+    validation_predictions: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.recipe, GeneratedLambdaRankReplayRecipe):
+            raise ProductionFinalizationError(
+                "ensemble member recipe must be generated LambdaRank v1"
+            )
+        if (
+            not isinstance(self.source, DirectoryArtifactRef)
+            or self.source.kind is not ArtifactKind.SOURCE
+        ):
+            raise ProductionFinalizationError(
+                "ensemble member source must be a source directory artifact"
+            )
+        for name, expected_kind in (
+            ("features", ArtifactKind.INPUT),
+            ("checkpoint", ArtifactKind.CHECKPOINT),
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, DirectoryArtifactRef) or value.kind is not expected_kind:
+                raise ProductionFinalizationError(
+                    f"ensemble member {name} must be a {expected_kind.value} directory artifact"
+                )
+        if (
+            not isinstance(self.validation_predictions, ArtifactRef)
+            or self.validation_predictions.kind is not ArtifactKind.PREDICTION
+        ):
+            raise ProductionFinalizationError(
+                "ensemble member validation predictions must be a prediction artifact"
+            )
+        recipe = self.recipe
+        if (
+            self.source.sha256 != recipe.source_artifact_sha256
+            or self.features.sha256 != recipe.feature_artifact_sha256
+            or self.checkpoint.sha256 != recipe.checkpoint_artifact_sha256
+        ):
+            raise ProductionFinalizationError(
+                "ensemble member artifacts do not match its complete v1 replay recipe"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedLambdaRankEnsembleReplayArtifacts:
+    """Immutable composite artifacts for an ordered generated LambdaRank ensemble-v2 replay.
+
+    The outer identity deliberately binds the *composite* recipe and directories.  Each nested
+    v1 recipe still binds every member artifact independently, and the validation reference is
+    the one fixed label-free rank fusion of all recorded member validation vectors.
+    """
+
+    recipe: GeneratedLambdaRankEnsembleReplayRecipe
+    source: DirectoryArtifactRef
+    config: ArtifactRef
+    features: DirectoryArtifactRef
+    checkpoint: DirectoryArtifactRef
+    validation_predictions: ArtifactRef
+    validation_scores: npt.NDArray[np.float64] = field(repr=False)
+    identity: FrozenReplayIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.recipe, GeneratedLambdaRankEnsembleReplayRecipe):
+            raise ProductionFinalizationError(
+                "ensemble replay artifacts require an ensemble-v2 recipe"
+            )
+        if (
+            self.source.sha256 != self.identity.source_sha256
+            or self.config.sha256 != self.identity.config_sha256
+            or self.features.sha256 != self.identity.features_sha256
+            or self.checkpoint.sha256 != self.identity.checkpoint_sha256
+            or self.validation_predictions.sha256
+            != self.identity.validation_prediction_artifact_sha256
+        ):
+            raise ProductionFinalizationError(
+                "ensemble composite artifacts differ from frozen identity"
+            )
+        if self.identity.config_sha256 != self.recipe.digest:
+            raise ProductionFinalizationError(
+                "ensemble frozen identity does not bind the outer recipe"
+            )
+        scores = np.asarray(self.validation_scores)
+        if scores.ndim != 1 or scores.dtype != np.dtype("float64") or not np.isfinite(scores).all():
+            raise ProductionFinalizationError(
+                "ensemble validation reference must be finite float64"
+            )
+        values = np.ascontiguousarray(scores, dtype=np.float64)
+        values.setflags(write=False)
+        if prediction_digest(values) != self.identity.validation_prediction_digest:
+            raise ProductionFinalizationError(
+                "ensemble validation reference digest differs from identity"
+            )
+        object.__setattr__(self, "validation_scores", values)
+
+    def replay_artifacts(self) -> ReplayArtifacts:
+        """Return the only artifact tuple accepted by :func:`run_clean_replay`."""
+
+        return ReplayArtifacts(
+            source=self.source,
+            config=self.config,
+            features=self.features,
+            checkpoint=self.checkpoint,
+            validation_predictions=self.validation_predictions,
+        )
+
+
+def _prefixed_directory_members(
+    store: ArtifactStore,
+    directory: DirectoryArtifactRef,
+    *,
+    prefix: str,
+) -> tuple[tuple[str, Path, str], ...]:
+    """Re-materialize immutable directory entries beneath one fixed ensemble position."""
+
+    if not isinstance(directory, DirectoryArtifactRef):
+        raise ProductionFinalizationError("ensemble component must be a directory artifact")
+    result: list[tuple[str, Path, str]] = []
+    for entry in directory.entries:
+        result.append(
+            (
+                f"{prefix}/{entry.path}",
+                store.verify(entry.artifact),
+                entry.artifact.sha256,
+            )
+        )
+    return tuple(result)
+
+
+def build_generated_lambdarank_ensemble_replay(
+    *,
+    members: tuple[GeneratedLambdaRankReplayMemberBundle, ...],
+    validation_user_ids: Sequence[object],
+    validation_video_ids: Sequence[object],
+    fusion_weights: tuple[float, ...],
+    environment_sha256: str,
+    artifact_store: ArtifactStore,
+) -> GeneratedLambdaRankEnsembleReplayArtifacts:
+    """Compose 2+ complete v1 member bundles into one exact, provider-free v2 replay.
+
+    This is an intentionally opt-in construction seam.  It does **not** alter campaign
+    selection or status evidence: a caller must first have a separately valid decision to deploy
+    the fixed ordered portfolio.  The seam's narrower job is to make that decision replayable
+    without reusing mutable run directories or silently collapsing the ordered member set to one
+    representative seed.
+    """
+
+    if type(members) is not tuple or len(members) < 2:
+        raise ProductionFinalizationError(
+            "ensemble replay requires at least two complete v1 members"
+        )
+    if any(not isinstance(member, GeneratedLambdaRankReplayMemberBundle) for member in members):
+        raise ProductionFinalizationError(
+            "ensemble replay members must be complete v1 member bundles"
+        )
+    if not isinstance(artifact_store, ArtifactStore):
+        raise ProductionFinalizationError("ensemble replay requires an ArtifactStore")
+    environment_digest = _digest(environment_sha256, "ensemble replay environment")
+
+    recipes = tuple(member.recipe for member in members)
+    first = recipes[0]
+    for other_recipe in recipes[1:]:
+        if (
+            other_recipe.data_sha256 != first.data_sha256
+            or other_recipe.validation_inputs_digest != first.validation_inputs_digest
+            or other_recipe.final_inputs_digest != first.final_inputs_digest
+        ):
+            raise ProductionFinalizationError(
+                "ensemble members must bind the same data and input capabilities"
+            )
+
+    validation_scores = tuple(
+        _load_npy(member.validation_predictions, artifact_store, rows=len(validation_user_ids))
+        for member in members
+    )
+    try:
+        fused = fuse_ranked_members(
+            validation_user_ids,
+            validation_video_ids,
+            validation_scores,
+            weights=fusion_weights,
+            phase=DataPhase.OUTER_VALID,
+        )
+    except Exception as exc:
+        raise ProductionFinalizationError("ordered ensemble validation fusion is invalid") from exc
+
+    member_recipe_refs = tuple(_recipe_ref(artifact_store, recipe) for recipe in recipes)
+    source_members: list[tuple[str, Path, str]] = []
+    feature_members: list[tuple[str, Path, str]] = []
+    checkpoint_members: list[tuple[str, Path, str]] = []
+    for position, (member, recipe_reference) in enumerate(
+        zip(members, member_recipe_refs, strict=True)
+    ):
+        prefix = f"members/{position}"
+        source_members.extend(
+            _prefixed_directory_members(
+                artifact_store,
+                member.source,
+                prefix=f"{prefix}/source",
+            )
+        )
+        source_members.append(
+            (
+                f"{prefix}/recipe.json",
+                artifact_store.verify(recipe_reference),
+                recipe_reference.sha256,
+            )
+        )
+        feature_members.extend(
+            _prefixed_directory_members(artifact_store, member.features, prefix=prefix)
+        )
+        checkpoint_members.extend(
+            _prefixed_directory_members(artifact_store, member.checkpoint, prefix=prefix)
+        )
+    source = _put_directory_from_members(
+        artifact_store,
+        kind=ArtifactKind.SOURCE,
+        members=tuple(source_members),
+        prefix="ensemble-source-",
+    )
+    features = _put_directory_from_members(
+        artifact_store,
+        kind=ArtifactKind.INPUT,
+        members=tuple(feature_members),
+        prefix="ensemble-preprocessing-",
+    )
+    checkpoint = _put_directory_from_members(
+        artifact_store,
+        kind=ArtifactKind.CHECKPOINT,
+        members=tuple(checkpoint_members),
+        prefix="ensemble-model-",
+    )
+    recipe = GeneratedLambdaRankEnsembleReplayRecipe(
+        members=recipes,
+        member_recipe_digests=tuple(recipe.digest for recipe in recipes),
+        validation_member_prediction_digests=fused.member_prediction_digests,
+        fusion_weights=fusion_weights,
+        validation_fusion_digest=fused.fusion_digest,
+    )
+    config = _recipe_ref(artifact_store, recipe)
+    payload = io.BytesIO()
+    np.save(payload, np.ascontiguousarray(fused.scores, dtype="<f8"), allow_pickle=False)
+    reference = artifact_store.put_bytes(payload.getvalue(), kind=ArtifactKind.PREDICTION)
+    scores = np.ascontiguousarray(fused.scores, dtype=np.float64)
+    scores.setflags(write=False)
+    identity = FrozenReplayIdentity(
+        source_sha256=source.sha256,
+        config_sha256=config.sha256,
+        features_sha256=features.sha256,
+        checkpoint_sha256=checkpoint.sha256,
+        validation_prediction_artifact_sha256=reference.sha256,
+        validation_prediction_digest=prediction_digest(scores),
+        data_sha256=recipe.data_sha256,
+        environment_sha256=environment_digest,
+    )
+    return GeneratedLambdaRankEnsembleReplayArtifacts(
+        recipe=recipe,
+        source=source,
+        config=config,
+        features=features,
+        checkpoint=checkpoint,
+        validation_predictions=reference,
+        validation_scores=scores,
+        identity=identity,
+    )
+
+
 def _organizer_metrics(value: OrganizerMetrics) -> dict[str, float]:
     if not isinstance(value, OrganizerMetrics):
         raise ProductionFinalizationError("organizer metric evidence is incomplete")
@@ -2981,7 +3262,15 @@ def _research_rejection_lines(science: Mapping[str, object]) -> tuple[str, ...]:
             f"research rejection example {index} diagnostic",
             maximum=2_048,
         )
-        lines.append(f"Research rejection example ({role}): {fingerprint}; {diagnostic}")
+        # The same controller guard can reject several distinct proposals with the same
+        # fingerprint and diagnostic.  Keep those examples independently attributable in the
+        # human report instead of rendering identical lines that the report schema must reject.
+        candidate_id = cast(str, entry["candidate_id"])
+        proposal_family = cast(str, entry["proposal_family"])
+        lines.append(
+            f"Research rejection example ({role}, iteration {iteration}, candidate "
+            f"{candidate_id}, family {proposal_family}): {fingerprint}; {diagnostic}"
+        )
     if raw["examples_truncated"]:
         lines.append("Additional research rejection examples were retained in the durable ledger.")
     return tuple(lines)
@@ -3064,6 +3353,7 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
     operation_summary = "+".join(operations) if operations else "none"
     usage = science.get("provider_usage")
     if live_provider_used or isinstance(usage, Mapping):
+
         def valid_context_limits(value: object) -> bool:
             if value is None:
                 return True
@@ -3107,14 +3397,19 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
         retry_usage_fields = {"retry_wait_seconds"}
         usage_fields = frozenset(usage) if isinstance(usage, Mapping) else frozenset()
         usage_fields_without_limits = usage_fields - {"context_limits"}
-        if not isinstance(usage, Mapping) or usage_fields_without_limits not in {
-            frozenset(legacy_usage_fields),
-            frozenset(legacy_usage_fields | retry_usage_fields),
-            frozenset(legacy_usage_fields | chain_usage_fields),
-            frozenset(legacy_usage_fields | chain_usage_fields | retry_usage_fields),
-        } or (
-            "context_limits" in usage_fields
-            and not valid_context_limits(usage["context_limits"])
+        if (
+            not isinstance(usage, Mapping)
+            or usage_fields_without_limits
+            not in {
+                frozenset(legacy_usage_fields),
+                frozenset(legacy_usage_fields | retry_usage_fields),
+                frozenset(legacy_usage_fields | chain_usage_fields),
+                frozenset(legacy_usage_fields | chain_usage_fields | retry_usage_fields),
+            }
+            or (
+                "context_limits" in usage_fields
+                and not valid_context_limits(usage["context_limits"])
+            )
         ):
             raise ProductionFinalizationError("live provider usage evidence is malformed")
         integer_fields = legacy_usage_fields - {
@@ -4602,8 +4897,7 @@ def _outcome_from_bundle(
     if request.campaign_id != research.campaign_id:
         raise ProductionFinalizationError("campaign and research outcome identity differ")
     if (
-        resource_evidence.get("hard_wall_seconds")
-        != request.config.benchmark.wall_clock_seconds
+        resource_evidence.get("hard_wall_seconds") != request.config.benchmark.wall_clock_seconds
         or resource_evidence.get("finalization_reserve_seconds")
         != request.config.runner.finalization_reserve_seconds
     ):

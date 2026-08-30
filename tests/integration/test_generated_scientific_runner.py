@@ -15,6 +15,7 @@ import pytest
 from kuairand_agent.campaign.generated_scientific_runner import (
     DurableGeneratedScientificRunner,
     FileScientificRunEvidenceRepository,
+    FoldBFusionSelectionEvidence,
     FoldBFusionSelector,
     GeneratedScientificRunnerCancelledError,
     GeneratedScientificRunRecord,
@@ -27,7 +28,11 @@ from kuairand_agent.campaign.scientific import (
     ScientificRunRequest,
     ScientificTier,
 )
-from kuairand_agent.candidates.fusion import normalize_within_user_percentiles
+from kuairand_agent.candidates.fusion import (
+    FUSION_WEIGHT_GRID,
+    LEGACY_FUSION_WEIGHT_GRID,
+    normalize_within_user_percentiles,
+)
 from kuairand_agent.data.capabilities import DataPhase
 from kuairand_agent.execution.artifacts import ArtifactKind, ArtifactStore
 from kuairand_agent.execution.candidate_executor import (
@@ -398,13 +403,7 @@ def test_fold_b_grid_scores_every_fixed_weight_once_and_persists_frozen_winner(
 
     assert record is not None
     assert record.fusion_selection is not None
-    assert tuple(point.weights for point in record.fusion_selection.points) == (
-        (1.0, 0.0),
-        (0.75, 0.25),
-        (0.5, 0.5),
-        (0.25, 0.75),
-        (0.0, 1.0),
-    )
+    assert tuple(point.weights for point in record.fusion_selection.points) == FUSION_WEIGHT_GRID
     expected_winner = max(
         enumerate(record.fusion_selection.points),
         key=lambda item: (item[1].metrics.primary_decimal, -item[0]),
@@ -419,6 +418,29 @@ def test_fold_b_grid_scores_every_fixed_weight_once_and_persists_frozen_winner(
     assert restored is not None
     assert restored.fusion_selection is not None
     assert restored.fusion_selection.digest == record.fusion_selection.digest
+
+    legacy_points = tuple(
+        point
+        for point in record.fusion_selection.points
+        if point.weights in LEGACY_FUSION_WEIGHT_GRID
+    )
+    legacy_winner = max(
+        enumerate(legacy_points),
+        key=lambda item: (item[1].metrics.primary_decimal, -item[0]),
+    )[1]
+    legacy_selection = FoldBFusionSelectionEvidence(
+        selector_digest=record.fusion_selection.selector_digest,
+        points=legacy_points,
+        selected_weights=legacy_winner.weights,
+        selected_prediction_digest=legacy_winner.prediction_digest,
+        selected_fusion_digest=legacy_winner.fusion_digest,
+    )
+    legacy_record = replace(record, fusion_selection=legacy_selection)
+    legacy_repository = FileScientificRunEvidenceRepository(tmp_path / "legacy-grid-records")
+    legacy_repository.commit(legacy_record)
+    restored_legacy = legacy_repository.load(request.digest)
+    assert restored_legacy is not None
+    assert restored_legacy.manifest() == legacy_record.manifest()
 
     cancellation = threading.Event()
 

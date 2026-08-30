@@ -1,0 +1,1073 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "KuaiRand-Pure Score Improvement Research",
+    "description": "Evidence-backed diagnosis of the seven-hour score plateau and a prioritized experimental program for improving long-view GAUC and nDCG@5.",
+    "generatedAt": "2026-08-30T01:58:20Z",
+    "cards": [
+      {
+        "id": "selected_primary",
+        "description": "Primary score of the retained official-FM seed-4 fallback. This is not a new-model gain.",
+        "dataset": "selected_primary",
+        "sourceId": "official_fm",
+        "metrics": [
+          {
+            "label": "Selected fallback primary",
+            "field": "value",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "completed_bundles",
+        "description": "Completed current run bundles whose selected submission is byte-identical to the fallback.",
+        "dataset": "completed_bundles",
+        "sourceId": "run_census",
+        "metrics": [
+          {
+            "label": "Byte-identical completed bundles",
+            "field": "value",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "best_fold_floor",
+        "description": "Smaller of the two train-fold gains for the faithfully reproduced three-member rank portfolio.",
+        "dataset": "best_fold_floor",
+        "sourceId": "portfolio_diagnostic",
+        "metrics": [
+          {
+            "label": "Best reproduced fold floor",
+            "field": "value",
+            "format": "number",
+            "signed": true
+          }
+        ]
+      },
+      {
+        "id": "outer_equivalence",
+        "description": "The append-only ledger contains six completed outer queries but only one distinct three-seed prediction vector.",
+        "dataset": "outer_equivalence",
+        "sourceId": "outer_ledger",
+        "metrics": [
+          {
+            "label": "Completed outer queries",
+            "field": "queries",
+            "format": "number"
+          },
+          {
+            "label": "Distinct prediction vectors",
+            "field": "prediction_vectors",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "material_gate",
+        "description": "Pre-existing strict primary-delta threshold required on each temporal fold.",
+        "dataset": "material_gate",
+        "sourceId": "research_review",
+        "metrics": [
+          {
+            "label": "Per-fold materiality gate",
+            "field": "value",
+            "format": "number",
+            "signed": true
+          }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "fold_primary_deltas",
+        "title": "Frozen temporal-fold primary deltas",
+        "subtitle": "No tested candidate clears +0.002 on both folds; the faithful three-member diagnostic is the closest.",
+        "headerMarkdown": "Bars are candidate-minus-matched-control primary score. Fold B is selection data; Fold A has also been adaptively reused and is no longer untouched confirmation.",
+        "type": "bar",
+        "dataset": "fold_primary_deltas",
+        "sourceId": "fold_records",
+        "valueFormat": "number",
+        "encodings": {
+          "x": {
+            "field": "method",
+            "type": "nominal",
+            "label": "Candidate or diagnostic"
+          },
+          "y": {
+            "field": "delta",
+            "type": "quantitative",
+            "label": "Primary delta",
+            "format": "number"
+          },
+          "color": {
+            "field": "fold",
+            "type": "nominal",
+            "label": "Temporal fold"
+          },
+          "tooltip": [
+            {
+              "field": "evidence",
+              "type": "nominal",
+              "label": "Evidence state"
+            }
+          ]
+        },
+        "yAxisTitle": "Candidate minus matched control",
+        "layout": "full"
+      },
+      {
+        "id": "metric_component_deltas",
+        "title": "The strongest robust recorded candidate gains more GAUC than nDCG@5",
+        "subtitle": "Attempt 16's objective-disagreement gate improves both components, but top-five ranking remains the smaller gain.",
+        "type": "bar",
+        "dataset": "metric_component_deltas",
+        "sourceId": "attempt16_records",
+        "valueFormat": "number",
+        "encodings": {
+          "x": {
+            "field": "component",
+            "type": "nominal",
+            "label": "Metric component"
+          },
+          "y": {
+            "field": "delta",
+            "type": "quantitative",
+            "label": "Metric delta",
+            "format": "number"
+          },
+          "color": {
+            "field": "fold",
+            "type": "nominal",
+            "label": "Temporal fold"
+          }
+        },
+        "yAxisTitle": "Candidate minus matched control",
+        "layout": "full"
+      },
+      {
+        "id": "tab_long_view_rates",
+        "title": "Long-view rates differ sharply by scenario tab",
+        "subtitle": "The five largest named tab codes in the training member span roughly 4% to 49% long-view prevalence.",
+        "type": "bar",
+        "dataset": "tab_long_view_rates",
+        "sourceId": "train_signal_audit",
+        "valueFormat": "percent",
+        "encodings": {
+          "x": {
+            "field": "tab",
+            "type": "nominal",
+            "label": "Tab code"
+          },
+          "y": {
+            "field": "long_view_rate",
+            "type": "quantitative",
+            "label": "Long-view rate",
+            "format": "percent"
+          },
+          "tooltip": [
+            {
+              "field": "rows",
+              "type": "quantitative",
+              "label": "Rows",
+              "format": "number"
+            },
+            {
+              "field": "row_share",
+              "type": "quantitative",
+              "label": "Training-row share",
+              "format": "percent"
+            }
+          ]
+        },
+        "yAxisTitle": "Observed training long-view rate",
+        "layout": "full"
+      },
+      {
+        "id": "strict_past_coverage",
+        "title": "Strict-past user sequences are available for most training impressions",
+        "subtitle": "Coverage remains 62.7% even at twenty prior user events, supporting bounded temporal-context experiments.",
+        "type": "bar",
+        "dataset": "strict_past_coverage",
+        "sourceId": "train_signal_audit",
+        "valueFormat": "percent",
+        "encodings": {
+          "x": {
+            "field": "history_threshold",
+            "type": "ordinal",
+            "label": "Minimum prior user events"
+          },
+          "y": {
+            "field": "coverage",
+            "type": "quantitative",
+            "label": "Training-row coverage",
+            "format": "percent"
+          }
+        },
+        "yAxisTitle": "Share of training impressions",
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "plateau_diagnosis",
+        "title": "Why substantial code change did not change the selected score",
+        "subtitle": "The plateau combines a byte-identical final artifact, misreplayed composition, repeated fold reuse, and blocked promotion.",
+        "dataset": "plateau_diagnosis",
+        "sourceId": "run_census",
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "finding",
+            "label": "Finding",
+            "type": "text"
+          },
+          {
+            "field": "evidence",
+            "label": "Observed evidence",
+            "type": "text"
+          },
+          {
+            "field": "score_consequence",
+            "label": "Why it holds the score flat",
+            "type": "text"
+          },
+          {
+            "field": "response",
+            "label": "Required response",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "data_opportunities",
+        "title": "Where the current representation still leaves new information",
+        "subtitle": "These opportunities are absent or underused in the selected model and can be tested without protected outcomes.",
+        "dataset": "data_opportunities",
+        "sourceId": "train_signal_audit",
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "signal",
+            "label": "Signal",
+            "type": "text"
+          },
+          {
+            "field": "measurement",
+            "label": "Repository measurement",
+            "type": "text"
+          },
+          {
+            "field": "implication",
+            "label": "Modeling implication",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "experiment_program",
+        "title": "Prioritized score-improvement program",
+        "subtitle": "Each experiment isolates one mechanism, carries its own falsifier, and preserves matched controls.",
+        "dataset": "experiment_program",
+        "sourceId": "research_review",
+        "density": "dense",
+        "layout": "full",
+        "defaultSort": {
+          "field": "priority",
+          "direction": "asc"
+        },
+        "columns": [
+          {
+            "field": "priority",
+            "label": "Priority",
+            "type": "number"
+          },
+          {
+            "field": "experiment",
+            "label": "Experiment",
+            "type": "text"
+          },
+          {
+            "field": "treatment",
+            "label": "Controlled design, expected signature, and falsifier",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "falsified_shortcuts",
+        "title": "Shortcuts already falsified or shown unreliable",
+        "subtitle": "These results narrow the search space; they should not be repeated under new names.",
+        "dataset": "falsified_shortcuts",
+        "sourceId": "auxiliary_pilot",
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "idea",
+            "label": "Idea",
+            "type": "text"
+          },
+          {
+            "field": "result",
+            "label": "Observed result",
+            "type": "text"
+          },
+          {
+            "field": "decision",
+            "label": "Decision",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "promotion_protocol",
+        "title": "Evidence gate before another protected score query",
+        "subtitle": "This protocol is designed to prevent another long sprint from converting tuning noise into a claimed improvement.",
+        "dataset": "promotion_protocol",
+        "sourceId": "research_review",
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "gate",
+            "label": "Gate",
+            "type": "text"
+          },
+          {
+            "field": "requirement",
+            "label": "Requirement",
+            "type": "text"
+          },
+          {
+            "field": "reason",
+            "label": "Reason",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "official_fm",
+        "label": "Official FM five-seed qualification manifest",
+        "path": "runs/wp3-official-qualification-production/manifest.json"
+      },
+      {
+        "id": "run_census",
+        "label": "Immutable campaign databases, final manifests, and prediction artifacts",
+        "path": "runs"
+      },
+      {
+        "id": "fold_records",
+        "label": "Frozen temporal-fold scientific records and portfolio diagnostic",
+        "path": "runs/improvement-20260830-attempt-22/production/scientific-records"
+      },
+      {
+        "id": "attempt16_records",
+        "label": "Attempt 16 objective-disagreement scientific records",
+        "path": "runs/improvement-20260830-attempt-16/production/scientific-records"
+      },
+      {
+        "id": "portfolio_diagnostic",
+        "label": "Faithful three-member rank-portfolio diagnostic",
+        "path": "runs/diagnostics/pointwise_video_type_ensemble.py"
+      },
+      {
+        "id": "outer_ledger",
+        "label": "Append-only outer-query ledger",
+        "path": "runs/outer-query-ledger.sqlite3"
+      },
+      {
+        "id": "train_signal_audit",
+        "label": "Train-only signal and temporal-context diagnostic",
+        "path": "docs/research/analyze_train_signal_headroom.py"
+      },
+      {
+        "id": "auxiliary_pilot",
+        "label": "Train-only auxiliary direct-rank pilot",
+        "path": "docs/research/evaluate_auxiliary_ranker_pilot.py"
+      },
+      {
+        "id": "implementation_audit",
+        "label": "Input-only implementation-readiness audit",
+        "path": "docs/research/implementation-readiness-research.md"
+      },
+      {
+        "id": "research_review",
+        "label": "Primary-source score-improvement literature review",
+        "path": "docs/research/score_improvement_literature.md"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# KuaiRand-Pure Score Improvement Research"
+      },
+      {
+        "id": "summary",
+        "type": "markdown",
+        "body": "## Technical summary\n\nThe score has not merely remained statistically similar: every completed current bundle selects the same official-FM fallback, and the corresponding submission artifacts are byte-identical. The recent sprint built useful candidate machinery, but it did not move a new ranking function through reliable selection. The best reproduced train-fold portfolio is extremely close to the internal materiality boundary, while the broad experiment history shows that nDCG@5—not GAUC—is now the harder component.\n\nThe most evidence-efficient route is therefore: faithfully reproduce and confirm the existing three-member rank portfolio; add genuinely new label-free query-period exposure state; target top-five ordering with duration-conditioned pairs and a corrected LambdaLoss or hard-negative control; then test watch-progress as training-only multi-task supervision. More residual capacity on the same frozen feature matrix is a lower-priority bet."
+      },
+      {
+        "id": "headline_metrics",
+        "type": "metric-strip",
+        "cardIds": [
+          "selected_primary",
+          "completed_bundles",
+          "best_fold_floor",
+          "outer_equivalence",
+          "material_gate"
+        ]
+      },
+      {
+        "id": "interpretation",
+        "type": "markdown",
+        "body": "The selected primary value above is the strongest retained fallback seed, not a multi-seed mean and not a challenger improvement. The valid five-seed FM mean is 0.6015721679. Candidate comparisons must use matched seeds and the same scorer; comparing a seed-0 candidate against the retained seed-4 fallback can manufacture a difference larger than the only prior matched-seed challenger effect.",
+        "sourceId": "official_fm"
+      },
+      {
+        "id": "plateau_heading",
+        "type": "markdown",
+        "body": "## Why the seven-hour sprint did not move the selected score\n\nThe sprint produced many executable surfaces, but selection stayed at the same fallback. Twenty-three completed current bundles across the inspected run families contain the same selected candidate and identical final prediction hashes. The newest improvement sequence completed fifteen campaigns without one new outer evaluation. Six historical outer slots were charged to six fingerprints that resolve to the same candidate, source, and three-seed prediction vector."
+      },
+      {
+        "id": "plateau_table",
+        "type": "table",
+        "tableId": "plateau_diagnosis",
+        "layout": "full"
+      },
+      {
+        "id": "fold_chart",
+        "type": "chart",
+        "chartId": "fold_primary_deltas",
+        "layout": "full"
+      },
+      {
+        "id": "fold_readout",
+        "type": "markdown",
+        "body": "The faithful 0.15 pointwise + 0.30 video-type + 0.55 official-FM within-user rank portfolio produced +0.002005756 on Fold B and +0.001987755 on Fold A. It is the closest reproduced treatment, but it still misses the strict both-fold rule by 0.000012245 on Fold A and has no multi-seed or protected confirmation. Attempt 22 did not test that recipe: it moved the largest weight to raw video type, substituted pairwise FM for the control inside the candidate, and then fused against the control a second time.",
+        "sourceId": "portfolio_diagnostic"
+      },
+      {
+        "id": "component_chart",
+        "type": "chart",
+        "chartId": "metric_component_deltas",
+        "layout": "full"
+      },
+      {
+        "id": "component_readout",
+        "type": "markdown",
+        "body": "Across all inspected records, average GAUC gains are about 1.47 times average nDCG@5 gains. The Fold B baseline's large deterioration relative to Fold A is also almost entirely nDCG@5. A new experiment should therefore explain which rank-one-to-five swaps it expects to fix; another global residual model without that mechanism is unlikely to break the plateau.",
+        "sourceId": "attempt16_records"
+      },
+      {
+        "id": "information_heading",
+        "type": "markdown",
+        "body": "## Where new score-moving information still exists\n\nThe selected FM uses only five fields. The research candidates expanded to 83 columns, but prediction-time histories are frozen at the training prefix and do not update through legal query inputs. That leaves exposure, fatigue, first-seen, and time-since-last state unused. The training log also contains strong scenario heterogeneity and dense auxiliary outcomes that can supervise representation learning without becoming inference features."
+      },
+      {
+        "id": "tab_chart",
+        "type": "chart",
+        "chartId": "tab_long_view_rates",
+        "layout": "full"
+      },
+      {
+        "id": "history_chart",
+        "type": "chart",
+        "chartId": "strict_past_coverage",
+        "layout": "full"
+      },
+      {
+        "id": "data_table",
+        "type": "table",
+        "tableId": "data_opportunities",
+        "layout": "full"
+      },
+      {
+        "id": "program_heading",
+        "type": "markdown",
+        "body": "## Prioritized score-improvement program\n\nPriority 1 is the cheapest faithful confirmation of an already-supported composition. Priorities 2–6 introduce distinct information or objective alignment one mechanism at a time. They are ordered by expected information gain and implementation risk, not by architectural novelty."
+      },
+      {
+        "id": "program_table",
+        "type": "table",
+        "tableId": "experiment_program",
+        "layout": "full"
+      },
+      {
+        "id": "aux_heading",
+        "type": "markdown",
+        "body": "## What the bounded diagnostics falsified now\n\nClick and profile-entry are associated with long view, but training standalone auxiliary rankers and blending their scores into the strongest base portfolio made Fold B worse at every tested non-zero weight. This rejects the cheap direct-score shortcut; it does not reject shared-representation multi-task learning or strict-past auxiliary histories."
+      },
+      {
+        "id": "falsified_table",
+        "type": "table",
+        "tableId": "falsified_shortcuts",
+        "layout": "full"
+      },
+      {
+        "id": "validation_heading",
+        "type": "markdown",
+        "body": "## Validation and promotion protocol\n\nFold B is tuning data because it selects fusion weights. Fold A has been repeatedly exposed to later proposal generation and is no longer a pristine holdout. Before consuming another protected query, the project needs a project-wide hypothesis registry, matched candidate/control seeds, user-cluster uncertainty, slice-level nDCG analysis, and a scoring-equivalence ledger that reuses exact prediction evidence instead of charging a new slot."
+      },
+      {
+        "id": "protocol_table",
+        "type": "table",
+        "tableId": "promotion_protocol",
+        "layout": "full"
+      },
+      {
+        "id": "literature",
+        "type": "markdown",
+        "body": "## Primary scientific basis\n\nThe [KuaiRand paper](https://arxiv.org/abs/2208.08696) and [official repository](https://github.com/chongminggao/KuaiRand) establish the standard-policy versus randomized-intervention boundary and the multi-response schema. The [Counterfactual Watch Model](https://arxiv.org/abs/2406.07932) supports duration-aware watch modeling but does not justify replacing the organizer's authoritative label. [MMoE](https://research.google/pubs/modeling-task-relationships-in-multi-task-learning-with-multi-gate-mixture-of-experts/) and YouTube's [multitask ranking system](https://research.google/pubs/recommending-what-video-to-watch-next-a-multitask-ranking-system/) support auxiliary-task learning when task relationships are measured. [DIN](https://arxiv.org/abs/1706.06978), [DSIN](https://arxiv.org/abs/1905.06482), and [Latent Cross](https://research.google/pubs/latent-cross-making-use-of-context-in-recurrent-recommender-systems/) support behavior- and context-conditioned representations. The [adaptive holdout literature](https://arxiv.org/abs/1506.02629) explains why repeatedly feeding holdout outcomes back into proposal generation invalidates the interpretation of an untouched test set.\n\nThese publications motivate controlled hypotheses, not guaranteed gains. The local scorer, legal feature boundary, and matched temporal-fold evidence remain authoritative."
+      },
+      {
+        "id": "scope",
+        "type": "markdown",
+        "body": "## Definitions, scope, and limitations\n\nThe official primary metric is the arithmetic mean of GAUC and nDCG@5. GAUC covers mixed-label users and is weighted by positive count; nDCG@5 covers users equally and only values the top five. No single ordinary loss exactly matches both weightings.\n\nThis report used repository code, immutable run artifacts, input-only public/final composition checks, and train-only outcomes. No new paid provider campaign, protected-outcome query, or final-period outcome analysis was run. One exploratory subanalysis accidentally opened a late-log outcome column; every result derived from that access was discarded and excluded from this report, and no model or campaign consumed it. Randomized-log counterfactual training remains blocked until policy propensities, slate semantics, date boundaries, and organizer authorization are established.\n\nThe report does not claim that a hidden score will increase. It identifies the experiments with the strongest current evidence and the gates needed to distinguish a real improvement from another plateau."
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## Concrete next decision\n\nRun the exact trusted three-member rank portfolio as a first-class, hashed, matched-seed experiment; in parallel, implement only the label-free online exposure state needed for Priority 2. Do not spend another protected query until one frozen candidate clears the predeclared fold, uncertainty, and component gates. If neither experiment improves nDCG@5, move to duration-conditioned pairs and the same-capacity watch-progress multi-task control rather than another broad architecture search.\n\n### Further questions\n\n- Which user/slate/duration strata account for Fold B's nDCG@5 collapse?\n- Does the attempt-16 disagreement specialist retain its effect across seeds 1 and 2?\n- Does online exposure state help the 3.6% final-input cold-user segment without harming known users?\n- Are the randomized-log policy fields sufficient for any defensible counterfactual correction, and is their use allowed?"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-30T01:58:20Z",
+    "status": "ready",
+    "datasets": {
+      "selected_primary": [
+        {
+          "value": 0.6020370721817017
+        }
+      ],
+      "completed_bundles": [
+        {
+          "value": 23
+        }
+      ],
+      "best_fold_floor": [
+        {
+          "value": 0.0019877552986145
+        }
+      ],
+      "outer_equivalence": [
+        {
+          "queries": 6,
+          "prediction_vectors": 1
+        }
+      ],
+      "material_gate": [
+        {
+          "value": 0.002
+        }
+      ],
+      "fold_primary_deltas": [
+        {
+          "method": "User-balanced ListNet",
+          "fold": "Fold A",
+          "delta": 0.0015188157558441,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "User-balanced ListNet",
+          "fold": "Fold B",
+          "delta": 0.001647874712944,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Deep-cross calibrator",
+          "fold": "Fold A",
+          "delta": 0.0016562640666962,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Deep-cross calibrator",
+          "fold": "Fold B",
+          "delta": 0.0016001611948013,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Objective-disagreement gate",
+          "fold": "Fold A",
+          "delta": 0.0016002058982849,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Objective-disagreement gate",
+          "fold": "Fold B",
+          "delta": 0.0017493963241577,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "LightGCN",
+          "fold": "Fold A",
+          "delta": 0.0018841922283173,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "LightGCN",
+          "fold": "Fold B",
+          "delta": 0.0010381191968918,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Pointwise offset",
+          "fold": "Fold A",
+          "delta": 0.000991553068161,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Pointwise offset",
+          "fold": "Fold B",
+          "delta": 0.0019217133522034,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Faithful 3-member portfolio",
+          "fold": "Fold A",
+          "delta": 0.0019877552986145,
+          "evidence": "Reproduced train-only diagnostic"
+        },
+        {
+          "method": "Faithful 3-member portfolio",
+          "fold": "Fold B",
+          "delta": 0.0020057559013367,
+          "evidence": "Reproduced train-only diagnostic"
+        },
+        {
+          "method": "Attempt 22 miscomposition",
+          "fold": "Fold A",
+          "delta": 0.0006876587867737,
+          "evidence": "Recorded candidate"
+        },
+        {
+          "method": "Attempt 22 miscomposition",
+          "fold": "Fold B",
+          "delta": 0.0015307068824768,
+          "evidence": "Recorded candidate"
+        }
+      ],
+      "metric_component_deltas": [
+        {
+          "component": "GAUC",
+          "fold": "Fold A",
+          "delta": 0.0022715926170349
+        },
+        {
+          "component": "nDCG@5",
+          "fold": "Fold A",
+          "delta": 0.0009288191795349
+        },
+        {
+          "component": "GAUC",
+          "fold": "Fold B",
+          "delta": 0.002135157585144
+        },
+        {
+          "component": "nDCG@5",
+          "fold": "Fold B",
+          "delta": 0.0013636350631714
+        }
+      ],
+      "tab_long_view_rates": [
+        {
+          "tab": "0",
+          "long_view_rate": 0.042216,
+          "rows": 150013,
+          "row_share": 0.131462
+        },
+        {
+          "tab": "1",
+          "long_view_rate": 0.386074,
+          "rows": 834876,
+          "row_share": 0.731634
+        },
+        {
+          "tab": "2",
+          "long_view_rate": 0.380545,
+          "rows": 39291,
+          "row_share": 0.034432
+        },
+        {
+          "tab": "4",
+          "long_view_rate": 0.489288,
+          "rows": 75524,
+          "row_share": 0.066185
+        },
+        {
+          "tab": "6",
+          "long_view_rate": 0.086954,
+          "rows": 29671,
+          "row_share": 0.026002
+        }
+      ],
+      "strict_past_coverage": [
+        {
+          "history_threshold": "1",
+          "coverage": 0.977031
+        },
+        {
+          "history_threshold": "5",
+          "coverage": 0.890203
+        },
+        {
+          "history_threshold": "10",
+          "coverage": 0.792144
+        },
+        {
+          "history_threshold": "20",
+          "coverage": 0.62698
+        }
+      ],
+      "plateau_diagnosis": [
+        {
+          "finding": "Selected model never changed",
+          "evidence": "23 completed current bundles select official-fm-fallback-seed-4 and share the same final-submission and validation-prediction hashes.",
+          "score_consequence": "No amount of candidate-side code can change the submitted ranking while final selection returns the fallback.",
+          "response": "Evaluate the exact artifact that would be deployed and report challenger-versus-matched-control evidence separately."
+        },
+        {
+          "finding": "Strongest portfolio was misreplayed",
+          "evidence": "The supported 0.15/0.30/0.55 pointwise/video-type/control rank blend became pairwise/pointwise/raw-video-type plus a second outer blend.",
+          "score_consequence": "Attempt 22 measured a different, scale-sensitive model and lost roughly half of the supported fold gain.",
+          "response": "Add trusted three-member within-user rank fusion and replay the frozen weights exactly."
+        },
+        {
+          "finding": "Outer budget counted operational identity",
+          "evidence": "Six completed ledger queries have six fingerprints but one candidate, one source, and one three-seed prediction vector.",
+          "score_consequence": "New candidates cannot be promoted, while exact replays consumed scarce score slots.",
+          "response": "Preserve history; add scoring-equivalence identity and reuse receipts. Obtain reviewed budget authority before any new protected query."
+        },
+        {
+          "finding": "Fold evidence is adaptively reused",
+          "evidence": "Fold B selects fusion weights; Fold A outcomes have been fed into later proposals across many campaign restarts.",
+          "score_consequence": "Positive fold deltas increasingly measure selection on known samples rather than generalization.",
+          "response": "Use project-wide hypothesis accounting, nested rolling-origin analysis, matched seeds, and user-cluster intervals."
+        },
+        {
+          "finding": "Implementation failures became fake rejections",
+          "evidence": "Six failed candidate executions were reflected with official-FM sentinel metrics and zero runtime instead of null candidate metrics.",
+          "score_consequence": "Potential mechanisms can be blacklisted as scientifically weak even though they never produced predictions.",
+          "response": "Separate execution_failed from scientifically_rejected; never attach fallback scores to an unscored candidate."
+        }
+      ],
+      "data_opportunities": [
+        {
+          "signal": "Scenario/tab specialization",
+          "measurement": "Training long-view rates range from 4.22% on tab 0 to 48.93% on tab 4; tab 1 carries 73.16% of rows at 38.61%.",
+          "implication": "Use shared structure with tab-conditioned calibration or small scenario experts; do not fit one undifferentiated residual."
+        },
+        {
+          "signal": "Label-free online exposure state",
+          "measurement": "Public inputs have earlier same-user context for 82.09% of rows, earlier same-video context for 95.24%, and repeated user-video exposure for 5.67%. Final inputs are at least as rich.",
+          "implication": "Add strict-earlier impression counts, first-seen flags, and time-since-last features; update only after equal-time buckets."
+        },
+        {
+          "signal": "Cold-user shift",
+          "measurement": "Unseen-user rows are 1.59% of public inputs and 3.62% of final inputs, while cold videos and authors are negligible.",
+          "implication": "Gate to an item/author/context specialist for cold users; train unknown embeddings with controlled field dropout."
+        },
+        {
+          "signal": "Dense watch progress",
+          "measurement": "Clipped watch progress correlates 0.596 with long_view, while 20,889 training rows disagree with the nominal threshold reconstruction.",
+          "implication": "Use progress only as a training auxiliary head; keep the supplied long_view label authoritative."
+        },
+        {
+          "signal": "Click and profile outcomes",
+          "measurement": "Train-only phi with long_view is 0.7605 for click and 0.1461 for profile entry.",
+          "implication": "Direct score blending is harmful; test strict-past histories or equal-capacity shared-bottom supervision instead."
+        },
+        {
+          "signal": "Structured metadata",
+          "measurement": "Tags contain 46 tokens across 111 full strings; 1,791 videos are multi-tag. Aspect, upload age, and music fields remain mostly disabled.",
+          "implication": "Use tokenized tag affinities and simple geometry/age interactions only after the higher-priority temporal and objective tests."
+        }
+      ],
+      "experiment_program": [
+        {
+          "priority": 1,
+          "experiment": "Faithful three-member rank portfolio",
+          "treatment": "Treatment: 0.15 pointwise + 0.30 video-type + 0.55 official-FM, each converted to within-user midranks. Control: exact official FM and existing two-member fusion, with no weight retuning. Expected: about +0.002 on both folds with complementary user wins. Falsify if a fold loses the diagnostic value, seed variation dominates, or top-five overlap shows no complementarity.",
+          "control": "Exact official FM and the existing two-member fusion; no weight retuning.",
+          "expected_signature": "Reproduce approximately +0.002 primary on both folds with complementary per-user wins.",
+          "falsifier": "Any fold loses the diagnostic value, seed variation dominates, or top-five overlap shows no complementarity."
+        },
+        {
+          "priority": 2,
+          "experiment": "Online query-exposure and cold-user state",
+          "treatment": "Treatment: strict-earlier user/video/user-video counts, time-since-last, first-seen flags, public-input warm-up for final, and a cold-user gate. Control: frozen-prefix v7 features with identical model and compute. Expected: nDCG gain in repeat and cold-user slices. Falsify if shuffled-safe exposure features match treatment or gains vanish under same-timestamp isolation.",
+          "control": "Frozen-prefix v7 features with identical model and compute.",
+          "expected_signature": "nDCG gain in repeated-exposure and cold-user slices without regression for established users.",
+          "falsifier": "Shuffle-safe exposure features add no slice gain or improvements vanish under same-timestamp isolation."
+        },
+        {
+          "priority": 3,
+          "experiment": "Duration-conditioned logged pairs",
+          "treatment": "Treatment: fixed mixture of uniform observed same-user pairs and same-duration-bucket pairs at equal total budget. Control: exact protected positive-ticket, uniform-negative GAUC sampler. Expected: better top-five swaps within duration regimes. Falsify if shuffled duration buckets perform the same or gains do not localize to duration slices.",
+          "control": "Exact protected positive-ticket, uniform-negative GAUC sampler.",
+          "expected_signature": "Better top-five swaps within duration regimes and primary gain without broad GAUC loss.",
+          "falsifier": "Shuffled duration buckets perform the same or gains do not appear in duration slices."
+        },
+        {
+          "priority": 4,
+          "experiment": "Same-capacity watch-progress multi-task model",
+          "treatment": "Treatment: shared bottom with authoritative long_view and clipped-progress heads; add click only after the two-head result. Control: equal-capacity long_view-only network, auxiliary weight zero, and shuffled progress. Expected: more stable threshold-near and sparse-history ordering. Falsify if only auxiliary loss moves or shuffled progress matches treatment.",
+          "control": "Equal-capacity long_view-only network, auxiliary weight zero, and shuffled progress.",
+          "expected_signature": "More stable ordering near the long-view boundary and in sparse-history users.",
+          "falsifier": "Auxiliary loss improves while organizer primary does not, or shuffled progress matches treatment."
+        },
+        {
+          "priority": 5,
+          "experiment": "Top-five objective and hard-negative ablation",
+          "treatment": "Treatment: corrected LambdaLoss@5 or 50/50 uniform and previous-epoch observed hard negatives, with fixed representation and budget. Control: current positive-only list loss and exact uniform-negative sampler. Expected: nDCG@5 moves more than GAUC at ranks one through five. Falsify if top-five swaps do not improve or stale-score mining dominates.",
+          "control": "Current positive-only list loss and exact uniform-negative pairwise sampler.",
+          "expected_signature": "nDCG@5 improves more than GAUC, concentrated at ranks one through five.",
+          "falsifier": "No top-five swap improvement, stale-score mining dominates, or only a library metric moves."
+        },
+        {
+          "priority": 6,
+          "experiment": "Scenario experts and structured tag affinity",
+          "treatment": "Treatment: small tab-conditioned experts plus tokenized user-tag strict-past affinity and support-aware smoothing. Control: equal-capacity shared model with raw tab and existing aggregates. Expected: gains in low-support tabs and cold users without losing tab 1. Falsify if routing merely reproduces prevalence or token shuffling preserves the gain.",
+          "control": "Same total-capacity shared model with raw tab and existing aggregate scopes.",
+          "expected_signature": "Gains in low-support tabs and cold-user rows without losing dominant tab 1.",
+          "falsifier": "Expert routing collapses to tab prevalence or token shuffling preserves the gain."
+        },
+        {
+          "priority": 7,
+          "experiment": "Randomized-log representation transfer",
+          "treatment": "Treatment only after authorization: support audit and representation regularization, with standard-policy evaluation authoritative. Control: standard-policy-only training. Expected: robustness only in supported user-item regions. Block or falsify if policy semantics, support, dates, or organizer permission cannot be established.",
+          "control": "Standard-policy-only training.",
+          "expected_signature": "Improved robustness in supported user-item regions without relying on unavailable propensities.",
+          "falsifier": "Policy semantics, action support, date boundaries, or organizer permission cannot be established."
+        }
+      ],
+      "falsified_shortcuts": [
+        {
+          "idea": "Direct click-ranker score blend",
+          "result": "All tested Fold B weights from 0.05 to 0.20 were worse than the base portfolio; the selector chose weight 0.",
+          "decision": "Do not blend a standalone click rank score. Retain click only for strict-past histories or controlled multi-task supervision."
+        },
+        {
+          "idea": "Direct profile-entry ranker score blend",
+          "result": "All tested Fold B weights from 0.05 to 0.20 reduced primary; the selector chose weight 0.",
+          "decision": "Do not use profile entry as a direct ranking score."
+        },
+        {
+          "idea": "Attempt 22 raw three-way composition",
+          "result": "Produced +0.000688 on Fold A and +0.001531 on Fold B versus +0.001988/+0.002006 for the faithful rank portfolio.",
+          "decision": "Treat Attempt 22 as a wiring failure, not evidence against the intended portfolio."
+        },
+        {
+          "idea": "Prior matched-seed LambdaRank challenger",
+          "result": "Mean primary delta was +0.00004225; one of three seeds was negative and the user-cluster interval crossed zero.",
+          "decision": "Treat as noise, not performance evidence."
+        },
+        {
+          "idea": "More broad residual capacity on the same matrix",
+          "result": "Listwise, deep-cross, graph, attention, manifold, and temporal residual candidates repeatedly plateau around sub-0.002 fold gains.",
+          "decision": "Require a distinct information source or metric mechanism before adding architecture."
+        },
+        {
+          "idea": "Naive IPS or full-catalog negative correction",
+          "result": "The local impression log has no displayed-slate ranks or action propensities, and the randomized-log policy semantics are unresolved.",
+          "decision": "Do not claim unbiased counterfactual learning without the missing support and policy information."
+        }
+      ],
+      "promotion_protocol": [
+        {
+          "gate": "Reproducible artifact",
+          "requirement": "Hash source, feature schema, data window, seed, model, fusion recipe, and exact prediction vector; evaluate the artifact that would be submitted.",
+          "reason": "Prevents a diagnostic recipe or fallback from being reported as a challenger."
+        },
+        {
+          "gate": "Matched multi-seed comparison",
+          "requirement": "At minimum seeds 0, 1, and 2 for both candidate and control; report per-seed deltas, mean, dispersion, and rank-averaged ensemble.",
+          "reason": "The FM seed range is about 0.000947, much larger than the prior matched-seed gain."
+        },
+        {
+          "gate": "Temporal evidence",
+          "requirement": "Freeze every choice before Fold A, add rolling-origin day slices, and stop feeding confirmation results into proposal generation.",
+          "reason": "Fold B is selected on and Fold A has been adaptively reused."
+        },
+        {
+          "gate": "User-cluster uncertainty",
+          "requirement": "Bootstrap complete users and report GAUC, nDCG@5, primary, and a confidence interval for paired deltas.",
+          "reason": "Rows within a user are not independent; the prior interval crossed zero."
+        },
+        {
+          "gate": "Component and slice safety",
+          "requirement": "Predeclare the +0.002 per-fold primary rule, component-regression tolerance, and slices for tab, duration, history, slate size, positives, and cold start.",
+          "reason": "The present bottleneck is top-five behavior and could be hidden by aggregate GAUC."
+        },
+        {
+          "gate": "Scoring equivalence",
+          "requirement": "Deduplicate exact within-user ordering or aligned prediction digests and reuse prior receipts; never rewrite the append-only history.",
+          "reason": "Six nominal outer slots currently represent one prediction hypothesis."
+        },
+        {
+          "gate": "Failure truthfulness",
+          "requirement": "Execution failures carry null metrics and cannot advance non-material convergence or mechanism blacklists.",
+          "reason": "A model that never scored has not been scientifically rejected."
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "official_fm",
+      "label": "Official FM five-seed qualification manifest",
+      "path": "runs/wp3-official-qualification-production/manifest.json",
+      "query": {
+        "engine": "repository-json",
+        "sql": "SELECT 0.6020370721817017 AS value FROM official_fm_five_seed_qualification WHERE retained_seed = 4;",
+        "description": "Canonical matched-seed baseline distribution and selected fallback evidence.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "runs/wp3-official-qualification-production/manifest.json"
+        ]
+      }
+    },
+    {
+      "id": "run_census",
+      "label": "Immutable campaign databases, final manifests, and prediction artifacts",
+      "path": "runs",
+      "query": {
+        "engine": "sqlite-and-json",
+        "sql": "SELECT finding, evidence, score_consequence, response FROM reviewed_campaign_artifact_census;",
+        "description": "Read-only run-artifact census; closed bundles were not modified.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "runs/*/campaign.sqlite3",
+          "runs/*/final/manifest.json",
+          "runs/*/production/scientific-records/*.json"
+        ]
+      }
+    },
+    {
+      "id": "fold_records",
+      "label": "Frozen temporal-fold scientific records and portfolio diagnostic",
+      "path": "runs/improvement-20260830-attempt-22/production/scientific-records",
+      "query": {
+        "engine": "repository-json",
+        "sql": "SELECT method, fold, delta, evidence FROM reviewed_temporal_fold_records;",
+        "description": "Comparison of recorded candidates with the faithful pointwise/video-type/control rank portfolio.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "runs/improvement-20260830-attempt-*/production/scientific-records/*.json",
+          "runs/diagnostics/pointwise_video_type_ensemble.py"
+        ]
+      }
+    },
+    {
+      "id": "attempt16_records",
+      "label": "Attempt 16 objective-disagreement scientific records",
+      "path": "runs/improvement-20260830-attempt-16/production/scientific-records",
+      "query": {
+        "engine": "repository-json",
+        "sql": "SELECT component, fold, delta FROM attempt16_objective_disagreement_records;",
+        "description": "Best worst-fold recorded candidate and component-level evidence.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "runs/improvement-20260830-attempt-16/production/scientific-records/c72ed7a2ed376d536966a1e4c17c3dcfe23be44332811deb13ced34403c2c1bc.json",
+          "runs/improvement-20260830-attempt-16/production/scientific-records/ee6a09d71e7e6231850586c280f03b47fff73ccc638a15404d46de3a5e46a199.json"
+        ]
+      }
+    },
+    {
+      "id": "portfolio_diagnostic",
+      "label": "Faithful three-member rank-portfolio diagnostic",
+      "path": "runs/diagnostics/pointwise_video_type_ensemble.py",
+      "query": {
+        "engine": "python",
+        "sql": "SELECT 0.0019877552986145 AS fold_a_delta, 0.0020057559013367 AS fold_b_delta FROM faithful_three_member_train_diagnostic;",
+        "description": "Train-fold-only replay of 0.15 pointwise, 0.30 video-type, and 0.55 official-FM within-user rank fusion.",
+        "executed_at": "2026-08-30T01:25:00Z",
+        "tables_used": [
+          "data/train",
+          "src/kuairand_agent/data/folds.py"
+        ]
+      }
+    },
+    {
+      "id": "outer_ledger",
+      "label": "Append-only outer-query ledger",
+      "path": "runs/outer-query-ledger.sqlite3",
+      "query": {
+        "engine": "sqlite",
+        "sql": "SELECT COUNT(*) AS completed_queries, COUNT(DISTINCT json_extract(metadata_json, '$.trusted_seed_evidence')) AS distinct_prediction_vectors FROM outer_queries WHERE event_seq = 2 AND state = 'COMPLETED';",
+        "description": "Counts completed scoring events and distinct trusted three-seed prediction vectors without mutating the ledger.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "outer_queries"
+        ]
+      }
+    },
+    {
+      "id": "train_signal_audit",
+      "label": "Train-only signal and temporal-context diagnostic",
+      "path": "docs/research/analyze_train_signal_headroom.py",
+      "query": {
+        "engine": "python",
+        "sql": "SELECT tab, long_view_rate, rows, row_share FROM train_only_signal_audit;",
+        "description": "Read-only analysis of train-member auxiliary associations, tab prevalence, user-history coverage, and temporal context.",
+        "executed_at": "2026-08-30T01:34:00Z",
+        "tables_used": [
+          "data/train"
+        ]
+      }
+    },
+    {
+      "id": "auxiliary_pilot",
+      "label": "Train-only auxiliary direct-rank pilot",
+      "path": "docs/research/evaluate_auxiliary_ranker_pilot.py",
+      "query": {
+        "engine": "python",
+        "sql": "SELECT idea, result, decision FROM train_only_auxiliary_pilot;",
+        "description": "Bounded Fold-B auxiliary-ranker blend controls using no public or final outcomes.",
+        "executed_at": "2026-08-30T01:47:00Z",
+        "tables_used": [
+          "data/train",
+          "src/kuairand_agent/data/folds.py"
+        ]
+      }
+    },
+    {
+      "id": "implementation_audit",
+      "label": "Input-only implementation-readiness audit",
+      "path": "docs/research/implementation-readiness-research.md",
+      "query": {
+        "engine": "repository-analysis",
+        "sql": "SELECT quantity, train_value, public_input_value FROM documented_input_only_audit;",
+        "description": "Row counts, cold entities, repeated pairs, and five-seed starter reproduction.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "docs/research/implementation-readiness-research.md"
+        ]
+      }
+    },
+    {
+      "id": "research_review",
+      "label": "Primary-source score-improvement literature review",
+      "path": "docs/research/score_improvement_literature.md",
+      "query": {
+        "engine": "primary-source-review",
+        "sql": "SELECT priority, experiment, treatment, control, expected_signature, falsifier FROM primary_source_decision_register ORDER BY priority;",
+        "description": "Primary-source literature synthesis with source-to-decision register and repository-specific experiment ladder.",
+        "executed_at": "2026-08-30T01:58:20Z",
+        "tables_used": [
+          "docs/research/score_improvement_literature.md"
+        ]
+      }
+    }
+  ]
+}

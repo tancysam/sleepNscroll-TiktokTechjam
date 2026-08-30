@@ -109,6 +109,24 @@ def test_materialization_is_disposable_reproducible_and_parent_preserving(
 def test_live_model_overlay_cannot_replace_stable_candidate_wrapper() -> None:
     with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
         validate_model_generated_overlay(package("candidate.py", CHANGED_SOURCE))
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(package("reference_pairwise_fm.py", CHANGED_SOURCE))
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(
+            package("reference_categorical_ranker.py", CHANGED_SOURCE)
+        )
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(package("reference_listnet_ranker.py", CHANGED_SOURCE))
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(
+            package("reference_observed_pair_fm.py", CHANGED_SOURCE)
+        )
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(
+            package("reference_observed_pair_objectives.py", CHANGED_SOURCE)
+        )
+    with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
+        validate_model_generated_overlay(package("reference_pointwise_ranker.py", CHANGED_SOURCE))
 
     validate_model_generated_overlay(
         package("model_impl.py", "def score(value):\n    return value + 1\n")

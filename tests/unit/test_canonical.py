@@ -15,10 +15,37 @@ from kuairand_agent.data.canonical import (
     VIDEO_BASIC_FILENAME,
     VIDEO_BASIC_HEADER,
     CanonicalDataError,
+    CanonicalInputs,
     ProtectedTargets,
     TrainingTargets,
     load_canonical_dataset,
 )
+
+
+def test_canonical_v1_identity_remains_compatible_with_feature_extensions() -> None:
+    normal = CanonicalInputs(
+        user_id=("1", "2"),
+        video_id=("10", "20"),
+        date=(20220408, 20220409),
+        duration_ms=(10_000.0, 20_000.0),
+        tab=("0", "1"),
+        author_id=("100", "200"),
+        time_ms=(1, 2),
+        video_type=("NORMAL", "NORMAL"),
+    )
+    extended = CanonicalInputs(
+        user_id=("1", "2"),
+        video_id=("10", "20"),
+        date=(20220408, 20220409),
+        duration_ms=(10_000.0, 20_000.0),
+        tab=("0", "1"),
+        author_id=("100", "200"),
+        time_ms=(1, 2),
+        video_type=("NORMAL", "AD"),
+    )
+
+    assert normal.video_type != extended.video_type
+    assert normal.digest == extended.digest
 
 
 def _log_row(**overrides: str) -> list[str]:
@@ -127,12 +154,14 @@ def test_canonical_order_duplicate_pairs_alignment_and_phase_target_boundary(
     assert dataset.train.alignment.video_id == ("010", "010", "010")
     assert dataset.train.alignment.row_id[:2] == (0, 1)  # repeated pair remains two rows
     assert dataset.train.inputs.author_id == ("090", "090", "090")
+    assert dataset.train.inputs.video_type == ("NORMAL", "NORMAL", "NORMAL")
 
     assert isinstance(dataset.train.targets, TrainingTargets)
     assert dataset.train.targets.long_view == (1, 0, 0)
     assert isinstance(dataset.valid.targets, ProtectedTargets)
     assert dataset.valid.targets.reveal_for_scorer() == (1,)
     assert dataset.valid.inputs.author_id == ("UNK",)
+    assert dataset.valid.inputs.video_type == ("UNKNOWN",)
     assert dataset.final.targets is None
     assert dataset.test is dataset.final
 

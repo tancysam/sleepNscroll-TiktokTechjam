@@ -21,7 +21,10 @@ from types import MappingProxyType
 from typing import Final, Protocol
 
 from kuairand_agent.campaign.budgets import LaunchCategory
-from kuairand_agent.campaign.convergence import ConvergenceState
+from kuairand_agent.campaign.convergence import (
+    CompletedScientificIteration,
+    ConvergenceState,
+)
 from kuairand_agent.campaign.store import (
     ArtifactSpec,
     CampaignStore,
@@ -336,6 +339,8 @@ class ResearchLedger(Protocol):
 
     def convergence(self) -> ConvergenceState: ...
 
+    def next_iteration_number(self) -> int: ...
+
     def create_iteration(self, experiment_id: str, iteration: int, proposal: Proposal) -> None: ...
 
     def record_proposal(
@@ -467,6 +472,15 @@ class CampaignStoreResearchLedger:
 
     def convergence(self) -> ConvergenceState:
         return ConvergenceState.from_manifest(self.store.snapshot().convergence_state)
+
+    def next_iteration_number(self) -> int:
+        """Return the durable attempt cursor, independent of scientific convergence."""
+
+        for iteration in range(1, _MAX_ITERATIONS + 1):
+            experiment_id = f"iteration-{iteration:02d}"
+            if self.store.experiment(experiment_id) is None:
+                return iteration
+        raise ResearchLoopError("the durable research-attempt limit is exhausted")
 
     def create_iteration(self, experiment_id: str, iteration: int, proposal: Proposal) -> None:
         self.store.create_experiment(
@@ -735,6 +749,8 @@ class CampaignStoreResearchLedger:
         evaluation: TrustedEvaluation,
     ) -> None:
         summary = evaluation.summary
+        if summary.gauc is None or summary.ndcg_at_5 is None or summary.primary is None:
+            raise ResearchLoopError("an unscored evaluation cannot be recorded as a metric")
         self.store.record_metric(
             metric_id=f"{execution_id}-trusted-metric",
             split_role=summary.tier,
@@ -1338,7 +1354,7 @@ class ResearchCampaignLoop:
         *,
         experiment_id: str,
         state: str,
-        eligible_outer_primary: float | None,
+        observation: CompletedScientificIteration | None,
         operation: str,
         reason: str,
     ) -> None:
@@ -1349,9 +1365,9 @@ class ResearchCampaignLoop:
             operation=operation,
             reason=reason,
         )
-        current = self.ledger.convergence()
-        updated = current.update_after_iteration(eligible_outer_primary)
-        self.ledger.update_convergence(updated)
+        if observation is not None:
+            current = self.ledger.convergence()
+            self.ledger.update_convergence(current.observe(observation))
 
     def _close_pre_admission_rejection(
         self,
@@ -1382,7 +1398,7 @@ class ResearchCampaignLoop:
         self._close(
             experiment_id=experiment_id,
             state="FAILED",
-            eligible_outer_primary=None,
+            observation=None,
             operation="close",
             reason="close rejected proposal without invoking implementation",
         )
@@ -1513,7 +1529,7 @@ class ResearchCampaignLoop:
             self._close(
                 experiment_id=experiment_id,
                 state="FAILED",
-                eligible_outer_primary=None,
+                observation=None,
                 operation="close",
                 reason="close failed scientific iteration without changing incumbent",
             )
@@ -1589,7 +1605,7 @@ class ResearchCampaignLoop:
             self._close(
                 experiment_id=experiment_id,
                 state="FAILED",
-                eligible_outer_primary=None,
+                observation=None,
                 operation="close",
                 reason="close failed execution without changing incumbent",
             )
@@ -1662,7 +1678,7 @@ class ResearchCampaignLoop:
             self._close(
                 experiment_id=experiment_id,
                 state="FAILED",
-                eligible_outer_primary=eligible,
+                observation=CompletedScientificIteration(eligible),
                 operation="close",
                 reason="close evaluated iteration after reflection failure",
             )
@@ -1724,7 +1740,7 @@ class ResearchCampaignLoop:
         self._close(
             experiment_id=experiment_id,
             state="REFLECTED",
-            eligible_outer_primary=eligible_outer,
+            observation=CompletedScientificIteration(eligible_outer),
             operation="selection",
             reason=decision.reason,
         )
@@ -1753,16 +1769,17 @@ class ResearchCampaignLoop:
             raise ResearchLoopError("initial parent must be the ledger's replay-verified incumbent")
         results: list[IterationResult] = []
         current_parent = parent
+        iteration = self.ledger.next_iteration_number()
         for _ in range(max_iterations):
             convergence = self.ledger.convergence()
             if not convergence.may_launch_scientific_iteration:
                 break
-            iteration = convergence.completed_iterations + 1
             item, current_parent = self._run_iteration(
                 iteration=iteration,
                 parent=current_parent,
             )
             results.append(item)
+            iteration += 1
         return CampaignLoopResult(
             selected_candidate_id=self.ledger.incumbent().incumbent_id,
             fallback_candidate_id=self.ledger.fallback_candidate_id,

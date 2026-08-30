@@ -219,19 +219,152 @@ def _observe_candidate_failure(
     )
 
 
-def _proposal_family(proposal: Proposal) -> str:
-    scientific_text = " ".join(
-        (proposal.objective, proposal.mechanism, proposal.principal_change)
-    ).lower()
+_NEGATED_FAMILY_CLAUSE = re.compile(
+    r"\b(?:not(?:\s+another)?|no|without|avoid(?:s|ed|ing)?|excluding|rather\s+than)\b"
+    r"[^.;]*"
+)
+
+_REPLACEMENT_TARGET = re.compile(r"\breplace\b.*\bwith\b(?P<target>.*)")
+
+
+def _asserted_proposal_text(value: str) -> str:
+    """Prefer the destination of an explicit replacement over the discarded family."""
+
+    asserted = _NEGATED_FAMILY_CLAUSE.sub(" ", value.lower())
+    replacement = _REPLACEMENT_TARGET.search(asserted)
+    return replacement.group("target") if replacement is not None else asserted
+
+
+def classify_proposal_family(proposal: Proposal) -> str:
+    # Research proposals routinely distinguish a new mechanism by naming families it is *not*.
+    # Those comparison clauses are negative evidence and must not poison the novelty ledger. An
+    # explicit "replace X with Y" has the same asymmetry: Y is the proposed family and X is only
+    # parent context. Prefer the structured principal change, then mechanism, then objective.
+    asserted_fields = tuple(
+        _asserted_proposal_text(value)
+        for value in (proposal.principal_change, proposal.mechanism, proposal.objective)
+    )
     families = (
+        (
+            "neural",
+            (
+                "multilayer perceptron",
+                "residual mlp",
+                "neural network",
+                "neural representation",
+                "mlp model",
+                "deepfm",
+                "deep fm",
+            ),
+        ),
+        (
+            "pointwise",
+            (
+                "pointwise",
+                "binary probability",
+                "binary-probability",
+                "binary classification",
+            ),
+        ),
         ("pairwise", ("pairwise", "bpr")),
         ("listwise", ("listwise", "lambdarank", "lambda rank")),
         ("duration-bucket", ("duration bucket", "duration-bucket")),
         ("user-balanced", ("user balanced", "user-balanced")),
     )
-    for family, markers in families:
-        if any(marker in scientific_text for marker in markers):
-            return family
+    combined = " ".join(asserted_fields)
+    organizer_fm_markers = (
+        "organizer categorical code",
+        "organizer categorical codes",
+        "five-field fm",
+        "five field fm",
+        "gauc-aligned",
+        "gauc aligned",
+        "protected pairwise-fm",
+        "protected pairwise fm",
+        "reference_pairwise_fm",
+        "reference pairwise fm",
+        "reference-conditioned",
+        "reference conditioned",
+    )
+    base_family: str | None = None
+    if any(marker in combined for marker in organizer_fm_markers):
+        # A protected pairwise FM can be the immutable input to a materially new objective. In
+        # that composition, mentioning the inherited backbone must not mask the new trainable
+        # mechanism. Prefer an explicit listwise objective, then a neural representation, then a
+        # pointwise objective; an exact standalone reference falls through to pairwise below.
+        composition_families = (
+            ("listwise", ("listwise", "lambdarank", "lambda rank")),
+            (
+                "neural",
+                (
+                    "multilayer perceptron",
+                    "residual mlp",
+                    "neural network",
+                    "neural representation",
+                    "mlp model",
+                    "deepfm",
+                    "deep fm",
+                ),
+            ),
+            (
+                "pointwise",
+                (
+                    "pointwise",
+                    "binary probability",
+                    "binary-probability",
+                    "binary classification",
+                ),
+            ),
+        )
+        base_family = next(
+            (
+                family
+                for family, markers in composition_families
+                if any(marker in combined for marker in markers)
+            ),
+            None,
+        )
+    if base_family is None:
+        for asserted_text in asserted_fields:
+            for family, markers in families:
+                if any(marker in asserted_text for marker in markers):
+                    base_family = family
+                    break
+            if base_family is not None:
+                break
+    if base_family is not None:
+        # The novelty ledger must block repeated mechanisms, not every future use of the same
+        # loss. A history-derived LambdaRank branch is scientifically distinct from a
+        # field-aware LambdaRank branch even though both are listwise. Keep the axis vocabulary
+        # deliberately small and evidence-oriented so cosmetic renames do not evade the guard.
+        axes = (
+            (
+                "history-reliability",
+                (
+                    "history reliability",
+                    "history-reliability",
+                    "exposure reliability",
+                    "exposure-reliability",
+                    "cross-scope disagreement",
+                    "cross-scope-disagreement",
+                ),
+            ),
+            (
+                "field-aware",
+                ("field-aware", "field aware", "partner-specific embedding"),
+            ),
+            (
+                "organizer-fm",
+                organizer_fm_markers,
+            ),
+            ("deep-cross", ("dcnv2", "deep & cross", "deep and cross", "cross network")),
+            ("native-categorical", ("native-categorical", "native categorical")),
+        )
+        axis = next(
+            (name for name, markers in axes if any(marker in combined for marker in markers)),
+            None,
+        )
+        return base_family if axis is None else f"{base_family}:{axis}"
     normalized = re.sub(r"[^a-z0-9]+", "-", proposal.objective.lower()).strip("-")
     return normalized[:64] or "unknown"
 
@@ -1096,7 +1229,7 @@ def prepare_or_rehydrate_live_lineage(
         )
         proposal = model.propose(proposal_request)
         candidate_id = f"candidate-{scientific_iteration:02d}-{proposal.digest[:16]}"
-        proposal_family = _proposal_family(proposal)
+        proposal_family = classify_proposal_family(proposal)
         try:
             proposal_request.source_policy.validate_manifest(
                 proposal.files_expected,
@@ -1226,7 +1359,7 @@ def prepare_or_rehydrate_live_lineage(
                         diagnostic=str(exc),
                         root_failure=root_failure,
                         terminal_failure=observed_failure,
-                        proposal_family=_proposal_family(proposal),
+                        proposal_family=classify_proposal_family(proposal),
                         proposal_signature=_proposal_signature(proposal),
                     ) from exc
                 failed_child = (

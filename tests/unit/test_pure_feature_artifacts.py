@@ -19,7 +19,8 @@ from kuairand_agent.campaign.pure_feature_artifacts import (
     save_pure_feature_pair,
     verify_pure_feature_artifact,
 )
-from kuairand_agent.campaign.pure_features import PureFeaturePair
+from kuairand_agent.campaign.pure_features import PureFeaturePair, build_pure_feature_pair
+from kuairand_agent.data.canonical import CanonicalInputs
 from kuairand_agent.data.causal_features import FeatureMatrix
 
 
@@ -44,6 +45,43 @@ def _pair() -> PureFeaturePair:
         dataset_digest="a" * 64,
         split_role="fold-b",
         causal_cache_key="b" * 64,
+        categorical_encoding_digest="c" * 64,
+        auxiliary_history_cache_key="d" * 64,
+        feature_schema_version=7,
+        feature_policy="pure-causal-tree-features-v7",
+    )
+
+
+def _current_v8_pair() -> PureFeaturePair:
+    prefix = CanonicalInputs(
+        user_id=("u", "u"),
+        video_id=("v1", "v2"),
+        date=(20220408, 20220408),
+        duration_ms=(10_000.0, 20_000.0),
+        tab=("0", "0"),
+        author_id=("a", "a"),
+        time_ms=(1, 2),
+        video_type=("NORMAL", "AD"),
+    )
+    query = CanonicalInputs(
+        user_id=("u",),
+        video_id=("v1",),
+        date=(20220409,),
+        duration_ms=(10_000.0,),
+        tab=("0",),
+        author_id=("a",),
+        time_ms=(3,),
+        video_type=("NORMAL",),
+    )
+    return build_pure_feature_pair(
+        prefix_inputs=prefix,
+        prefix_labels=(1, 0),
+        prefix_click_labels=(1, 0),
+        prefix_watch_progress=(1.2, 0.4),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-b",
+        builder_source_digest="b" * 64,
     )
 
 
@@ -64,7 +102,7 @@ def test_pair_round_trip_is_byte_deterministic_and_float64_exact(tmp_path: Path)
     assert first.manifest() == second.manifest()
     assert first.npz_sha256 == "61fdf1ce3ca7add3d950670dec87ed8f1b0e45c4276ee9ebfe3dbd8be7ae8c6f"
     assert (
-        first.manifest_sha256 == "f84715bc9216c27898792e4a66e13f17287f3ffdf2a3d4d7543b3cc026147b61"
+        first.manifest_sha256 == "d15daf1fcd51088f3e353f4dd4e284fafc038f025b69c7cd4d4cb9b5883f6630"
     )
     assert restored.digest == pair.digest
     assert restored.prefix.values.tobytes() == pair.prefix.values.tobytes()
@@ -75,6 +113,202 @@ def test_pair_round_trip_is_byte_deterministic_and_float64_exact(tmp_path: Path)
     assert first.npz_path.stat().st_nlink == 1
     assert first.manifest_path.stat().st_nlink == 1
     assert not tuple(tmp_path.glob(".*.tmp"))
+
+
+def test_schema_v1_feature_artifact_remains_replayable(tmp_path: Path) -> None:
+    current = _pair()
+    historical = PureFeaturePair(
+        prefix=current.prefix,
+        query=current.query,
+        dataset_digest=current.dataset_digest,
+        split_role=current.split_role,
+        causal_cache_key=current.causal_cache_key,
+        feature_schema_version=1,
+        feature_policy="pure-causal-tree-features-v1",
+    )
+    artifact = save_pure_feature_pair(tmp_path / "historical.npz", historical)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == 1
+    assert restored.feature_policy == "pure-causal-tree-features-v1"
+    assert "recency" not in restored.manifest()
+    assert restored.digest == historical.digest
+
+
+def test_schema_v2_feature_artifact_remains_replayable(tmp_path: Path) -> None:
+    current = _pair()
+    historical = PureFeaturePair(
+        prefix=current.prefix,
+        query=current.query,
+        dataset_digest=current.dataset_digest,
+        split_role=current.split_role,
+        causal_cache_key=current.causal_cache_key,
+        feature_schema_version=2,
+        feature_policy="pure-causal-tree-features-v2",
+    )
+    artifact = save_pure_feature_pair(tmp_path / "historical-v2.npz", historical)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == 2
+    assert restored.feature_policy == "pure-causal-tree-features-v2"
+    assert "recency" in restored.manifest()
+    assert "categorical_codes" not in restored.manifest()
+    assert restored.digest == historical.digest
+
+
+def test_schema_v3_feature_artifact_remains_replayable(tmp_path: Path) -> None:
+    current = _pair()
+    historical = PureFeaturePair(
+        prefix=current.prefix,
+        query=current.query,
+        dataset_digest=current.dataset_digest,
+        split_role=current.split_role,
+        causal_cache_key=current.causal_cache_key,
+        categorical_encoding_digest="c" * 64,
+        feature_schema_version=3,
+        feature_policy="pure-causal-tree-features-v3",
+    )
+    artifact = save_pure_feature_pair(tmp_path / "historical-v3.npz", historical)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == 3
+    assert restored.feature_policy == "pure-causal-tree-features-v3"
+    assert restored.manifest()["recency"]["half_life_days"] == 3.0  # type: ignore[index]
+    assert "categorical_codes" in restored.manifest()
+    assert restored.digest == historical.digest
+
+
+def test_schema_v4_feature_artifact_remains_replayable_without_auxiliary_history(
+    tmp_path: Path,
+) -> None:
+    current = _pair()
+    historical = PureFeaturePair(
+        prefix=current.prefix,
+        query=current.query,
+        dataset_digest=current.dataset_digest,
+        split_role=current.split_role,
+        causal_cache_key=current.causal_cache_key,
+        categorical_encoding_digest="c" * 64,
+        feature_schema_version=4,
+        feature_policy="pure-causal-tree-features-v4",
+    )
+    artifact = save_pure_feature_pair(tmp_path / "historical-v4.npz", historical)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == 4
+    assert restored.feature_policy == "pure-causal-tree-features-v4"
+    assert restored.manifest()["recency"]["half_life_days"] == [1.0, 3.0, 7.0]  # type: ignore[index]
+    assert "categorical_codes" in restored.manifest()
+    assert "auxiliary_history" not in restored.manifest()
+    assert restored.digest == historical.digest
+
+
+def test_schema_v5_feature_artifact_remains_replayable_without_watch_progress(
+    tmp_path: Path,
+) -> None:
+    current = _pair()
+    historical = PureFeaturePair(
+        prefix=current.prefix,
+        query=current.query,
+        dataset_digest=current.dataset_digest,
+        split_role=current.split_role,
+        causal_cache_key=current.causal_cache_key,
+        categorical_encoding_digest="c" * 64,
+        auxiliary_history_cache_key="d" * 64,
+        feature_schema_version=5,
+        feature_policy="pure-causal-tree-features-v5",
+    )
+    artifact = save_pure_feature_pair(tmp_path / "historical-v5.npz", historical)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == 5
+    assert restored.feature_policy == "pure-causal-tree-features-v5"
+    assert "auxiliary_history" in restored.manifest()
+    assert "watch_progress_history" not in restored.manifest()
+    assert restored.digest == historical.digest
+
+
+@pytest.mark.parametrize("version", (6, 7))
+def test_schema_v6_and_v7_feature_artifacts_remain_replayable(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    current = _pair()
+    historical = PureFeaturePair(
+        prefix=current.prefix,
+        query=current.query,
+        dataset_digest=current.dataset_digest,
+        split_role=current.split_role,
+        causal_cache_key=current.causal_cache_key,
+        categorical_encoding_digest="c" * 64,
+        auxiliary_history_cache_key="d" * 64,
+        feature_schema_version=version,
+        feature_policy=f"pure-causal-tree-features-v{version}",
+    )
+    artifact = save_pure_feature_pair(tmp_path / f"historical-v{version}.npz", historical)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == version
+    assert "watch_progress_history" in restored.manifest()
+    assert ("video_type_code" in restored.manifest()) is (version == 7)
+    assert "input_exposure" not in restored.manifest()
+    assert restored.digest == historical.digest
+
+
+def test_schema_v8_input_exposure_round_trip_is_exact(tmp_path: Path) -> None:
+    pair = _current_v8_pair()
+    artifact = save_pure_feature_pair(tmp_path / "current-v8.npz", pair)
+
+    restored = load_pure_feature_pair(
+        artifact.npz_path,
+        expected_manifest_sha256=artifact.manifest_sha256,
+    )
+
+    assert restored.feature_schema_version == 8
+    assert restored.input_exposure is not None
+    assert restored.input_exposure.digest == pair.input_exposure.digest  # type: ignore[union-attr]
+    assert restored.manifest()["input_exposure"] == pair.manifest()["input_exposure"]
+    assert restored.digest == pair.digest
+    assert restored.prefix.values.tobytes() == pair.prefix.values.tobytes()
+
+
+def test_schema_v8_rejects_missing_input_exposure_manifest(tmp_path: Path) -> None:
+    artifact = save_pure_feature_pair(tmp_path / "current-v8.npz", _current_v8_pair())
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="ascii"))
+    del manifest["pair"]["input_exposure"]
+    forged_payload = _canonical_json(manifest)
+    artifact.manifest_path.chmod(0o600)
+    artifact.manifest_path.write_bytes(forged_payload)
+
+    with pytest.raises(PureFeatureArtifactError, match="logical pair manifest"):
+        load_pure_feature_pair(
+            artifact.npz_path,
+            expected_manifest_sha256=hashlib.sha256(forged_payload).hexdigest(),
+        )
 
 
 def test_save_never_overwrites_either_existing_artifact_file(tmp_path: Path) -> None:

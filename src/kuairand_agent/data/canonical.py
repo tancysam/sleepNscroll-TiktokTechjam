@@ -92,9 +92,11 @@ SAFE_INPUT_FIELDS: Final = (
     "duration_ms",
     "tab",
     "author_id",
+    "video_type",
 )
 TRUSTED_BUILDER_FIELDS: Final = ("time_ms",)
 UNKNOWN_AUTHOR: Final = "UNK"
+UNKNOWN_VIDEO_TYPE: Final = "UNKNOWN"
 
 _LOG_INDEX: Final = MappingProxyType({name: index for index, name in enumerate(LOG_HEADER)})
 _VIDEO_INDEX: Final = MappingProxyType(
@@ -208,6 +210,7 @@ class CanonicalInputs:
     tab: Sequence[str]
     author_id: Sequence[AuthorIdentifier]
     time_ms: Sequence[int]
+    video_type: Sequence[str] = ()
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -216,6 +219,14 @@ class CanonicalInputs:
         dates = _canonical_int_sequence(cast(Sequence[object], self.date), "date")
         tabs = _canonical_text_sequence(cast(Sequence[object], self.tab), "tab")
         times = _canonical_int_sequence(cast(Sequence[object], self.time_ms), "time_ms")
+        video_types = (
+            (UNKNOWN_VIDEO_TYPE,) * len(users)
+            if not self.video_type
+            else _canonical_text_sequence(
+                cast(Sequence[object], self.video_type),
+                "video_type",
+            )
+        )
 
         durations: list[float] = []
         for index, duration_raw in enumerate(self.duration_ms):
@@ -242,6 +253,7 @@ class CanonicalInputs:
             "duration_ms": durations,
             "tab": tabs,
             "author_id": authors,
+            "video_type": video_types,
             "time_ms": times,
         }
         _same_length("canonical input", columns)
@@ -261,6 +273,7 @@ class CanonicalInputs:
         object.__setattr__(self, "duration_ms", tuple(durations))
         object.__setattr__(self, "tab", tabs)
         object.__setattr__(self, "author_id", tuple(authors))
+        object.__setattr__(self, "video_type", video_types)
         object.__setattr__(self, "time_ms", times)
         object.__setattr__(
             self,
@@ -268,6 +281,13 @@ class CanonicalInputs:
             _digest_columns(
                 b"kuairand-canonical-inputs-v1",
                 (
+                    # Keep this v1 identity projection frozen.  It is the immutable dataset
+                    # identity used by the already-qualified organizer FM, whose declared
+                    # capability is these original columns.  Feature extensions such as
+                    # ``video_type`` are validated above and are independently bound into the
+                    # schema-v8 feature-matrix and feature-pair digests.  Adding an extension to
+                    # this historical namespace would invalidate sound qualification evidence
+                    # even though the qualified model's inputs have not changed.
                     ("user_id", users),
                     ("video_id", videos),
                     ("date", dates),
@@ -624,6 +644,7 @@ class _SplitBuilder:
     duration_ms: list[float] = field(default_factory=list)
     tab: list[str] = field(default_factory=list)
     author_id: list[AuthorIdentifier] = field(default_factory=list)
+    video_type: list[str] = field(default_factory=list)
     time_ms: list[int] = field(default_factory=list)
     targets: dict[str, list[TargetValue]] = field(default_factory=dict)
 
@@ -747,9 +768,10 @@ def _project_binary_log_fields(
     return projected
 
 
-def _load_author_map(data_dir: Path) -> tuple[dict[str, str], str]:
+def _load_video_metadata(data_dir: Path) -> tuple[dict[str, str], dict[str, str], str]:
     path = data_dir / VIDEO_BASIC_FILENAME
     authors: dict[str, str] = {}
+    video_types: dict[str, str] = {}
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
         _check_header(path, next(reader, None), VIDEO_BASIC_HEADER)
@@ -759,15 +781,19 @@ def _load_author_map(data_dir: Path) -> tuple[dict[str, str], str]:
                 raise CanonicalDataError(f"{source} has the wrong number of CSV fields")
             video_id = _parse_identifier(row[_VIDEO_INDEX["video_id"]], "video_id", source)
             author_id = _parse_identifier(row[_VIDEO_INDEX["author_id"]], "author_id", source)
+            video_type = row[_VIDEO_INDEX["video_type"]]
+            if not video_type or "\x00" in video_type:
+                raise CanonicalDataError(f"{source} has empty text field video_type")
             if video_id in authors:
                 raise CanonicalDataError(
-                    f"{source} duplicates video_id in the unique author mapping"
+                    f"{source} duplicates video_id in the unique basic-video mapping"
                 )
             authors[video_id] = author_id
+            video_types[video_id] = video_type
     keys = tuple(authors)
     values = tuple(authors[key] for key in keys)
     digest = _digest_columns(b"kuairand-author-map-v1", (("video_id", keys), ("author_id", values)))
-    return authors, digest
+    return authors, video_types, digest
 
 
 def _split_for_date(date: int) -> SplitName | None:
@@ -793,6 +819,7 @@ def _append_row(
     split: SplitName,
     builder: _SplitBuilder,
     author_map: Mapping[str, str],
+    video_type_map: Mapping[str, str],
 ) -> None:
     # The canonical identity is fixed here, before the author lookup (the only join).
     row_id = len(builder.user_id)
@@ -805,12 +832,14 @@ def _append_row(
 
     # A missing basic-video row maps to one value and never changes cardinality.
     author_id: AuthorIdentifier = author_map.get(video_id, UNKNOWN_AUTHOR)
+    video_type = video_type_map.get(video_id, UNKNOWN_VIDEO_TYPE)
     builder.user_id.append(user_id)
     builder.video_id.append(video_id)
     builder.date.append(date)
     builder.duration_ms.append(duration)
     builder.tab.append(tab)
     builder.author_id.append(author_id)
+    builder.video_type.append(video_type)
     builder.time_ms.append(time_ms)
 
     for name in _target_fields_for_split(split):
@@ -832,6 +861,7 @@ def _build_split(name: SplitName, builder: _SplitBuilder) -> CanonicalSplit:
         tab=builder.tab,
         author_id=builder.author_id,
         time_ms=builder.time_ms,
+        video_type=builder.video_type,
     )
     alignment = CanonicalAlignment(
         split=name,
@@ -872,7 +902,7 @@ def load_canonical_dataset(data_dir: str | Path) -> CanonicalDataset:
     root = Path(data_dir).expanduser().resolve(strict=True)
     if not root.is_dir():
         raise CanonicalDataError(f"canonical data path is not a directory: {root}")
-    author_map, author_map_digest = _load_author_map(root)
+    author_map, video_type_map, author_map_digest = _load_video_metadata(root)
     builders = {
         name: _SplitBuilder(
             targets={field_name: [] for field_name in _target_fields_for_split(name)}
@@ -900,6 +930,7 @@ def load_canonical_dataset(data_dir: str | Path) -> CanonicalDataset:
                     split=split,
                     builder=builders[split],
                     author_map=author_map,
+                    video_type_map=video_type_map,
                 )
 
     train = _build_split(SplitName.TRAIN, builders[SplitName.TRAIN])
@@ -938,6 +969,7 @@ __all__ = [
     "STANDARD_LOG_FILENAMES",
     "TRUSTED_BUILDER_FIELDS",
     "UNKNOWN_AUTHOR",
+    "UNKNOWN_VIDEO_TYPE",
     "VIDEO_BASIC_FILENAME",
     "VIDEO_BASIC_HEADER",
     "CanonicalAlignment",
