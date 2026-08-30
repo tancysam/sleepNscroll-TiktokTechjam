@@ -120,15 +120,37 @@ standalone, by 0.003 to 0.010 primary, against a seed-to-seed sigma of 0.0008. T
 hiding that. Your target is to beat `fold_b_control_primary` at the 100/0 point. Fusion can then
 only add to a model that is already competitive; it cannot rescue one that is not.
 
-One structural difference between those losing candidates and the control has never been tested.
-Every one of them built a single factorization-machine interaction over ALL feature columns, so 33
-standardized continuous aggregates share a latent space with the identity codes and cross with
-them. The control crosses only its categorical fields. Crossing continuous magnitudes into the
-same latent space adds many low-signal interaction terms, and that is a plausible cause of the
-persistent deficit. The untested alternative is to match the control's structure first: put ONLY
-the identity codes in the interaction term, keep the causal aggregates as separate additive
-first-order terms, and let the aggregates contribute without polluting the crosses. That is a
-smaller model than the ones that have been failing, not a larger one.
+The scoring structure that closed most of that gap is MEASURED, not a suggestion. Every candidate
+that scored 0.003 to 0.010 below the control built one factorization-machine interaction over ALL
+feature columns, so 33 standardized continuous aggregates shared a latent space with the identity
+codes. The control crosses only its categorical fields. Restricting the interaction to the
+identity codes and keeping the causal aggregates as separate additive first-order terms scored
+0.5745 standalone against a control of 0.5754 — a deficit of about one sigma, down from four to
+twelve. Start from that structure. Two further measurements from the same run: pointwise logistic
+loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
+collapsed it to 0.5630, so do not replace the loss.
+
+The cheapest remaining way to cross the control is SEED ENSEMBLING, and its effect size on this
+exact benchmark is already measured. The five qualified seeds of the official FM score 0.6014695,
+0.6017609, 0.6010903, 0.6015031 and 0.6020371 on public validation; averaging all five scores
+0.6026034, which beats every individual seed including the luckiest. Seed-to-seed sigma is 0.0008
+and averaging removes most of it. That is a larger effect than any modelling change in this
+project's history, and it is available to you inside a single candidate:
+
+- Derive N child seeds deterministically from the `seed` argument you are given, so replay stays
+  byte exact. N = 5 is the measured point.
+- Train N copies of the SAME scorer on the SAME data and store every parameter set in the
+  checkpoint under indexed names.
+- In `predict_scores`, average the N members' scores.
+
+One constraint that will otherwise break this: `predict_scores` receives the feature matrix and
+the checkpoint and NOTHING ELSE. There is no `user_groups` at prediction time, so you cannot rank
+normalise within a user there. Average the raw scores or logits instead. That is valid here
+because every member shares one architecture, one standardisation and one training set, so their
+scales are directly comparable.
+
+This is a variance-reduction change, not a new architecture. Hold the scorer fixed and wrap it in
+a loop. It is a few extra lines, not a bigger model.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive
