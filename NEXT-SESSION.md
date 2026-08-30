@@ -65,7 +65,14 @@ mypy    1 error in src/kuairand_agent/execution/runner.py:909 "Statement is unre
         Not ours.
 ```
 
-**No campaign is currently running.** Two were, and both were stopped at ~11:52 today:
+> **A campaign is running right now.** `runs/maki-overnight-09` was launched at 12:29 SGT on
+> 2026-08-30 on the corrected code, with both provider keys verified live. Do not launch another
+> one — only one campaign may run at a time. Check on it with
+> `ls runs/maki-overnight-09/final/` (empty means still going) and grade it with the ladder in
+> section 3. If it is no longer in `ps -eo pid,args | grep "[.]venv/bin/kuairand-agent"` and there
+> is no `final/` directory, it died: read `logs/overnight-09.log`.
+
+Two earlier campaigns were stopped at ~11:52 today:
 
 | Run dir | Code | Status |
 |---|---|---|
