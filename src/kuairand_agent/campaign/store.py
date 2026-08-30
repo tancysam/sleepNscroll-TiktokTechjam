@@ -4116,6 +4116,13 @@ class LineageEventRecord:
     parent_fold_a_primary: float | None
     parent_fold_b_primary: float | None
     promoted: bool | None
+    # The hyperparameters that produced the metrics above. Without these a later campaign learns
+    # only that a family scored some number, never at what setting, so it cannot do the ordinary
+    # engineering move of taking a configuration that worked and pushing it further. Candidates
+    # now run their own internal grids -- decay half-lives, round counts, regularisation -- and
+    # that search is the most transferable thing a campaign produces; it used to die with the run
+    # directory.
+    candidate_config: Mapping[str, object] | None
     created_at: str
 
 
@@ -4177,8 +4184,62 @@ def _lineage_event_record(row: sqlite3.Row) -> LineageEventRecord:
         parent_fold_a_primary=row["parent_fold_a_primary"],
         parent_fold_b_primary=row["parent_fold_b_primary"],
         promoted=(None if row["promoted"] is None else bool(row["promoted"])),
+        candidate_config=_lineage_candidate_config(row["metadata_json"]),
         created_at=_row_text(row, "created_at"),
     )
+
+
+# The stored configuration is rendered into a later campaign's prompt, so it is bounded here
+# rather than trusted. A candidate's config is a small flat block of hyperparameters; anything
+# larger is not tuning evidence and is dropped rather than allowed to crowd out the briefing.
+_LINEAGE_CONFIG_MAX_KEYS: Final = 40
+_LINEAGE_CONFIG_MAX_VALUE_CHARS: Final = 120
+
+
+def _lineage_metadata(candidate_config: Mapping[str, object] | None) -> Mapping[str, object]:
+    """Build the stored metadata object, keeping only bounded scalar configuration."""
+
+    if candidate_config is None:
+        return {}
+    if not isinstance(candidate_config, Mapping):
+        raise StoreInvariantError("candidate_config must be a mapping")
+    bounded: dict[str, object] = {}
+    for key, value in candidate_config.items():
+        if type(key) is not str or not key:
+            raise StoreInvariantError("candidate_config keys must be non-empty strings")
+        if len(bounded) >= _LINEAGE_CONFIG_MAX_KEYS:
+            break
+        if isinstance(value, (bool, int, float, str)):
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            if isinstance(value, str) and len(value) > _LINEAGE_CONFIG_MAX_VALUE_CHARS:
+                continue
+            bounded[key] = value
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(item, (int, float, str)) and not isinstance(item, bool) for item in value
+        ):
+            # Grid specifications such as half_lives_days are exactly the evidence worth keeping.
+            if (
+                all(not isinstance(item, float) or math.isfinite(item) for item in value)
+                and len(value) <= _LINEAGE_CONFIG_MAX_KEYS
+            ):
+                bounded[key] = list(value)
+    return {"candidate_config": bounded} if bounded else {}
+
+
+def _lineage_candidate_config(value: object) -> Mapping[str, object] | None:
+    """Read the stored candidate configuration, tolerating events written without one.
+
+    The ledger is append-only and predates this field, so every historical row carries ``{}``.
+    A missing or malformed entry is simply absent evidence, never a read failure.
+    """
+
+    try:
+        metadata = _load_json_object(value, "lineage-event metadata")
+    except StoreInvariantError:
+        return None
+    config = metadata.get("candidate_config")
+    return config if isinstance(config, Mapping) and config else None
 
 
 class ResearchLineageLedger:
@@ -4367,6 +4428,7 @@ class ResearchLineageLedger:
         parent_fold_a_primary: float | None = None,
         parent_fold_b_primary: float | None = None,
         promoted: bool | None = None,
+        candidate_config: Mapping[str, object] | None = None,
     ) -> None:
         """Append one successful admission observed by a live research campaign.
 
@@ -4406,7 +4468,7 @@ class ResearchLineageLedger:
                 raise StoreInvariantError(f"{name} must be finite in [0, 1]")
         if promoted is not None and type(promoted) is not bool:
             raise StoreInvariantError("promoted must be boolean")
-        metadata_json = _json_object({}, "lineage-event metadata")
+        metadata_json = _json_object(_lineage_metadata(candidate_config), "lineage-event metadata")
         with self._transaction(write=True) as connection:
             connection.execute(
                 """INSERT INTO lineage_events(

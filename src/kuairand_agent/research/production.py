@@ -221,7 +221,6 @@ def _observe_candidate_failure(
     )
 
 
-
 # A proposal that names a family only to disclaim it is not a proposal in that family. Once the
 # propose instructions list the closed families, the model states which one it is avoiding, and a
 # bare substring match then blocks exactly the proposals that heeded the instruction. Observed in

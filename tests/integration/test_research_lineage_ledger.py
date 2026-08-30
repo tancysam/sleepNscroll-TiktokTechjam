@@ -338,3 +338,85 @@ def test_admissions_are_readable_after_a_source_change_but_rejections_are_not(
         assert durable[0].proposal_family == "pairwise"
     finally:
         ledger.close()
+
+
+def test_the_configuration_that_produced_a_score_survives_to_the_next_campaign(
+    tmp_path: Path,
+) -> None:
+    """A family that lost at one setting has not been shown to be a dead direction.
+
+    Candidates run their own internal grids -- decay half-lives, round counts, regularisation --
+    and that search used to die with the run directory. A later campaign then learned only that a
+    family scored some number, never at what setting, so it could not take a configuration that
+    worked and push it further. This is the verbatim configuration from the campaign that produced
+    this project's best measured paired delta.
+    """
+
+    path = tmp_path / "lineage.sqlite3"
+    config = {
+        "candidate_family": "causal_identity_lambdarank",
+        "l2": 8.0,
+        "num_rounds": 450,
+        "min_data_in_leaf": 300,
+        "lambdarank_truncation_level": 5,
+        "half_lives_days": [2.0, 4.0, 8.0],
+    }
+    ledger = ResearchLineageLedger.create(path)
+    try:
+        ledger.record_admission(
+            campaign_id="run-a",
+            benchmark_digest=_BENCHMARK,
+            starter_digest=_STARTER,
+            source_digest=_SOURCE,
+            evaluation_digest=_EVALUATION,
+            candidate_id="cand-1",
+            proposal_family="listwise",
+            proposal_signature=_SIGNATURE,
+            candidate_config=config,
+        )
+    finally:
+        ledger.close()
+
+    reopened = ResearchLineageLedger.open(path, read_only=True)
+    try:
+        events = reopened.admissions_for_evaluation(
+            benchmark_digest=_BENCHMARK, evaluation_digest=_EVALUATION
+        )
+        assert len(events) == 1
+        stored = events[0].candidate_config
+        assert stored is not None
+        assert stored["l2"] == 8.0
+        assert stored["num_rounds"] == 450
+        # The store returns immutable tuples for stored JSON arrays.
+        assert stored["half_lives_days"] == (2.0, 4.0, 8.0)
+    finally:
+        reopened.close()
+
+
+def test_events_written_without_a_configuration_read_back_cleanly(tmp_path: Path) -> None:
+    """The ledger is append-only and predates this field, so historical rows carry none."""
+
+    path = tmp_path / "lineage.sqlite3"
+    ledger = ResearchLineageLedger.create(path)
+    try:
+        ledger.record_admission(
+            campaign_id="run-a",
+            benchmark_digest=_BENCHMARK,
+            starter_digest=_STARTER,
+            source_digest=_SOURCE,
+            evaluation_digest=_EVALUATION,
+            candidate_id="cand-1",
+            proposal_family="listwise",
+            proposal_signature=_SIGNATURE,
+        )
+    finally:
+        ledger.close()
+
+    reopened = ResearchLineageLedger.open(path, read_only=True)
+    try:
+        events = reopened.admissions_for_evaluation(
+            benchmark_digest=_BENCHMARK, evaluation_digest=_EVALUATION
+        )
+        assert events[0].candidate_config is None
+    finally:
+        reopened.close()

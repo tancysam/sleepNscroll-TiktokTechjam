@@ -333,7 +333,6 @@ def materialize_candidate(
 ) -> MaterializedCandidate:
     """Create one new read-only child tree after validating the complete response mapping."""
 
-
     _validate_package(parent, package)
     destination_path = Path(destination)
     if destination_path.exists() or destination_path.is_symlink():
@@ -622,10 +621,14 @@ def _top_level_symbols(tree: ast.Module) -> dict[str, str]:
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    result[target.id] = ast.dump(node, annotate_fields=True, include_attributes=False)
+                    result[target.id] = ast.dump(
+                        node, annotate_fields=True, include_attributes=False
+                    )
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name):
-                result[node.target.id] = ast.dump(node, annotate_fields=True, include_attributes=False)
+                result[node.target.id] = ast.dump(
+                    node, annotate_fields=True, include_attributes=False
+                )
     return result
 
 
@@ -659,7 +662,9 @@ def _reachable_python_files(files: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def _extract_symbol_source(
-    source: str, symbol_name: str, tree: ast.Module,
+    source: str,
+    symbol_name: str,
+    tree: ast.Module,
 ) -> str | None:
     """Extract the exact source lines for a top-level symbol from source text."""
     lines = source.splitlines(keepends=True)
@@ -682,7 +687,8 @@ def _extract_symbol_source(
 
 
 def _restore_protocol_constants(
-    parent: ParentSnapshot, candidate_content: str,
+    parent: ParentSnapshot,
+    candidate_content: str,
 ) -> str:
     """Restore frozen protocol symbols in candidate.py from the parent if the model changed them.
 

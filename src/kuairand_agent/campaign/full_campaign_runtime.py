@@ -155,6 +155,7 @@ from kuairand_agent.execution.runner import ExecutionOutcome, active_python_inte
 from kuairand_agent.execution.workspace import WorkspaceMaterializer
 from kuairand_agent.research.context import (
     AggregateRecord,
+    AggregateScalar,
     MetricSummary,
     ResearchBudgetContext,
     SafeResearchContext,
@@ -1520,12 +1521,108 @@ def _measured_primary(
     return primary, delta, "inner_fold"
 
 
+def _candidate_config(materialized: object) -> Mapping[str, object] | None:
+    """Read a materialized candidate's ``config.json`` as a mapping, or ``None``.
+
+    The configuration is the tuning the candidate actually performed -- decay half-lives, round
+    counts, regularisation, the grid it searched. Recording only the family and the score told a
+    later campaign that a direction lost without telling it at what setting, so it could not take
+    a configuration that worked and push it further. Missing or malformed config is absent
+    evidence, never a campaign failure.
+    """
+
+    reader = getattr(materialized, "file", None)
+    if not callable(reader):
+        return None
+    try:
+        content = reader("config.json").content
+    except Exception:  # A candidate need not ship config.json, and a bad read is not fatal here.
+        return None
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+# The rendered configuration reaches a later prompt, so it is bounded rather than trusted.
+_RECORD_CONFIG_MAX_CHARS: Final = 600
+
+
+def _bounded_config_json(config: Mapping[str, object] | None) -> str | None:
+    """Render a candidate configuration as compact JSON, or ``None`` when unusable."""
+
+    if not config:
+        return None
+    try:
+        rendered = json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return rendered if len(rendered) <= _RECORD_CONFIG_MAX_CHARS else None
+
+
+def _decomposed_metrics(
+    candidate_result: CandidateCampaignResult | None,
+    incumbent: IncumbentEvidence,
+) -> dict[str, AggregateScalar]:
+    """Report GAUC and nDCG@5 per fold, with each delta against the incumbent's same fold.
+
+    The record previously carried only the mean of the two, collapsed across folds. A candidate
+    that gained 0.009 GAUC and lost 0.020 nDCG@5 was therefore remembered as one negative scalar,
+    which reads as "that direction failed" rather than "the objective works and the truncated
+    metric does not" -- the diagnosis an engineer would make from the same run. Reporting the
+    folds separately also lets a replicated effect be told apart from one fold's noise.
+
+    Runs arrive in the tier order ``_measured_primary`` documents: the Fold B screen first, then
+    the Fold A confirmation, then the matched outer seeds. ``ScientificRunEvidence`` carries no
+    fold label of its own, so that order is the only available mapping and it is applied
+    positionally, never guessed from an attribute.
+    """
+
+    if candidate_result is None:
+        return {}
+    scored = [run for run in candidate_result.runs if run.metrics is not None]
+    if not scored:
+        return {}
+    folds = dict(incumbent.inner_by_fold)
+    values: dict[str, AggregateScalar] = {}
+    for index, fold in enumerate(("B", "A")):
+        if index >= len(scored):
+            break
+        metrics = scored[index].metrics
+        if metrics is None:
+            continue
+        values[f"fold_{fold}_candidate_gauc"] = round(float(metrics.gauc), 6)
+        values[f"fold_{fold}_candidate_ndcg_at_5"] = round(float(metrics.ndcg_at_5), 6)
+        values[f"fold_{fold}_candidate_primary"] = round(float(metrics.primary), 6)
+        reference = folds.get(fold)
+        if reference is None:
+            continue
+        values[f"fold_{fold}_delta_gauc"] = round(float(metrics.gauc) - float(reference.gauc), 6)
+        values[f"fold_{fold}_delta_ndcg_at_5"] = round(
+            float(metrics.ndcg_at_5) - float(reference.ndcg_at_5), 6
+        )
+        values[f"fold_{fold}_delta_primary"] = round(
+            float(metrics.primary) - float(reference.primary), 6
+        )
+    if values:
+        values["metric_decomposition_note"] = (
+            "The primary score is the MEAN of GAUC and nDCG@5, and a change can move them in "
+            "opposite directions. A positive GAUC delta with a larger negative nDCG@5 delta means "
+            "the ranking objective worked and the top-5 behaviour did not: that is a reason to "
+            "fix the cutoff behaviour, not to abandon the direction. Deltas are against the "
+            "incumbent on the same fold. An effect present on one fold only is not yet replicated."
+        )
+    return values
+
+
 def _iteration_record(
     result: ScientificCampaignResult,
     reflection: Reflection,
     *,
     scientific_iteration: int,
     proposal: Proposal | None = None,
+    materialized: object | None = None,
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
     primary, delta, tier = _measured_primary(candidate_result, result.incumbent)
@@ -1566,6 +1663,18 @@ def _iteration_record(
             "candidate_primary": None if primary is None else round(primary, 6),
             "candidate_primary_tier": tier,
             "delta_vs_incumbent": None if delta is None else round(delta, 6),
+            # GAUC and nDCG@5 per fold, with deltas against the incumbent's same fold. Without
+            # these the primary mean hides opposite movements in its two halves, and the
+            # proposer reads "worse" where an engineer would read "the objective worked, the
+            # truncated metric did not".
+            **_decomposed_metrics(candidate_result, result.incumbent),
+            # The hyperparameters that produced the numbers above, so a later iteration can push
+            # a setting that worked rather than re-searching for it.
+            "candidate_config_json": (
+                None
+                if materialized is None
+                else _bounded_config_json(_candidate_config(materialized))
+            ),
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
@@ -2487,6 +2596,7 @@ def _run_autonomous_followups(
                 parent_fold_a_primary=metrics.parent_fold_a_primary,
                 parent_fold_b_primary=metrics.parent_fold_b_primary,
                 promoted=metrics.promoted,
+                candidate_config=_candidate_config(lineage.materialized),
             )
 
     result = first_result
@@ -2512,6 +2622,7 @@ def _run_autonomous_followups(
             reflection,
             scientific_iteration=runtime_template.scientific_iteration,
             proposal=lineage.proposal,
+            materialized=lineage.materialized,
         ),
     ]
     rejected_records = list(prior_records)
@@ -2725,6 +2836,7 @@ def _run_autonomous_followups(
                 reflection,
                 scientific_iteration=iteration,
                 proposal=lineage.proposal,
+                materialized=lineage.materialized,
             )
         )
         round_attempt_count += 1
@@ -4035,6 +4147,10 @@ def run_provider_free_campaign(
                             "parent_fold_a_primary": event.parent_fold_a_primary,
                             "parent_fold_b_primary": event.parent_fold_b_primary,
                             "promoted": event.promoted,
+                            # The setting that produced those metrics. A family that lost at one
+                            # configuration has not been shown to be a dead direction, and a
+                            # family that gained is worth pushing further from where it landed.
+                            "candidate_config_json": _bounded_config_json(event.candidate_config),
                         }.items()
                         if value is not None
                     },
