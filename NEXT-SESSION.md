@@ -161,11 +161,51 @@ pkill -TERM -f "bin/kuairand-agent"
 3. `repairs_attempted` on any rejection should be **greater than 0**. If it is still 0, the model
    is emitting `maximum_repairs: 0` and the prompt fix did not land — see §6.
 
-### What "done" looks like
+### What "done" looks like, and how to grade it
 
-A submission bundle under `runs/maki-overnight-09/` plus a final report. Even if every generated
-candidate fails, the run must still finalize on the qualified official-FM fallback. **A run that
-ends with no bundle is a bug, not a bad result** — that was the entire point of the work in §5.
+Nothing is required of the operator during the run. Launch it and walk away.
+
+A finished run writes:
+
+```
+runs/maki-overnight-09/final/
+  report.md          the deliverable writeup
+  submission.csv     the predictions
+  experiments.csv    the trajectory in tabular form
+  manifest.json      digests for every artifact
+  reproduce.sh       the replay entrypoint
+```
+
+**If `final/` exists at all, the run finalized.** That alone is a pass on the failure this project
+kept hitting: runs 04, 05 and 07 never got there.
+
+Grade the outcome from one table in `report.md`, **Experiment trajectory and candidate tree**.
+Every completed run so far:
+
+| Run | Trajectory row | Meaning |
+|---|---|---|
+| 02, 03 | `official-fm-fallback-seed-4 / baseline_reproduced` | no candidate was ever admitted |
+| 06 | `candidate-01-...-repair-2 / rejected_before_execution` | code was written, rejected before it ran |
+
+The ladder, worst to best:
+
+1. Only `official-fm-fallback-seed-4`. The agent produced nothing usable; the safety net shipped.
+2. A `candidate-NN-...` row appears. The agent wrote code that cleared the static gates. Run 06.
+3. **A number in `Inner primary`.** The candidate actually trained and was scored. **No run has
+   ever reached this.** This is the first real milestone.
+4. A number in `Outer primary`. It cleared inner folds and was promoted to matched-seed outer
+   validation.
+5. Multiple iterations, 1, 2, 3... The agent proposed, failed, learned and retried. This is the
+   Track 2 deliverable — judges grade the loop, not only the score.
+
+**Did it beat the baseline?** Check the **Baseline parity** table. If the selected row is
+`official-fm-fallback-seed-4` at tier `qualified fallback`, the fallback shipped. If it is a
+`candidate-NN-...` at tier `matched-seed outer validation`, the agent's own model won and its
+primary is the score. The bar is **0.6016**, the official FM validation primary. For reference the
+fallback's own seed-4 row reads 0.6020370721817017 and the five-seed mean reads 0.6015721678733825.
+
+**A run that ends with no `final/` directory is a bug, not a bad result** — that was the entire
+point of the work in section 5.
 
 ---
 
