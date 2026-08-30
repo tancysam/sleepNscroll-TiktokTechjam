@@ -744,6 +744,12 @@ _LINEAGE_SCHEMA_STATEMENTS: Final = (
         benchmark_digest TEXT NOT NULL CHECK(length(benchmark_digest) = 64),
         starter_digest TEXT NOT NULL CHECK(length(starter_digest) = 64),
         source_digest TEXT NOT NULL CHECK(length(source_digest) = 64),
+        -- Identity of everything that determines what a *metric* means: the benchmark, the data,
+        -- the scorer, and the controller-engineered feature bundle. Metric evidence is scoped by
+        -- this rather than by source_digest, so editing a prompt or a selector no longer discards
+        -- the record that a proposal family already scored flat, while changing the features or
+        -- the scorer correctly does.
+        evaluation_digest TEXT NOT NULL CHECK(length(evaluation_digest) = 64),
         outcome TEXT NOT NULL CHECK(outcome IN ('rejected', 'admitted')),
         candidate_id TEXT NOT NULL CHECK(length(candidate_id) > 0),
         proposal_family TEXT NOT NULL CHECK(length(proposal_family) > 0),
@@ -847,6 +853,8 @@ _LINEAGE_SCHEMA_STATEMENTS: Final = (
     ) STRICT""",
     """CREATE INDEX lineage_events_scope
         ON lineage_events(benchmark_digest, starter_digest, source_digest, event_id)""",
+    """CREATE INDEX lineage_events_evaluation_scope
+        ON lineage_events(benchmark_digest, evaluation_digest, outcome, event_id)""",
     *_append_only_statements(("lineage_events",)),
 )
 
@@ -4102,6 +4110,7 @@ class LineageEventRecord:
     terminal_failure_code: str | None
     terminal_failure_subject: str | None
     diagnostic: str | None
+    evaluation_digest: str
     inner_fold_a: LineageFoldMetrics | None
     inner_fold_b: LineageFoldMetrics | None
     parent_fold_a_primary: float | None
@@ -4146,6 +4155,7 @@ def _lineage_event_record(row: sqlite3.Row) -> LineageEventRecord:
         terminal_failure_code=row["terminal_failure_code"],
         terminal_failure_subject=row["terminal_failure_subject"],
         diagnostic=row["diagnostic"],
+        evaluation_digest=_row_text(row, "evaluation_digest"),
         inner_fold_a=(
             None
             if row["inner_fold_a_primary"] is None
@@ -4272,6 +4282,7 @@ class ResearchLineageLedger:
         benchmark_digest: str,
         starter_digest: str,
         source_digest: str,
+        evaluation_digest: str,
         candidate_id: str,
         proposal_family: str,
         proposal_signature: str | None,
@@ -4292,6 +4303,7 @@ class ResearchLineageLedger:
         benchmark = _digest(benchmark_digest, "benchmark_digest")
         starter = _digest(starter_digest, "starter_digest")
         source = _digest(source_digest, "source_digest")
+        evaluation = _digest(evaluation_digest, "evaluation_digest")
         candidate = _text(candidate_id, "candidate_id")
         family = _text(proposal_family, "proposal_family")
         signature = _optional_digest(proposal_signature, "proposal_signature")
@@ -4304,18 +4316,22 @@ class ResearchLineageLedger:
         with self._transaction(write=True) as connection:
             connection.execute(
                 """INSERT INTO lineage_events(
-                    campaign_id, benchmark_digest, starter_digest, source_digest, outcome,
+                    campaign_id, benchmark_digest, starter_digest, source_digest,
+                    evaluation_digest, outcome,
                     candidate_id, proposal_family, proposal_signature, repairs_attempted,
                     root_failure_fingerprint, root_failure_category, root_failure_code,
                     root_failure_subject, terminal_failure_fingerprint, terminal_failure_category,
                     terminal_failure_code, terminal_failure_subject, diagnostic, metadata_json,
                     created_at
-                ) VALUES (?, ?, ?, ?, 'rejected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (
+                    ?, ?, ?, ?, ?, 'rejected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )""",
                 (
                     campaign,
                     benchmark,
                     starter,
                     source,
+                    evaluation,
                     candidate,
                     family,
                     signature,
@@ -4342,6 +4358,7 @@ class ResearchLineageLedger:
         benchmark_digest: str,
         starter_digest: str,
         source_digest: str,
+        evaluation_digest: str,
         candidate_id: str,
         proposal_family: str,
         proposal_signature: str | None,
@@ -4366,6 +4383,7 @@ class ResearchLineageLedger:
         benchmark = _digest(benchmark_digest, "benchmark_digest")
         starter = _digest(starter_digest, "starter_digest")
         source = _digest(source_digest, "source_digest")
+        evaluation = _digest(evaluation_digest, "evaluation_digest")
         candidate = _text(candidate_id, "candidate_id")
         family = _text(proposal_family, "proposal_family")
         signature = _optional_digest(proposal_signature, "proposal_signature")
@@ -4392,20 +4410,22 @@ class ResearchLineageLedger:
         with self._transaction(write=True) as connection:
             connection.execute(
                 """INSERT INTO lineage_events(
-                    campaign_id, benchmark_digest, starter_digest, source_digest, outcome,
+                    campaign_id, benchmark_digest, starter_digest, source_digest,
+                    evaluation_digest, outcome,
                     candidate_id, proposal_family, proposal_signature,
                     inner_fold_a_gauc, inner_fold_a_ndcg_at_5, inner_fold_a_primary,
                     inner_fold_b_gauc, inner_fold_b_ndcg_at_5, inner_fold_b_primary,
                     parent_fold_a_primary, parent_fold_b_primary, promoted,
                     metadata_json, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, 'admitted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, 'admitted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )""",
                 (
                     campaign,
                     benchmark,
                     starter,
                     source,
+                    evaluation,
                     candidate,
                     family,
                     signature,
@@ -4468,6 +4488,35 @@ class ResearchLineageLedger:
             proposal_family_admission_totals=MappingProxyType(family_admissions),
             recent_events=tuple(events[-limit:]),
         )
+
+    def admissions_for_evaluation(
+        self,
+        *,
+        benchmark_digest: str,
+        evaluation_digest: str,
+        limit: int = 40,
+    ) -> tuple[LineageEventRecord, ...]:
+        """Return metric evidence that is still valid for one evaluation identity.
+
+        Deliberately not scoped by ``source_digest``. A recorded fold score is a fact about the
+        benchmark, the data, the scorer and the feature bundle -- editing a prompt, a selector or
+        a circuit breaker cannot make it false, so that evidence must survive our own development.
+        Changing the features or the scorer does change what the number means, and those are
+        folded into ``evaluation_digest``, so it correctly resets then.
+        """
+
+        benchmark = _digest(benchmark_digest, "benchmark_digest")
+        evaluation = _digest(evaluation_digest, "evaluation_digest")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise StoreInvariantError("admission history limit must be an integer in [1, 200]")
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                """SELECT * FROM lineage_events
+                WHERE benchmark_digest = ? AND evaluation_digest = ? AND outcome = 'admitted'
+                ORDER BY event_id ASC""",
+                (benchmark, evaluation),
+            ).fetchall()
+        return tuple(_lineage_event_record(row) for row in rows[-limit:])
 
     def events_for_campaign(self, campaign_id: str) -> tuple[LineageEventRecord, ...]:
         """Return one campaign's own events in durable order, across every identity scope.

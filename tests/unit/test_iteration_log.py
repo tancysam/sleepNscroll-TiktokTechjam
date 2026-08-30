@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+_EVALUATION = "e" * 64
+
 import json
 from pathlib import Path
 
@@ -99,6 +101,7 @@ def _record_admission(run_dir: Path, *, candidate_id: str, promoted: bool | None
             benchmark_digest=_digest("1"),
             starter_digest=_digest("2"),
             source_digest=_digest("3"),
+            evaluation_digest=_EVALUATION,
             candidate_id=candidate_id,
             proposal_family="pairwise",
             proposal_signature=_digest("4"),

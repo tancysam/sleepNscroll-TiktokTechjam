@@ -1950,6 +1950,7 @@ def _prepare_live_lineage_portfolio(
     starter_digest: str = "",
     source_digest: str = "",
     lineage_ledger_path: Path | None = None,
+    evaluation_digest: str = "",
     prior_root_failure_totals: Mapping[str, int] = MappingProxyType({}),
     prior_family_attempts: Mapping[str, int] = MappingProxyType({}),
     prior_advisory_records: tuple[AggregateRecord, ...] = (),
@@ -1985,6 +1986,7 @@ def _prepare_live_lineage_portfolio(
                 benchmark_digest=benchmark_digest,
                 starter_digest=starter_digest,
                 source_digest=source_digest,
+                evaluation_digest=evaluation_digest,
                 candidate_id=rejection.failed_candidate_id,
                 proposal_family=rejection.proposal_family,
                 proposal_signature=rejection.proposal_signature or None,
@@ -2233,6 +2235,7 @@ def _run_autonomous_followups(
     first_reflection_evidence: tuple[str, str, ArtifactRef],
     prior_records: tuple[AggregateRecord, ...],
     lineage_ledger_path: Path | None = None,
+    evaluation_digest: str = "",
     prior_advisory_records: tuple[AggregateRecord, ...] = (),
 ) -> _AutonomousFollowupResult:
     """Continue propose→implement→evaluate→reflect until an exact terminal condition.
@@ -2252,6 +2255,7 @@ def _run_autonomous_followups(
                 benchmark_digest=request.benchmark_digest,
                 starter_digest=request.starter_manifest_digest,
                 source_digest=request.source_digest,
+                evaluation_digest=evaluation_digest,
                 candidate_id=rejection.failed_candidate_id,
                 proposal_family=rejection.proposal_family,
                 proposal_signature=rejection.proposal_signature or None,
@@ -2286,6 +2290,7 @@ def _run_autonomous_followups(
                 benchmark_digest=request.benchmark_digest,
                 starter_digest=request.starter_manifest_digest,
                 source_digest=request.source_digest,
+                evaluation_digest=evaluation_digest,
                 candidate_id=lineage.candidate_id,
                 proposal_family=_lineage_proposal_family(lineage.proposal),
                 proposal_signature=_lineage_proposal_signature(lineage.proposal),
@@ -3128,6 +3133,35 @@ def _open_lineage_ledger(path: Path) -> ResearchLineageLedger:
         raise FullCampaignError("research-lineage ledger is unavailable") from exc
 
 
+def _evaluation_scope_digest(
+    *,
+    benchmark_digest: str,
+    dataset_digest: str,
+    scorer_digest: str,
+    feature_bundle_digest: str,
+) -> str:
+    """Identity of everything that determines what a recorded metric means.
+
+    Cross-run metric evidence is scoped by this rather than by the trusted-source digest. A fold
+    score is a fact about the benchmark, the data, the scorer and the controller-engineered
+    feature bundle; editing a prompt, a selector or a circuit breaker cannot make it false, so
+    that evidence should outlive our own development. Changing the features or the scorer does
+    change what the number means, and both are inputs here, so the scope correctly resets then.
+    """
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "benchmark_digest": benchmark_digest,
+                "dataset_digest": dataset_digest,
+                "scorer_digest": scorer_digest,
+                "feature_bundle_digest": feature_bundle_digest,
+            }
+        )
+    ).hexdigest()
+
+
 def _lineage_ledger_location(
     *,
     run_dir: Path,
@@ -3646,6 +3680,14 @@ def run_provider_free_campaign(
             outer_targets=data.outer_train_labels,
             outer_users=data.outer_train_inputs.user_id,
         )
+        # Metric evidence is scoped by what determines a metric's meaning, not by our source tree,
+        # so cross-run knowledge survives controller edits. See _evaluation_scope_digest.
+        evaluation_scope = _evaluation_scope_digest(
+            benchmark_digest=request.benchmark_digest,
+            dataset_digest=qualification.canonical_digest,
+            scorer_digest=scorer_digest,
+            feature_bundle_digest=features.digest,
+        )
         _stage(
             progress,
             request_digest=request.digest,
@@ -3839,6 +3881,7 @@ def run_provider_free_campaign(
                 starter_digest=request.starter_manifest_digest,
                 source_digest=request.source_digest,
                 lineage_ledger_path=lineage_path,
+                evaluation_digest=evaluation_scope,
                 prior_root_failure_totals=prior_lineage.root_failure_totals,
                 prior_family_attempts=prior_lineage.proposal_family_rejection_totals,
                 prior_advisory_records=prior_lineage_advisory_records,
@@ -4113,6 +4156,7 @@ def run_provider_free_campaign(
                     benchmark_digest=request.benchmark_digest,
                     starter_digest=request.starter_manifest_digest,
                     source_digest=request.source_digest,
+                    evaluation_digest=evaluation_scope,
                     candidate_id=lineage.candidate_id,
                     proposal_family=_lineage_proposal_family(lineage.proposal),
                     proposal_signature=_lineage_proposal_signature(lineage.proposal),
@@ -4193,6 +4237,7 @@ def run_provider_free_campaign(
                 ),
                 prior_records=rejected_lineage_records,
                 lineage_ledger_path=lineage_path,
+                evaluation_digest=evaluation_scope,
                 prior_advisory_records=prior_lineage_advisory_records,
             )
             result = followup.result

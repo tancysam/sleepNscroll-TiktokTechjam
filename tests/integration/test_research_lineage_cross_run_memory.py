@@ -36,6 +36,9 @@ class _StubLineage:
         self.proposal = proposal
 
 
+_EVALUATION = "e" * 64
+
+
 def test_prior_root_failure_totals_trip_the_circuit_breaker_immediately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -139,6 +142,7 @@ def test_rejection_is_durably_recorded_and_visible_only_as_advisory_context(
         starter_digest=_STARTER,
         source_digest=_SOURCE,
         lineage_ledger_path=ledger_path,
+        evaluation_digest=_EVALUATION,
         prior_advisory_records=(),
     )
 
@@ -224,6 +228,7 @@ def test_prepare_live_lineage_portfolio_does_not_itself_record_admission(
         starter_digest=_STARTER,
         source_digest=_SOURCE,
         lineage_ledger_path=ledger_path,
+        evaluation_digest=_EVALUATION,
     )
 
     assert prepared.status == "accepted"
@@ -402,6 +407,7 @@ def test_autonomous_followup_records_real_fold_metrics_against_the_actual_parent
         first_reflection_evidence=("request-1", "response-1", transcript),
         prior_records=(),
         lineage_ledger_path=ledger_path,
+        evaluation_digest=_EVALUATION,
     )
 
     ledger = ResearchLineageLedger.open(ledger_path)
@@ -684,6 +690,7 @@ def test_lineage_ledger_write_survives_an_incomplete_candidate(
         first_reflection_evidence=("request-1", "response-1", transcript),
         prior_records=(),
         lineage_ledger_path=ledger_path,
+        evaluation_digest=_EVALUATION,
     )
 
     ledger = ResearchLineageLedger.open(ledger_path)
@@ -845,6 +852,7 @@ def test_lineage_ledger_preserves_a_screen_rejected_candidates_real_fold_b_resul
         first_reflection_evidence=("request-1", "response-1", transcript),
         prior_records=(),
         lineage_ledger_path=ledger_path,
+        evaluation_digest=_EVALUATION,
     )
 
     ledger = ResearchLineageLedger.open(ledger_path)
