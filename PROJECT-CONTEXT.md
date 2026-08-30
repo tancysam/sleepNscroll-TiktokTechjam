@@ -32,6 +32,66 @@ Three things about how this team works, learned the hard way:
 
 ---
 
+## Your environment — read this before you touch a file
+
+**The user is on Windows 11. This project cannot run on Windows.** That is not a preference, it is
+a hard blocker: `campaign/full_campaign_runtime.py` does an unguarded `import resource`, and
+`execution/runner.py` uses `os.killpg`, `signal.SIGKILL` and `os.setsid`. All of those are
+POSIX-only, and the platform guards in the code branch on `darwin` and `linux` only. There is no
+Windows path through the runtime and adding one is not in scope.
+
+The fix was **WSL2 with Ubuntu**, which is installed and working. Everything real happens in the
+Ubuntu terminal, not in PowerShell and not in a Windows shell.
+
+### There are two copies of this repo. Only one of them works.
+
+| | Path | State |
+|---|---|---|
+| **WSL — the live one** | `~/sleepNscroll-TiktokTechjam` | current, has the 195 MB dataset at `.data/`, has the virtualenv, runs campaigns |
+| Windows — stale | `C:\Users\Makendra Prasad\OneDrive - Singapore Management University\Desktop\tiktok jam\sleepNscroll-TiktokTechjam` | on `Maki` at `ba8fd55`, **18 commits behind**, **no dataset**, cannot run anything |
+
+**This is the single easiest way to waste an hour.** If you read code and it does not match what
+this brief describes, check which copy you are in. Everything you do belongs in the WSL copy.
+
+The Windows Desktop folder is still useful for one thing: it holds the reference material and the
+docs the user reads outside the terminal — `PROJECT-CONTEXT.md` and `NEXT-SESSION.md` are mirrored
+there, alongside `WSL-SETUP.md`, `WHATS-GOING-ON.md`, the MLE-STAR paper, and cloned reference
+repos (`aideml`, `openevolve`, `adk-samples`, `RD-Agent`, `IR-Benchmark`).
+
+### If you are Claude Code running on the Windows side
+
+You reach the working repo through `wsl.exe`. Two things will bite you:
+
+1. **Quoting.** `wsl.exe -e bash -lc '...'` breaks constantly on nested quotes — a Python triple
+   single quote or a plain apostrophe inside the command is enough to produce
+   `unexpected EOF while looking for matching`. For anything beyond a one-liner, write a Python
+   patch script to a file, `cp` it into WSL, and run it there. Anchor every substitution and assert
+   the match count is exactly 1.
+2. **`uv` is not on the non-login PATH.** `wsl.exe -e bash -s` with a heredoc will fail with
+   `uv: command not found`. Use `wsl.exe -e bash -lc` (note the `-l`) for anything that runs `uv`.
+
+Windows paths are visible from inside WSL under `/mnt/c/...`, which is how files move between the
+two sides.
+
+### Running things
+
+Dependencies and tests go through `uv`, always from the WSL copy:
+
+```sh
+cd ~/sleepNscroll-TiktokTechjam
+UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural pytest -q
+UV_CACHE_DIR=.uv-cache uv run --locked ruff check src tests
+UV_CACHE_DIR=.uv-cache uv run --locked mypy src tests
+```
+
+Two failures are **pre-existing and not yours**: `test_starter_fm.py::
+test_first_update_matches_untouched_organizer_float32_golden` (an arm64 float32 golden; we are on
+x86), and a mypy `Statement is unreachable` at `execution/runner.py:909` (inside a
+`sys.platform != "darwin"` branch, so it is unreachable on Linux and reachable on the macOS the
+code also targets). Expect **1479 passed, 1 failed**.
+
+---
+
 ## The problem
 
 **TikTok TechJam 2026, Track 2: Autonomous ML Research Agent for Recommender Systems.**
@@ -241,9 +301,9 @@ per-iteration run log is a **required deliverable** and is generated from
 
 ## Constraints and gotchas
 
-- **Everything runs in WSL2 Ubuntu, never Windows.** The runtime uses `resource`, `os.killpg`,
-  `SIGKILL` and `os.getpgid`, which are POSIX-only. *(The 2026-08-29 brief lists WSL as not yet
-  installed — it is now set up and working at `~/sleepNscroll-TiktokTechjam`.)*
+- **Everything runs in WSL2 Ubuntu, never Windows, and only in the WSL copy of the repo.** See
+  "Your environment" above. *(The 2026-08-29 brief lists WSL as not yet installed — it is now set
+  up and working.)*
 - **`convergence_patience = 3` and `epsilon = 0.002` are frozen benchmark constants**, not tuning
   knobs. They live beside `target = "long_view"` in `config.py` as `FROZEN_*` values, the validator
   rejects anything else, and they are stamped into `benchmark_digest`. Changing them means you are
