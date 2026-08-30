@@ -369,7 +369,9 @@ a label-free submission.
 ## Results
 
 See [`docs/RESULTS.md`](docs/RESULTS.md) for the full table, run logs, resource accounting, and
-evaluation-integrity analysis.
+evaluation-integrity analysis. [`docs/agent-memory-experiment.md`](docs/agent-memory-experiment.md)
+covers what we chose to target and why: whether cross-run memory makes the agent explore, the
+measured negative result, and the deterministic circuit breaker we built in response.
 
 Headline, stated conservatively:
 
