@@ -44,7 +44,7 @@ rule is what makes the run log trustworthy evidence rather than a transcript of 
 
 **We deliberately did not use an agent framework.** No LangChain, no LiteLLM, no orchestration
 library, not even the `openai` SDK. Provider calls are `urllib.request` from the standard library
-against the Responses API with strict structured outputs. The two runtime dependencies are `numpy`
+against an OpenAI-compatible Chat Completions endpoint with strict structured outputs. The two runtime dependencies are `numpy`
 and `psutil`. This was a considered choice: AIDE's own published benchmarking found that plain
 tree search over code outperformed a LangChain-based agent on this class of task, and every
 framework layer we skipped is a layer that cannot silently take authority we did not intend to
@@ -87,14 +87,31 @@ install cannot silently change the execution profile.
 
 ## Honest status
 
-A scripted full-data campaign completes end to end and emits an organizer-valid submission
-(170,588 rows, checker return code 0, replay verified). It reproduces the official baseline to
-within noise — a +0.000144 validation delta, about one fifth of one seed standard deviation. **We
-do not claim it as an improvement.**
+**Sixteen live autonomous campaigns have run** against `openai/gpt-5.6-sol`; twelve completed end
+to end and emitted a full organizer-valid submission (170,588 rows, checker return code 0, replay
+verified). **Every completed campaign recorded zero manual interventions.** Total live spend:
+1.63M tokens, roughly $9.57, and **0.00 GPU-hours** — every configuration is CPU-only.
 
-No live-provider autonomous campaign has completed, so we do not claim autonomous research
-results, and hidden-test performance is unknown and unclaimed. Full detail, including what is not
-demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).
+**No generated candidate has beaten the baseline by more than noise.** One candidate cleared every
+gate the pipeline has, including outer matched-seed validation, at +0.00052 on Fold A — real,
+reproducible, and an order of magnitude below the organizers' ε = 0.002. **We do not claim it as
+an improvement.** Hidden-test performance is unknown and unclaimed; only the organizers measure it.
+
+What we did learn is why. The agent proposed a training-objective change in sixteen consecutive
+campaigns, and we spent the day assuming that was a defect in the agent. It was not. Enforcing
+cross-run memory, pruning 57% of the proposal prompt, and widening the feature bundle from 28 to
+66 columns each changed nothing, because the cause was in our own prompt: the PROPOSE operation
+never received the execution-environment section, so the proposer had no information about its own
+implementation authority, while the briefing it did receive ranks the objective as "the single
+largest known opportunity" and lists feature breadth under measured dead ends. The model was
+following our instructions precisely. That is the same constraint-transmission defect we had
+already found in reverse — code rejected for rules it was never told — and we would not have found
+either without running the system live and reading what it was actually sent.
+
+Four production defects were found this way and fixed, each root-caused from a real failure with a
+regression test confirmed to fail without the fix. Full detail, including what is not demonstrated,
+is in [`docs/RESULTS.md`](RESULTS.md), and the measurement behind the memory finding is in
+[`docs/agent-memory-experiment.md`](agent-memory-experiment.md).
 
 We would rather report a small honest number than a large unverifiable one.
 
@@ -112,7 +129,7 @@ We would rather report a small honest number than a large unverifiable one.
 
 | | |
 |---|---|
-| OpenAI **Responses API** | `gpt-5.6-sol`, with strict JSON-schema structured outputs and a configured reasoning effort. Called directly over `urllib.request` — no vendor SDK and no agent framework. Per-call input, cached-input, output, reasoning and total tokens are recorded, with cost derived from pricing pinned in configuration rather than inferred at runtime. |
+| OpenAI-compatible **Chat Completions** | `openai/gpt-5.6-sol` served via OpenRouter, with strict JSON-schema structured outputs and a configured reasoning effort; a second profile is configured as failover. Called directly over `urllib.request` — no vendor SDK and no agent framework. Per-call input, cached-input, output, reasoning and total tokens are recorded, with cost derived from pricing pinned in configuration rather than inferred at runtime. Measured across sixteen live campaigns: 1,634,466 tokens for roughly $9.57. |
 | Zenodo | One-time hash-verified dataset acquisition (record 10439422). Not called at runtime. |
 
 No other network access exists anywhere in the system. Generated candidate code cannot reach the
@@ -150,5 +167,10 @@ trained on, joined with, or pre-trained against any dataset outside KuaiRand-Pur
 
 - [`README.md`](../README.md) — overview, setup, reproduction, limitations, contributions
 - [`docs/RESULTS.md`](RESULTS.md) — results, run logs, resource accounting, integrity analysis
+- [`docs/agent-memory-experiment.md`](agent-memory-experiment.md) — what the agent was pointed at
+  and why: the cross-run memory measurement, its negative result, and the enforcement experiment
+- [`docs/run-logs/`](run-logs/) — the per-iteration run-log deliverable (hypothesis, code diff,
+  resulting metrics, error and recovery events), emitted by
+  `kuairand-agent iteration-log --run-dir <run>` in Markdown or JSONL
 - [`plan.md`](../plan.md) — full architecture and design rationale
 - [`docs/research/`](research/) — primary-source verification and implementation-readiness research
