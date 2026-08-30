@@ -16,7 +16,7 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
 ) -> None:
     instructions = instructions_for(operation)
 
-    assert PROMPT_VERSION == 6
+    assert PROMPT_VERSION == 7
     assert DEFAULT_CANDIDATE_SOURCE_POLICY.digest in instructions
     assert "candidate.py" in instructions
     assert "baseline.py" in instructions
@@ -90,3 +90,26 @@ def test_delivered_prompt_uses_the_exact_request_policy_digest() -> None:
     instructions = instructions_for(ResearchOperation.PROPOSE, source_policy=request.source_policy)
 
     assert request.source_policy_digest in instructions
+
+
+def test_prompt_grants_in_matrix_feature_authority_and_bounds_it() -> None:
+    """The candidate may transform the matrix it is given, and must be told so explicitly.
+
+    `train_model` receives a mutable NumPy array and numpy is available, so in-matrix feature
+    engineering was always technically possible. The briefing never said so, and across sixteen
+    live campaigns every proposal preserved the controller bundle verbatim -- one even said it
+    would "preserve the parent's causal controller feature bundle". That is the same
+    constraint-transmission defect this project already documented in reverse: a model rejected
+    for rules it was never told, and here a capability declined because it was never granted.
+    """
+
+    instructions = instructions_for(ResearchOperation.PROPOSE)
+
+    assert "Feature authority inside your own code" in instructions
+    assert "mutable NumPy array" in instructions
+    # The grant must travel with its two bounds, or it invites a leak or a train/inference skew.
+    assert "identical transformation in" in instructions
+    assert "to read raw columns, current-row outcomes" in instructions
+    # The stale claim that no history exists must not survive the widened bundle.
+    assert "use no history at all" not in instructions
+    assert "is_click_smoothed_rate" in instructions

@@ -11,7 +11,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 6
+PROMPT_VERSION: Final = 7
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -53,8 +53,11 @@ Where the headroom actually is, in the organizers' own priority order:
    mismatch is the single largest known opportunity. Pairwise (BPR-style) or listwise (softmax
    over the user's impressions) objectives align the loss with the metric. Softmax cross-entropy
    is a convex bound on NDCG and is NDCG-consistent (Bruch et al., ICTIR 2019).
-2. User behaviour sequences. The current features use no history at all; DIN/SIM-style interest
-   modelling is untouched.
+2. User behaviour sequences and engagement history. The controller bundle now carries
+   strictly-past click and like history alongside long_view, for every grouping and cross
+   (`*__is_click_positive`, `*__is_click_smoothed_rate`, and the same for `is_like`). These are
+   new and untested: no candidate has yet used them, and their interaction with the ranking
+   objective is unmeasured. DIN/SIM-style interest modelling remains untouched.
 3. Multi-task auxiliaries drawn from the other logged feedback signals.
 4. Watch-time modelling as censored regression (watch time is truncated when a video completes,
    so a one-sided loss is more faithful than squared error).
@@ -187,13 +190,29 @@ next experiment using the typed recommendation vocabulary.""",
 
 # PROPOSE and REFLECT emit no files, so they are not charged for the environment notes or the
 # worked example. Every operation that reasons about the science receives the briefing.
+
+_FEATURE_AUTHORITY: Final = """Feature authority inside your own code
+
+`features` arrives as a mutable NumPy array and you may transform it inside `train_model` and your
+scoring path before fitting: build interaction columns (`features[:, i] * features[:, j]`), apply
+non-linear scalings such as `log1p`, standardise, bucket, difference two history columns, drop
+columns, or select a subset. NumPy is available and this needs no controller change, so feature
+construction is a proposable axis and not only a model-side detail.
+
+Two rules bound it. First, apply the identical transformation in training and in inference,
+deriving it only from the training matrix, or your scores will not correspond to your model.
+Second, this authority extends only to arithmetic on the matrix you are given: it is not permission
+to read raw columns, current-row outcomes, or any capability the field policy withholds."""
+
 _SECTIONS: Final = {
-    ResearchOperation.PROPOSE: (_BENCHMARK,),
-    ResearchOperation.IMPLEMENT: (_PACKAGES, _WORKED_EXAMPLE, _BENCHMARK),
-    ResearchOperation.REPAIR: (_PACKAGES, _WORKED_EXAMPLE),
+    # PROPOSE receives the feature-authority grant because the proposal is where an axis is
+    # chosen: without it the proposer cannot know that in-matrix feature work is even available
+    # to it, and every observed proposal preserved the controller bundle verbatim.
+    ResearchOperation.PROPOSE: (_BENCHMARK, _FEATURE_AUTHORITY),
+    ResearchOperation.IMPLEMENT: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE, _BENCHMARK),
+    ResearchOperation.REPAIR: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE),
     ResearchOperation.REFLECT: (_BENCHMARK,),
 }
-
 
 
 def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
@@ -306,8 +325,7 @@ def instructions_for(
         else ""
     )
     policy = (
-        f"\n\n{_source_policy_constraints(source_policy)}"
-        f"\n\n{_runtime_contract_constraints()}"
+        f"\n\n{_source_policy_constraints(source_policy)}\n\n{_runtime_contract_constraints()}"
         if operation
         in {ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR}
         else ""
