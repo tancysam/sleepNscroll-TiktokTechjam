@@ -51,7 +51,9 @@ _ROW_ID_FIELDS: Final = frozenset(
 type SafeScalar = str | int | float | bool | None
 type TypedKeyPart = tuple[str, str]
 type TypedKey = tuple[TypedKeyPart, ...]
-type _CountPair = tuple[int, int]
+# Running state for one grouping key: a shared exposure row count, plus one positive count per
+# outcome stream in `OutcomeEvents.streams` order. Exposure does not depend on the outcome.
+type _CountPair = tuple[int, tuple[int, ...]]
 
 
 class CausalFeatureError(ValueError):
@@ -188,32 +190,101 @@ class CausalInputs:
         return len(self.time_ms)
 
 
+def _validate_outcome_name(name: object) -> str:
+    """Auxiliary streams must name a recognized observed outcome, not an arbitrary column.
+
+    This is the inverse of :func:`_validate_name`, which exists to keep outcome fields *out* of
+    input positions. Here the field is deliberately an outcome, so the allowlist is exactly the
+    known outcome vocabulary minus the primary label; anything else -- including a mis-typed or
+    invented name that might silently smuggle an input column into history -- fails closed.
+    """
+
+    if not isinstance(name, str) or not _SAFE_NAME.fullmatch(name):
+        raise CausalFeatureError(
+            f"auxiliary outcome name must match {_SAFE_NAME.pattern!r}; got {name!r}"
+        )
+    lowered = name.casefold()
+    if lowered == "long_view":
+        raise CausalFeatureError("auxiliary outcomes must not redeclare long_view")
+    if lowered not in _OUTCOME_FIELDS:
+        raise CausalFeatureError(
+            f"auxiliary outcome {name!r} is not a recognized observed-outcome field"
+        )
+    return name
+
+
+def _binary_stream(values: Iterable[object], *, name: str) -> tuple[int, ...]:
+    normalized: list[int] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise CausalFeatureError(f"{name} prefix outcomes must be binary integers")
+        candidate = int(value)
+        if candidate not in (0, 1):
+            raise CausalFeatureError(f"{name} prefix outcomes must be binary integers in {{0, 1}}")
+        normalized.append(candidate)
+    return tuple(normalized)
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class OutcomeEvents:
-    """Authorized training-prefix outcomes; no query outcome type exists."""
+    """Authorized training-prefix outcomes; no query outcome type exists.
+
+    ``long_view`` is the benchmark label and is always present.  ``auxiliary`` carries additional
+    *binary* observed outcomes -- ``is_click``, ``is_like`` -- which the trusted controller may
+    aggregate over strictly-past rows exactly as it already does for ``long_view``.  Every stream
+    is consumed only through the same causal prefix walk, so an auxiliary outcome can never enter a
+    feature for its own row or for any earlier row; it is history, never a same-row input.
+    """
 
     long_view: tuple[int, ...]
+    auxiliary: Mapping[str, tuple[int, ...]]
     logical_digest: str
 
-    def __init__(self, *, long_view: Iterable[object]) -> None:
-        values: list[int] = []
-        for value in long_view:
-            if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-                raise CausalFeatureError("long_view prefix outcomes must be binary integers")
-            normalized = int(value)
-            if normalized not in (0, 1):
-                raise CausalFeatureError(
-                    "long_view prefix outcomes must be binary integers in {0, 1}"
-                )
-            values.append(normalized)
-        if not values:
+    def __init__(
+        self,
+        *,
+        long_view: Iterable[object],
+        auxiliary: Mapping[str, Iterable[object]] | None = None,
+    ) -> None:
+        primary = _binary_stream(long_view, name="long_view")
+        if not primary:
             raise CausalFeatureError("prefix outcomes must contain at least one event")
-        frozen = tuple(values)
-        object.__setattr__(self, "long_view", frozen)
+        extra: dict[str, tuple[int, ...]] = {}
+        for name in sorted(auxiliary or {}):
+            validated = _validate_outcome_name(name)
+            stream = _binary_stream((auxiliary or {})[name], name=validated)
+            if len(stream) != len(primary):
+                raise CausalFeatureError(
+                    f"auxiliary outcome {validated} must align with long_view row count"
+                )
+            extra[validated] = stream
+        object.__setattr__(self, "long_view", primary)
+        object.__setattr__(self, "auxiliary", MappingProxyType(extra))
         object.__setattr__(
             self,
             "logical_digest",
-            _digest_manifest({"schema_version": _SCHEMA_VERSION, "long_view": frozen}),
+            _digest_manifest(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "long_view": primary,
+                    "auxiliary": {name: extra[name] for name in sorted(extra)},
+                }
+            ),
+        )
+
+    @property
+    def auxiliary_names(self) -> tuple[str, ...]:
+        """Auxiliary stream names in the deterministic order that fixes column layout."""
+
+        return tuple(sorted(self.auxiliary))
+
+    @property
+    def streams(self) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        """Every outcome stream, primary first, then auxiliaries in deterministic order."""
+
+        return (
+            ("long_view", self.long_view),
+            *((name, self.auxiliary[name]) for name in self.auxiliary_names),
         )
 
     @property
@@ -544,7 +615,16 @@ def _validate_request(
     )
 
 
-def _feature_names(specs: tuple[AggregateSpec, ...]) -> tuple[str, ...]:
+def _feature_names(
+    specs: tuple[AggregateSpec, ...], auxiliary_names: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Column layout: the primary block first, then one appended block per auxiliary outcome.
+
+    The primary block is byte-identical to the original single-outcome layout, so enabling an
+    auxiliary stream only ever appends columns. Exposure is a row count and does not depend on the
+    outcome, so it is emitted once rather than repeated per stream.
+    """
+
     names = ["global__long_view_prior"]
     for spec in specs:
         names.extend(
@@ -554,6 +634,15 @@ def _feature_names(specs: tuple[AggregateSpec, ...]) -> tuple[str, ...]:
                 f"{spec.resolved_name}__smoothed_rate",
             )
         )
+    for outcome in auxiliary_names:
+        names.append(f"global__{outcome}_prior")
+        for spec in specs:
+            names.extend(
+                (
+                    f"{spec.resolved_name}__{outcome}_positive",
+                    f"{spec.resolved_name}__{outcome}_smoothed_rate",
+                )
+            )
     return tuple(names)
 
 
@@ -561,25 +650,31 @@ def _key(inputs: CausalInputs, key_fields: tuple[str, ...], index: int) -> Typed
     return tuple(_typed_part(inputs.fields[name][index]) for name in key_fields)
 
 
-def _add_count(current: _CountPair | None, exposure: int, positive: int) -> _CountPair:
+def _add_count(current: _CountPair | None, exposure: int, positives: tuple[int, ...]) -> _CountPair:
     if current is None:
-        return (exposure, positive)
-    return (current[0] + exposure, current[1] + positive)
+        return (exposure, positives)
+    return (
+        current[0] + exposure,
+        tuple(left + right for left, right in zip(current[1], positives, strict=True)),
+    )
 
 
 def _build_prefix_matrix(
     request: _BuildRequest,
-) -> tuple[FeatureMatrix, list[dict[TypedKey, _CountPair]], int, int]:
+) -> tuple[FeatureMatrix, list[dict[TypedKey, _CountPair]], int, tuple[int, ...]]:
     inputs = request.prefix_inputs
-    labels = request.prefix_outcomes.long_view
+    streams = request.prefix_outcomes.streams
+    stream_labels = tuple(values for _name, values in streams)
+    stream_count = len(streams)
     specs = request.specs
-    names = _feature_names(specs)
+    names = _feature_names(specs, request.prefix_outcomes.auxiliary_names)
     order = np.argsort(np.asarray(inputs.time_ms, dtype=np.int64), kind="stable")
     chronological = np.empty((inputs.row_count, len(names)), dtype=np.float64)
     states: list[dict[TypedKey, _CountPair]] = [dict() for _ in specs]
     global_exposure = 0
-    global_positive = 0
+    global_positives = [0] * stream_count
     initial_prior = specs[0].initial_prior
+    empty_counts: _CountPair = (0, (0,) * stream_count)
 
     start = 0
     while start < inputs.row_count:
@@ -588,22 +683,39 @@ def _build_prefix_matrix(
         while end < inputs.row_count and inputs.time_ms[int(order[end])] == bucket_time:
             end += 1
 
-        prior = initial_prior if global_exposure == 0 else global_positive / global_exposure
+        priors = [
+            initial_prior if global_exposure == 0 else global_positives[stream] / global_exposure
+            for stream in range(stream_count)
+        ]
         for position in range(start, end):
             canonical_index = int(order[position])
-            chronological[position, 0] = prior
+            key_counts = [
+                states[spec_index].get(_key(inputs, spec.key_fields, canonical_index), empty_counts)
+                for spec_index, spec in enumerate(specs)
+            ]
+            # Primary block: exposure, positive, smoothed_rate per grouping.
+            chronological[position, 0] = priors[0]
             column = 1
             for spec_index, spec in enumerate(specs):
-                exposure, positive = states[spec_index].get(
-                    _key(inputs, spec.key_fields, canonical_index), (0, 0)
-                )
-                smoothed = (positive + spec.smoothing * prior) / (exposure + spec.smoothing)
+                exposure, positives = key_counts[spec_index]
+                smoothed = (positives[0] + spec.smoothing * priors[0]) / (exposure + spec.smoothing)
                 chronological[position, column : column + 3] = (
                     exposure,
-                    positive,
+                    positives[0],
                     smoothed,
                 )
                 column += 3
+            # Auxiliary blocks reuse the same exposure and emit only positive and rate.
+            for stream in range(1, stream_count):
+                chronological[position, column] = priors[stream]
+                column += 1
+                for spec_index, spec in enumerate(specs):
+                    exposure, positives = key_counts[spec_index]
+                    smoothed = (positives[stream] + spec.smoothing * priors[stream]) / (
+                        exposure + spec.smoothing
+                    )
+                    chronological[position, column : column + 2] = (positives[stream], smoothed)
+                    column += 2
 
         # Updates happen only after every simultaneous row has been featurized.
         # Aggregate bucket deltas before touching persistent state so the update
@@ -613,14 +725,21 @@ def _build_prefix_matrix(
             for position in range(start, end):
                 canonical_index = int(order[position])
                 key = _key(inputs, spec.key_fields, canonical_index)
-                deltas[key] = _add_count(deltas.get(key), 1, labels[canonical_index])
-            for key, (exposure, positive) in deltas.items():
+                deltas[key] = _add_count(
+                    deltas.get(key),
+                    1,
+                    tuple(values[canonical_index] for values in stream_labels),
+                )
+            for key, (exposure, positives) in deltas.items():
                 states[spec_index][key] = _add_count(
-                    states[spec_index].get(key), exposure, positive
+                    states[spec_index].get(key), exposure, positives
                 )
 
         global_exposure += end - start
-        global_positive += sum(labels[int(order[position])] for position in range(start, end))
+        for stream, values in enumerate(stream_labels):
+            global_positives[stream] += sum(
+                values[int(order[position])] for position in range(start, end)
+            )
         start = end
 
     canonical = np.empty_like(chronological)
@@ -629,7 +748,7 @@ def _build_prefix_matrix(
         FeatureMatrix(canonical, names),
         states,
         global_exposure,
-        global_positive,
+        tuple(global_positives),
     )
 
 
@@ -637,31 +756,53 @@ def _build_query_matrix(
     request: _BuildRequest,
     states: list[dict[TypedKey, _CountPair]],
     global_exposure: int,
-    global_positive: int,
+    global_positives: tuple[int, ...],
 ) -> FeatureMatrix | None:
+    """Score query rows against the frozen terminal prefix state; no query outcome is ever read."""
+
     inputs = request.query_inputs
     if inputs is None:
         return None
     specs = request.specs
-    names = _feature_names(specs)
+    auxiliary_names = request.prefix_outcomes.auxiliary_names
+    names = _feature_names(specs, auxiliary_names)
+    stream_count = len(global_positives)
+    empty_counts: _CountPair = (0, (0,) * stream_count)
     values = np.empty((inputs.row_count, len(names)), dtype=np.float64)
-    prior = specs[0].initial_prior if global_exposure == 0 else global_positive / global_exposure
+    priors = [
+        specs[0].initial_prior
+        if global_exposure == 0
+        else global_positives[stream] / global_exposure
+        for stream in range(stream_count)
+    ]
     for index in range(inputs.row_count):
-        values[index, 0] = prior
+        key_counts = [
+            states[spec_index].get(_key(inputs, spec.key_fields, index), empty_counts)
+            for spec_index, spec in enumerate(specs)
+        ]
+        values[index, 0] = priors[0]
         column = 1
         for spec_index, spec in enumerate(specs):
-            exposure, positive = states[spec_index].get(
-                _key(inputs, spec.key_fields, index), (0, 0)
-            )
-            smoothed = (positive + spec.smoothing * prior) / (exposure + spec.smoothing)
-            values[index, column : column + 3] = (exposure, positive, smoothed)
+            exposure, positives = key_counts[spec_index]
+            smoothed = (positives[0] + spec.smoothing * priors[0]) / (exposure + spec.smoothing)
+            values[index, column : column + 3] = (exposure, positives[0], smoothed)
             column += 3
+        for stream in range(1, stream_count):
+            values[index, column] = priors[stream]
+            column += 1
+            for spec_index, spec in enumerate(specs):
+                exposure, positives = key_counts[spec_index]
+                smoothed = (positives[stream] + spec.smoothing * priors[stream]) / (
+                    exposure + spec.smoothing
+                )
+                values[index, column : column + 2] = (positives[stream], smoothed)
+                column += 2
     return FeatureMatrix(values, names)
 
 
 def _build_uncached(request: _BuildRequest) -> CausalFeaturePair:
-    prefix, states, global_exposure, global_positive = _build_prefix_matrix(request)
-    query = _build_query_matrix(request, states, global_exposure, global_positive)
+    prefix, states, global_exposure, global_positives = _build_prefix_matrix(request)
+    query = _build_query_matrix(request, states, global_exposure, global_positives)
     return CausalFeaturePair(
         identity=request.identity,
         specs=request.specs,

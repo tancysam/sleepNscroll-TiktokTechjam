@@ -455,3 +455,105 @@ def test_row_identity_never_appears_in_candidate_feature_schema() -> None:
 
     assert all("row_id" not in name for name in pair.prefix.feature_names)
     assert pair.prefix.feature_count == 7
+
+
+def _aux_build(
+    long_view: tuple[int, ...],
+    auxiliary: dict[str, tuple[int, ...]] | None = None,
+) -> CausalFeaturePair:
+    return build_causal_feature_pair(
+        prefix_inputs=_one_key_inputs((10, 20, 30, 40), ("a", "a", "a", "a")),
+        prefix_outcomes=OutcomeEvents(long_view=long_view, auxiliary=auxiliary),
+        specs=(AggregateSpec(name="video", key_fields=("video_id",), smoothing=2.0),),
+        identity=IDENTITY,
+    )
+
+
+def test_auxiliary_outcomes_append_columns_without_disturbing_the_primary_block() -> None:
+    """Enabling an auxiliary stream must only append; the long_view block stays byte-identical."""
+
+    primary_only = _aux_build((1, 0, 1, 0))
+    with_auxiliary = _aux_build((1, 0, 1, 0), {"is_click": (1, 1, 0, 1)})
+
+    assert primary_only.prefix.feature_names == (
+        "global__long_view_prior",
+        "video__exposure",
+        "video__positive",
+        "video__smoothed_rate",
+    )
+    assert with_auxiliary.prefix.feature_names == (
+        "global__long_view_prior",
+        "video__exposure",
+        "video__positive",
+        "video__smoothed_rate",
+        "global__is_click_prior",
+        "video__is_click_positive",
+        "video__is_click_smoothed_rate",
+    )
+    # The original four columns are unchanged, so the existing bundle is a strict prefix.
+    np.testing.assert_array_equal(primary_only.prefix.values, with_auxiliary.prefix.values[:, :4])
+
+
+def test_auxiliary_outcome_history_is_real_and_distinct_from_the_primary_label() -> None:
+    pair = _aux_build((0, 0, 0, 0), {"is_click": (1, 1, 1, 1)})
+    names = pair.prefix.feature_names
+    positives = pair.prefix.values[:, names.index("video__is_click_positive")]
+    primary = pair.prefix.values[:, names.index("video__positive")]
+
+    # Clicks accumulate strictly from past rows; long_view stays flat at zero.
+    np.testing.assert_array_equal(positives, [0.0, 1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(primary, [0.0, 0.0, 0.0, 0.0])
+    # Exposure is shared, emitted once, and counts rows rather than outcomes.
+    np.testing.assert_array_equal(
+        pair.prefix.values[:, names.index("video__exposure")], [0.0, 1.0, 2.0, 3.0]
+    )
+
+
+def test_auxiliary_outcome_mutations_cannot_change_current_or_past_rows() -> None:
+    """The leakage property that matters, asserted for the auxiliary stream itself.
+
+    An auxiliary outcome is only ever aggregated over strictly-past rows, so changing a row's own
+    click -- or any later row's click -- must not alter that row or any earlier one.
+    """
+
+    original = _aux_build((1, 0, 1, 0), {"is_click": (1, 0, 1, 0)})
+    current_changed = _aux_build((1, 0, 1, 0), {"is_click": (1, 0, 0, 0)})
+    final_changed = _aux_build((1, 0, 1, 0), {"is_click": (1, 0, 1, 1)})
+
+    np.testing.assert_array_equal(original.prefix.values[:3], current_changed.prefix.values[:3])
+    assert not np.array_equal(original.prefix.values[3], current_changed.prefix.values[3])
+    np.testing.assert_array_equal(original.prefix.values, final_changed.prefix.values)
+
+
+def test_simultaneous_rows_cannot_observe_each_others_auxiliary_outcomes() -> None:
+    """Equal-timestamp rows must not see one another's clicks, exactly as for long_view."""
+
+    inputs = CausalInputs(time_ms=(10, 20, 20, 30), fields={"video_id": ("a", "a", "a", "a")})
+    pair = build_causal_feature_pair(
+        prefix_inputs=inputs,
+        prefix_outcomes=OutcomeEvents(long_view=(0, 0, 0, 0), auxiliary={"is_click": (1, 1, 1, 1)}),
+        specs=(AggregateSpec(name="video", key_fields=("video_id",), smoothing=2.0),),
+        identity=IDENTITY,
+    )
+    names = pair.prefix.feature_names
+    positives = pair.prefix.values[:, names.index("video__is_click_positive")]
+
+    # Rows 1 and 2 share a timestamp: both see only row 0's click, never each other's.
+    np.testing.assert_array_equal(positives, [0.0, 1.0, 1.0, 3.0])
+
+
+@pytest.mark.parametrize(
+    ("auxiliary", "message"),
+    [
+        ({"long_view": (1, 0, 1, 0)}, "redeclare long_view"),
+        ({"user_id": (1, 0, 1, 0)}, "not a recognized observed-outcome field"),
+        ({"invented_signal": (1, 0, 1, 0)}, "not a recognized observed-outcome field"),
+        ({"is_click": (1, 0, 1)}, "must align with long_view row count"),
+        ({"is_click": (1, 0, 1, 2)}, "binary integers"),
+    ],
+)
+def test_invalid_auxiliary_outcomes_fail_closed(
+    auxiliary: dict[str, tuple[int, ...]], message: str
+) -> None:
+    with pytest.raises(CausalFeatureError, match=message):
+        _aux_build((1, 0, 1, 0), auxiliary)
