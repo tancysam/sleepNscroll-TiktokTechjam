@@ -51,7 +51,21 @@ _MODEL_RE: Final = re.compile(
 _ENV_RE: Final = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
 _PRICE_RE: Final = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?\Z")
 _REASONING_EFFORTS: Final = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
-_GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai", "api.tokenrouter.com"})
+_GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai"})
+# Hosts that ignore both ``reasoning_effort`` and the gateway ``reasoning`` object, and
+# instead expose an explicit thinking budget. Measured against api.tokenrouter.com: the
+# OpenAI-style controls left 92% of completion tokens as reasoning and drove implement calls
+# past the configured timeout, while an explicit budget is honoured exactly.
+_THINKING_BUDGET_HOSTS: Final = frozenset({"api.tokenrouter.com"})
+_THINKING_BUDGET_TOKENS: Final = {
+    "none": 0,
+    "minimal": 0,
+    "low": 4096,
+    "medium": 16384,
+    "high": 32768,
+    "xhigh": 49152,
+    "max": 65536,
+}
 _SECRET_PATTERN: Final = re.compile(r"(?i)(?:bearer\s+|sk-(?:proj-)?)[A-Za-z0-9_.-]{8,}")
 
 
@@ -805,6 +819,16 @@ class OpenAIChatCompletionsModel:
                     "effort": self.config.reasoning_effort,
                     "exclude": True,
                 }
+            elif hostname in _THINKING_BUDGET_HOSTS:
+                # This host silently ignores both OpenAI-style controls, so the configured
+                # effort must be expressed as an explicit budget or the model reasons
+                # without bound and the call exceeds its timeout.
+                budget = _THINKING_BUDGET_TOKENS.get(self.config.reasoning_effort, 4096)
+                payload["thinking"] = (
+                    {"type": "enabled", "budget_tokens": budget}
+                    if budget > 0
+                    else {"type": "disabled"}
+                )
             else:
                 payload["reasoning_effort"] = self.config.reasoning_effort
         if hostname == "openrouter.ai":

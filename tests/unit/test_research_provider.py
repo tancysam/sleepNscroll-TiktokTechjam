@@ -246,7 +246,16 @@ def test_gateway_payload_uses_gateway_reasoning_contract(
 
     payload = json.loads(transport.requests[0].body)
     assert "reasoning_effort" not in payload
-    assert payload["reasoning"] == {"effort": "low", "exclude": True}
+    if base_url.startswith("https://api.tokenrouter.com"):
+        # This host ignores both reasoning_effort and the gateway reasoning object. Measured:
+        # the OpenAI-style controls left 92% of completion tokens as reasoning and pushed
+        # implement calls past the configured timeout, so the effort is sent as an explicit
+        # budget instead, which the host honours exactly.
+        assert "reasoning" not in payload
+        assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    else:
+        assert payload["reasoning"] == {"effort": "low", "exclude": True}
+        assert "thinking" not in payload
     if base_url.startswith("https://openrouter.ai/"):
         assert payload["max_tokens"] == 4096
         assert "max_completion_tokens" not in payload
