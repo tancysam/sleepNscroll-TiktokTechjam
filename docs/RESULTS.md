@@ -257,6 +257,29 @@ Two causes, both now fixed and both structural rather than modelling failures:
    discarded. Commit `8124607` exposes `candidate_standalone_primary` and `fold_b_control_primary`
    in `campaign_records` and states the mechanism in the briefing.
 
+#### A confounder in the run series: run 11 failed over mid-campaign
+
+Reconstructed from every `production/provider-attempt-journal/*.json` across all thirteen runs.
+The model actually called, per run:
+
+| Runs | Model | Calls |
+|---|---|---:|
+| 01–07 | `deepseek/deepseek-v4-pro-0813` | 53 |
+| 09, 10, 12, 13, 14 | `openai/gpt-5.6-sol` | 50 |
+| **11** | **`openai/gpt-5.6-sol` ×9 and `openai/gpt-5.6-terra` ×2** | 11 |
+
+114 calls in total, matching the accounting in §4. **Run 11 is the only campaign that crossed the
+failover boundary**, and the provider chain is sticky by design, so two of its operations were
+served by a different model than the other nine. Run 11 is also one of the campaigns in which
+**zero of three candidates executed**.
+
+We are not claiming the failover caused that; run 12 executed zero of three without any failover,
+and §3.3a identifies implementation size as the variable that actually tracked execution. But a
+mid-campaign model switch is a silent change of experimental conditions, and run 11 should be read
+as a confounded observation rather than a clean one. It is recorded here because it was found by
+sweeping every journal in the series rather than the run under investigation, and because nothing
+in the campaign record flags it at the point of use.
+
 #### 3.3b Seed-ensemble headroom in the baseline itself
 
 Measured offline from artifacts already in `runs/maki-qualification`; no training, no campaign, no
@@ -338,7 +361,22 @@ each run's `production/provider-attempt-journal/`. Reasoning tokens are billed a
 | `maki-overnight-10` | 9 | 116,097 | 70,792 | 186,889 | $1.82 |
 | `maki-overnight-11` | 11 | 149,934 | 88,222 | 238,156 | $2.31 |
 | `maki-overnight-12` | 10 | 135,560 | 72,551 | 208,111 | $1.93 |
-| **Total** | **92** | **1,087,621** | **877,678** | **1,965,299** | **$20.84** |
+| `maki-overnight-13` | 12 | 195,915 | 75,419 | 271,334 | $2.21 |
+| `maki-overnight-14` | 10 | 142,624 | 59,611 | 202,235 | $1.69 |
+| **Total** | **114** | **1,426,160** | **1,012,708** | **2,438,868** | **$24.74** |
+
+Of the 1,012,708 output tokens, **778,563 are reasoning tokens** — 77% of all output. That is the
+price of leaving reasoning enabled, which is not optional here: with thinking disabled the model
+stopped writing code and returned 18-character stubs, with `import numpy as np` written into
+`config.json`. It is also why `max_output_tokens` is 65536 and the request timeout is 600 seconds.
+
+Regenerate this table with `python3 token_accounting.py`, which recomputes every figure from the
+journals. Two counting notes so the two reconcile: the **Calls** column counts every attempt,
+while the tool counts only the 103 that returned a usage block — 11 attempts errored before
+returning one, and contribute zero tokens either way. And the tool deliberately does not compute
+spend: the cost column comes from the frozen pricing block in `configs/`, not from the provider's
+self-reported upstream cost, so it stays reproducible rather than dependent on a rate card that
+can change.
 
 Runs 02 and 08 made calls that returned no usage and are counted at zero. Runs 01 to 08 predate
 the survivability fixes and produced only truncated candidate stubs; their spend is included
@@ -367,8 +405,10 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
 | `maki-overnight-09` | 0 | Converged with no human action after launch. |
 | `maki-overnight-10` | 0 | Converged with no human action after launch. |
-| `maki-overnight-11` | 0 | Converged with no human action after launch. |
+| `maki-overnight-11` | 0 | Converged with no human action after launch. Its provider chain failed over mid-campaign, which is an automatic recovery rather than an intervention; see §3.3. |
 | `maki-overnight-12` | 0 | Converged with no human action after launch. |
+| `maki-overnight-13` | 0 | Converged with no human action after launch. Finalization then failed on a latent defect, which is a software fault and not a human action; no human altered the campaign. |
+| `maki-overnight-14` | 0 | Converged with no human action after launch. |
 
 ## 5. Evaluation integrity
 
