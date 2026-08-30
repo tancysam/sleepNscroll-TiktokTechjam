@@ -2083,6 +2083,7 @@ def test_fallback_report_includes_research_admission_and_rejection_evidence(
         parent_id="official-fm-fallback-seed-4",
         run_dir=tmp_path,
         campaign_id="campaign-report-context",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
         metrics=_metrics(0.6, 0.4),
         qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
         outcome=cast(
@@ -2168,6 +2169,7 @@ def test_report_context_degrades_when_the_trajectory_cannot_be_read(
         parent_id="official-fm-fallback-seed-4",
         run_dir=tmp_path,
         campaign_id="campaign-degraded-trajectory",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
         metrics=_metrics(0.6, 0.4),
         qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
         outcome=cast(

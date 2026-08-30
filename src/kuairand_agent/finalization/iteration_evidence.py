@@ -122,6 +122,7 @@ def _lineage_narrative(
     *,
     fallback_parent_id: str,
     candidate_outcomes: Mapping[str, str],
+    candidate_metrics: Mapping[str, tuple[float | None, float | None]],
 ) -> tuple[ExperimentNarrative, tuple[str, ...]]:
     """Build one narrative from an admitted iteration's immutable lineage record."""
 
@@ -166,6 +167,7 @@ def _lineage_narrative(
             "the repaired package was accepted and evaluated.",
         )
 
+    inner_primary, outer_primary = candidate_metrics.get(candidate_id, (None, None))
     narrative = ExperimentNarrative(
         iteration=iteration,
         experiment_id=candidate_id,
@@ -175,6 +177,8 @@ def _lineage_narrative(
         material_changes=material_changes,
         attributions=attributions,
         status=candidate_outcomes.get(candidate_id, "evaluated"),
+        inner_primary=inner_primary,
+        outer_primary=outer_primary,
         failures_and_recoveries=failure_lines,
     )
     return narrative, failure_lines
@@ -235,6 +239,7 @@ def collect_iteration_narratives(
     campaign_id: str,
     fallback_parent_id: str,
     candidate_outcomes: Mapping[str, str] | None = None,
+    candidate_metrics: Mapping[str, tuple[float | None, float | None]] | None = None,
     maximum_iterations: int = _MAX_ITERATIONS,
 ) -> IterationEvidence:
     """Recover every iteration a campaign durably recorded, admitted or rejected.
@@ -246,6 +251,7 @@ def collect_iteration_narratives(
     if not isinstance(run_dir, Path):
         raise IterationEvidenceError("run_dir must be a pathlib.Path")
     outcomes = dict(candidate_outcomes or {})
+    measured = dict(candidate_metrics or {})
     generated_root = run_dir / _PRODUCTION_DIR / _GENERATED_SOURCE_DIR
     if not generated_root.is_dir():
         return IterationEvidence((), ())
@@ -260,6 +266,7 @@ def collect_iteration_narratives(
             path,
             fallback_parent_id=fallback_parent_id,
             candidate_outcomes=outcomes,
+            candidate_metrics=measured,
         )
         narratives[narrative.iteration] = narrative
         failure_lines.extend(lines)

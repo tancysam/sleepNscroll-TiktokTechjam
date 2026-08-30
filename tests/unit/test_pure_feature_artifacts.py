@@ -64,7 +64,7 @@ def test_pair_round_trip_is_byte_deterministic_and_float64_exact(tmp_path: Path)
     assert first.manifest() == second.manifest()
     assert first.npz_sha256 == "61fdf1ce3ca7add3d950670dec87ed8f1b0e45c4276ee9ebfe3dbd8be7ae8c6f"
     assert (
-        first.manifest_sha256 == "f84715bc9216c27898792e4a66e13f17287f3ffdf2a3d4d7543b3cc026147b61"
+        first.manifest_sha256 == "3782eaeb1345bed1353fe29a4b7f10066e8d1b2a54706a096d388ee671a13a2c"
     )
     assert restored.digest == pair.digest
     assert restored.prefix.values.tobytes() == pair.prefix.values.tobytes()

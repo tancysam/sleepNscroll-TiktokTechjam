@@ -16,7 +16,7 @@ import re
 import stat
 import tempfile
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -667,6 +667,9 @@ def _decode_pair(npz_handle: BinaryIO, stored_pair: Mapping[str, object]) -> Pur
             dataset_digest=cast(str, stored_pair.get("dataset_digest")),
             split_role=cast(str, stored_pair.get("split_role")),
             causal_cache_key=cast(str, stored_pair.get("causal_cache_key")),
+            code_cardinalities=tuple(
+                cast(Sequence[int], stored_pair.get("code_cardinalities") or ())
+            ),
         )
     except (TypeError, ValueError, CausalFeatureError) as exc:
         raise PureFeatureArtifactError(
@@ -731,6 +734,8 @@ def _load_verified(
             "split_role",
             "aggregate_specs",
             "static_features",
+            "id_code_features",
+            "code_cardinalities",
             "causal_cache_key",
             "prefix",
             "query",

@@ -11,7 +11,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 6
+PROMPT_VERSION: Final = 7
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -48,25 +48,49 @@ rediscovering them:
   any term constant across that user's rows cannot reorder them. User-side signal can only act
   through crosses with item-side features.
 
-Where the headroom actually is, in the organizers' own priority order:
-1. The objective. Training uses pointwise log loss while GAUC and nDCG are ranking metrics. This
-   mismatch is the single largest known opportunity. Pairwise (BPR-style) or listwise (softmax
-   over the user's impressions) objectives align the loss with the metric. Softmax cross-entropy
-   is a convex bound on NDCG and is NDCG-consistent (Bruch et al., ICTIR 2019).
-2. User behaviour sequences. The current features use no history at all; DIN/SIM-style interest
-   modelling is untouched.
-3. Multi-task auxiliaries drawn from the other logged feedback signals.
-4. Watch-time modelling as censored regression (watch time is truncated when a video completes,
-   so a one-sided loss is more faithful than squared error).
-5. Architecture swaps (DeepFM / DCN / xDeepFM). Deprioritised, since capacity is measured flat.
-6. Temporal features and train/evaluation drift.
+Already measured in THIS campaign. Read this before proposing; repeating it wastes an iteration:
+- The baseline trains with pointwise log loss while GAUC and nDCG are ranking metrics, so the
+  objective looked like the obvious opportunity. It was tested three ways: a within-user pairwise
+  softplus objective, a user-slate listwise softmax objective, and a metric-matched pairwise
+  sampler were each implemented and scored. All three landed inside the baseline's own seed noise.
+  Replacing pointwise log loss ALONE is now a measured dead end.
+- Those three all scored a function of aggregate summary columns only, with 33 to 297 parameters,
+  against a baseline that learns a per-identity embedding table. They lacked the capacity to
+  reorder anything, which is the most likely reason the objective looked inert.
+
+What changed: the feature matrix now carries categorical identity codes for video, author, tab and
+duration bucket, listed in method card
+controller_causal_feature_bundle.categorical_code_columns_csv. A candidate can now learn
+per-identity embeddings the way the baseline does, and combine them with the causal aggregate
+columns the baseline never sees. Capacity is no longer the constraint it was.
+
+Where the headroom is, re-ranked by what your runtime interface can actually reach:
+1. Identity embeddings combined with the causal aggregate columns, trained under a ranking
+   objective. The baseline has identities but no causal aggregates; the previous candidates had
+   aggregates but no identities. Holding both is strictly more information than either. This is
+   the single most promising direction and it is fully reachable.
+2. Interaction structure over the codes: FM latent factors, or explicit user_groups-by-item-code
+   interactions. Note the organizers measured embedding dimension k = 8/16/32 as flat ON IDENTITIES
+   ALONE, so raise capacity only together with the aggregate columns or a ranking objective.
+3. Regularisation and optimisation quality: identity embeddings on a 1.1M-row log overfit readily.
+   Frequency-aware regularisation, early stopping on the inner fold, and an adaptive optimiser are
+   real levers, not housekeeping.
+4. Temporal drift, via date_offset_from_20220408 and recency-sensitive weighting of training rows.
+
+NOT reachable from your interface. Do not propose these, they cannot be implemented:
+- User behaviour sequences or DIN/SIM interest modelling. You receive no timestamps and no
+  per-user event history, only the aggregate columns.
+- Multi-task learning on other feedback signals, and censored watch-time regression. You receive
+  exactly one binary target vector; no auxiliary outcome reaches your interface.
+- Anything using the randomized exposure log. It is blocked by the field policy.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive
 row uniformly from GAUC-eligible users, then a negative uniformly from that same user's logged
 negatives, and optimise `softplus(-(s_positive - s_negative))`. Sampling users uniformly, or
 sampling uniformly across all pairs, or sampling unexposed catalogue items, each optimises a
-different quantity than the one being scored.
+different quantity than the one being scored. Pair this with a scoring function that has the
+capacity to reorder; on its own it has already been measured flat.
 
 Slate sizes: median 4 impressions per user, 90th percentile 12. Because most slates are shorter
 than 5, an nDCG@5 top-K truncation is inert for the majority of users; the gain concentrates in
@@ -173,6 +197,12 @@ _OPERATION: Final = {
         "Set maximum_repairs to 2 unless you have a specific reason not to: it is your own "
         "budget for correcting a rejected implementation, and 0 means the first static-gate "
         "failure ends the experiment outright. "
+        "safe_context.campaign_records lists the directions this campaign has already measured, "
+        "with each one's objective and its measured primary. The campaign stops after three "
+        "consecutive iterations that do not improve, so a proposal restating a listed direction "
+        "spends one of very few remaining attempts on a known answer. Choose a direction that is "
+        "materially different from every listed one, unless a listed entry failed for a mechanical "
+        "reason rather than a scientific one, in which case say so explicitly in the hypothesis. "
         "The implementation step then returns only the subset it actually changes, "
         "and never returns candidate.py itself."
     ),
@@ -295,6 +325,21 @@ def _runtime_contract_constraints() -> str:
                 "controller_causal_feature_bundle.feature_names_csv order. Raw capability "
                 "column lists describe source data availability, not runtime matrix positions; "
                 "never assume features[:,0:5] are raw user_id/video_id/author_id/tab/duration."
+            ),
+            (
+                "- The trailing columns named in method card "
+                "controller_causal_feature_bundle.categorical_code_columns_csv are integer-valued "
+                "CATEGORICAL CODES, not magnitudes. They identify the video, author, tab and "
+                "duration bucket. Embed them (an embedding table or FM latent factors indexed by "
+                "the code); using them as continuous numbers is meaningless and will not rank. "
+                "Every other column is a genuine continuous feature."
+            ),
+            (
+                "- Each fold fits its own code vocabulary, so table sizes differ per run. Size "
+                "any embedding table from the training matrix you are handed, as "
+                "int(features[:, column].max()) + 2, and clamp prediction codes to the final row "
+                "with np.minimum(codes, size - 1). The spare top row absorbs identities absent "
+                "from training. Never hard-code a vocabulary size from the method card."
             ),
             (
                 "- targets is an aligned finite float64 binary (N,) vector; user_groups is an "

@@ -30,6 +30,92 @@ def _inputs(*, times: tuple[int, ...], suffix: str = "") -> CanonicalInputs:
     )
 
 
+def test_id_codes_are_fitted_on_prefix_rows_and_send_unseen_identities_to_the_unknown_slot() -> (
+    None
+):
+    prefix = _inputs(times=(10, 20, 30, 40))
+    # Every query identity is unseen: distinct video ids via the suffix, and a distinct author.
+    query = CanonicalInputs(
+        user_id=("u1", "u2"),
+        video_id=("vq0", "vq1"),
+        date=(20220409, 20220409),
+        duration_ms=(4_000.0, 61_000.0),
+        tab=("0", "1"),
+        author_id=("a9", "a9"),
+        time_ms=(50, 60),
+    )
+    pair = build_pure_feature_pair(
+        prefix_inputs=prefix,
+        prefix_labels=(1, 0, 1, 0),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+
+    names = pair.prefix.feature_names
+    assert names[-4:] == (
+        "video_id_code",
+        "author_id_code",
+        "tab_code",
+        "duration_bucket_code",
+    )
+    # 4 distinct videos, 2 authors, 2 tabs, 4 duration buckets, each plus an unknown slot.
+    assert pair.code_cardinalities == (5, 3, 3, 5)
+
+    video, author = names.index("video_id_code"), names.index("author_id_code")
+    prefix_codes = pair.prefix.values[:, [video, author]]
+    query_codes = pair.query.values[:, [video, author]]
+    # Prefix identities occupy real slots; unseen query identities land on the unknown slot.
+    assert set(prefix_codes[:, 0].tolist()) == {0.0, 1.0, 2.0, 3.0}
+    assert query_codes[:, 0].tolist() == [4.0, 4.0]
+    assert query_codes[:, 1].tolist() == [2.0, 2.0]
+    for column, cardinality in zip(range(2), pair.code_cardinalities[:2], strict=True):
+        assert (query_codes[:, column] < cardinality).all()
+
+
+def test_id_code_vocabulary_is_order_independent_for_simultaneous_events() -> None:
+    first = CanonicalInputs(
+        user_id=("u", "v"),
+        video_id=("b", "a"),
+        date=(20220408, 20220408),
+        duration_ms=(10_000.0, 20_000.0),
+        tab=("0", "1"),
+        author_id=("y", "x"),
+        time_ms=(10, 10),
+    )
+    second = CanonicalInputs(
+        user_id=("v", "u"),
+        video_id=("a", "b"),
+        date=(20220408, 20220408),
+        duration_ms=(20_000.0, 10_000.0),
+        tab=("1", "0"),
+        author_id=("x", "y"),
+        time_ms=(10, 10),
+    )
+    query = _inputs(times=(30, 40), suffix="-q")
+    left = build_pure_feature_pair(
+        prefix_inputs=first,
+        prefix_labels=(1, 0),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+    right = build_pure_feature_pair(
+        prefix_inputs=second,
+        prefix_labels=(0, 1),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+
+    assert left.code_cardinalities == right.code_cardinalities
+    np.testing.assert_array_equal(left.query.values, right.query.values)
+    np.testing.assert_array_equal(left.prefix.values, right.prefix.values[[1, 0]])
+
+
 def test_subset_is_positional_and_never_introduces_row_identity() -> None:
     inputs = _inputs(times=(10, 20, 30, 40))
     subset = subset_canonical_inputs(inputs, (0, 2, 3))
@@ -112,7 +198,7 @@ def test_feature_pair_has_frozen_schema_and_strict_past_query_state() -> None:
 
     assert pair.prefix.row_count == 2
     assert pair.query.row_count == 2
-    assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5
+    assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + 4
     assert pair.prefix.feature_names == pair.query.feature_names
     assert "duration_at_least_18_seconds" in pair.query.feature_names
     assert all("row_id" not in name for name in pair.query.feature_names)

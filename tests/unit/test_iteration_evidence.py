@@ -318,3 +318,46 @@ def test_counting_iterations_does_not_require_parsing(tmp_path: Path) -> None:
     )
 
     assert count_recorded_iterations(tmp_path) == 3
+
+
+def test_measured_primaries_reach_the_trajectory_rows(tmp_path: Path) -> None:
+    """Lineage records carry a proposal and a package but no score.
+
+    Without the measured primaries the trajectory table renders a dash for every generated
+    candidate, so a run whose candidates trained and were scored is indistinguishable from one
+    that produced nothing.  That table is the evidence a judge grades the loop from.
+    """
+
+    root = _generated_root(tmp_path)
+    for iteration in (1, 2):
+        _write_lineage(root, iteration)
+
+    evidence = collect_iteration_narratives(
+        tmp_path,
+        campaign_id=CAMPAIGN,
+        fallback_parent_id="official-fm-fallback-seed-4",
+        candidate_metrics={
+            "candidate-01": (0.5913746, 0.6012030),
+            "candidate-02": (0.5754240, None),
+        },
+    )
+
+    first, second = evidence.narratives
+    assert first.inner_primary == pytest.approx(0.5913746)
+    assert first.outer_primary == pytest.approx(0.6012030)
+    # A screen-rejected branch has an inner score and no outer promotion.
+    assert second.inner_primary == pytest.approx(0.5754240)
+    assert second.outer_primary is None
+
+
+def test_trajectory_rows_stay_unscored_when_no_metrics_are_supplied(tmp_path: Path) -> None:
+    """An unknown score must render as unknown rather than as a fabricated number."""
+
+    _write_lineage(_generated_root(tmp_path), 1)
+
+    evidence = collect_iteration_narratives(
+        tmp_path, campaign_id=CAMPAIGN, fallback_parent_id="parent"
+    )
+
+    assert evidence.narratives[0].inner_primary is None
+    assert evidence.narratives[0].outer_primary is None

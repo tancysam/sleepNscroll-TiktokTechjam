@@ -2548,6 +2548,7 @@ def _generated_replay_candidate(
             parent_id=outcome.fallback_candidate_id,
             run_dir=outcome.run_dir,
             campaign_id=outcome.campaign_id,
+            artifact_store=artifact_store,
             metrics=metrics,
             qualification=qualification,
             outcome=outcome,
@@ -2672,6 +2673,7 @@ def _fallback_replay_candidate(
             parent_id=candidate_id,
             run_dir=outcome.run_dir,
             campaign_id=outcome.campaign_id,
+            artifact_store=artifact_store,
             metrics=metrics,
             qualification=qualification,
             outcome=outcome,
@@ -3362,6 +3364,114 @@ def _report_peak_rss_bytes(
     return max(qualification_peak, confirmation.retained_training_peak_rss_bytes)
 
 
+def _retained_candidate_outcomes(
+    run_dir: Path,
+    outcome: FullCampaignOutcome,
+    artifact_store: ArtifactStore,
+) -> list[object]:
+    """Read the retained scientific result and return its per-candidate outcome entries.
+
+    The durable progress checkpoints carry the result artifact reference, so this recovers the
+    document without threading the science checkpoint mapping through the report builder.  The
+    stored digest is checked against the retained outcome so a mismatched document is ignored
+    rather than reported.
+    """
+
+    progress_root = run_dir / "production" / "progress"
+    if not progress_root.is_dir():
+        return []
+    for path in sorted(progress_root.iterdir(), reverse=True):
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        evidence = checkpoint.get("evidence")
+        if not isinstance(evidence, Mapping):
+            continue
+        reference_raw = evidence.get("scientific_result_artifact")
+        if not isinstance(reference_raw, Mapping):
+            continue
+        if evidence.get("scientific_result_digest") != outcome.scientific_result_digest:
+            continue
+        reference = ArtifactRef.from_manifest(reference_raw)
+        if reference.kind is not ArtifactKind.MANIFEST:
+            return []
+        payload = artifact_store.read_bytes(reference, max_bytes=_MAX_MANIFEST_BYTES)
+        document = json.loads(payload.decode("ascii"))
+        if not isinstance(document, dict):
+            return []
+        if document.get("digest") != outcome.scientific_result_digest:
+            return []
+        entries = document.get("candidate_outcomes")
+        return list(entries) if isinstance(entries, list) else []
+    return []
+
+
+_INNER_TIER_RUN_COUNT: Final = 2
+
+
+def _candidate_measured_primaries(
+    run_dir: Path,
+    outcome: FullCampaignOutcome,
+    artifact_store: ArtifactStore,
+) -> dict[str, tuple[float | None, float | None]]:
+    """Recover each generated candidate's measured inner and outer primary.
+
+    The trajectory table is the one place a judge can see that a candidate actually ran, and
+    lineage records carry a proposal and a package but no score.  The scientific result names
+    each candidate's run evidence digests and the durable record repository holds the exact
+    metrics, so joining the two recovers the numbers without trusting the rounded public
+    feedback.  Runs are recorded in tier order: the Fold B screen, the Fold A confirmation,
+    then the matched outer seeds.
+
+    This is presentation evidence.  Every inconsistency degrades to an unknown score rather than
+    failing a finalization that has a valid bundle to publish.
+    """
+
+    if outcome.scientific_result_digest is None:
+        return {}
+    record_root = run_dir / "production" / "scientific-records"
+    if not record_root.is_dir():
+        return {}
+    try:
+        candidate_outcomes = _retained_candidate_outcomes(run_dir, outcome, artifact_store)
+        if not candidate_outcomes:
+            return {}
+        repository = FileScientificRunEvidenceRepository(record_root)
+        primary_by_run: dict[str, float] = {}
+        for path in sorted(record_root.iterdir()):
+            if not path.is_file() or path.suffix != ".json":
+                continue
+            record = repository.load(path.stem)
+            if record is None or record.evidence.metrics is None:
+                continue
+            primary_by_run[record.evidence.digest] = float(record.evidence.metrics.primary)
+    except Exception:
+        return {}
+
+    measured: dict[str, tuple[float | None, float | None]] = {}
+    for candidate in candidate_outcomes:
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_id = candidate.get("candidate_id")
+        run_digests = candidate.get("run_digests")
+        if not isinstance(candidate_id, str) or not isinstance(run_digests, list):
+            continue
+        scored = [
+            primary_by_run[item]
+            for item in run_digests
+            if isinstance(item, str) and item in primary_by_run
+        ]
+        if not scored:
+            continue
+        inner = scored[:_INNER_TIER_RUN_COUNT]
+        outer = scored[_INNER_TIER_RUN_COUNT:]
+        measured[candidate_id] = (
+            sum(inner) / len(inner) if inner else None,
+            sum(outer) / len(outer) if outer else None,
+        )
+    return measured
+
+
 def _candidate_outcome_status(outcome: FullCampaignOutcome) -> dict[str, str]:
     """Map candidate id to its measured campaign outcome for the trajectory table.
 
@@ -3402,6 +3512,7 @@ def _report_context(
     parent_id: str,
     run_dir: Path,
     campaign_id: str,
+    artifact_store: ArtifactStore,
     metrics: Mapping[str, object],
     qualification: OfficialFMQualificationEvidence,
     outcome: FullCampaignOutcome,
@@ -3447,6 +3558,7 @@ def _report_context(
             campaign_id=campaign_id,
             fallback_parent_id=parent_id,
             candidate_outcomes=_candidate_outcome_status(outcome),
+            candidate_metrics=_candidate_measured_primaries(run_dir, outcome, artifact_store),
         )
     except Exception:
         # The recovered trajectory is presentation; the campaign store and the immutable

@@ -480,6 +480,11 @@ def _drive_autonomous_followups(
         candidate_id="live-candidate-1",
         parent=parent,
         materialized=object(),
+        proposal=SimpleNamespace(
+            objective="stub ranking objective",
+            mechanism="stub mechanism",
+            principal_change="stub principal change",
+        ),
     )
     opaque = cast(Any, object())
     runtime_template = runtime._ScientificRuntime(
@@ -531,6 +536,11 @@ def _drive_autonomous_followups(
             candidate_id=f"live-candidate-{iteration}",
             parent=kwargs["parent"],
             materialized=object(),
+            proposal=SimpleNamespace(
+                objective="stub ranking objective",
+                mechanism="stub mechanism",
+                principal_change="stub principal change",
+            ),
         )
 
     def continue_campaign(**kwargs: object) -> ScientificCampaignResult:
@@ -966,3 +976,94 @@ def test_provider_free_runtime_closes_fallback_and_exactly_retries_without_final
     }
     assert progress.checkpoints() == first_checkpoints
     assert tuple((request.run_dir / "controller" / "deadline").iterdir()) == first_deadlines
+
+
+def _runs(primaries: tuple[float, ...]) -> SimpleNamespace:
+    """A candidate result carrying `primaries` in the tier order the campaign produces."""
+
+    return SimpleNamespace(
+        runs=tuple(
+            SimpleNamespace(metrics=OrganizerMetrics(gauc=primary, ndcg_at_5=primary))
+            for primary in primaries
+        )
+    )
+
+
+def test_measured_primary_reports_the_outer_seed_mean_and_its_delta() -> None:
+    """Runs arrive as Fold B screen, Fold A confirmation, then the matched outer seeds."""
+
+    incumbent = _fallback(0.61)
+
+    primary, delta, tier = runtime._measured_primary(
+        cast(Any, _runs((0.57, 0.60, 0.601, 0.602, 0.603))),
+        incumbent,
+    )
+
+    assert tier == "outer_matched_seed"
+    assert primary == pytest.approx(0.602, abs=1e-9)
+    assert delta == pytest.approx(-0.008, abs=1e-9)
+
+
+def test_measured_primary_falls_back_to_the_inner_tier_before_outer_promotion() -> None:
+    incumbent = _fallback(0.61)
+
+    primary, delta, tier = runtime._measured_primary(cast(Any, _runs((0.58,))), incumbent)
+
+    assert tier == "inner_fold"
+    assert primary == pytest.approx(0.58, abs=1e-9)
+    assert delta == pytest.approx(-0.03, abs=1e-9)
+
+
+def test_measured_primary_claims_nothing_when_no_run_produced_metrics() -> None:
+    incumbent = _fallback(0.61)
+
+    assert runtime._measured_primary(None, incumbent) == (None, None, None)
+    assert runtime._measured_primary(
+        cast(Any, SimpleNamespace(runs=(SimpleNamespace(metrics=None),))),
+        incumbent,
+    ) == (None, None, None)
+
+
+def test_iteration_record_carries_the_tested_direction_and_the_reflection_lessons() -> None:
+    """The proposer sees only these records, so a tested direction must be legible in them."""
+
+    config = _config()
+    fallback = _fallback(0.61)
+    result = ScientificCampaignResult(
+        config_digest=config.digest,
+        fallback=fallback,
+        incumbent=fallback,
+        candidates=(),
+        public_feedback=(),
+        convergence=ConvergenceState.initial(0.61),
+        launches_used=config.launches_already_used + 1,
+        elapsed_seconds=1.0,
+        stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
+    )
+    reflection = Reflection(
+        response_id="reflection-1",
+        summary="The pairwise branch did not beat the incumbent.",
+        recommendation="propose_next",
+        lessons=("Objective alone is inert.", "Capacity is the binding constraint."),
+    )
+    proposal = SimpleNamespace(
+        objective="within-user pairwise softplus ranking objective",
+        mechanism="sample a positive then a negative from the same user",
+        principal_change="replace pointwise log loss",
+    )
+
+    record = runtime._iteration_record(
+        result,
+        reflection,
+        scientific_iteration=2,
+        proposal=cast(Any, proposal),
+    )
+
+    values = record.values
+    assert values["proposal_family"] == "pairwise"
+    assert values["proposal_objective"] == proposal.objective
+    assert values["proposal_principal_change"] == proposal.principal_change
+    assert "Capacity is the binding constraint." in cast(str, values["reflection_lessons"])
+    # Without a proposal the record claims no direction rather than fabricating one.
+    bare = runtime._iteration_record(result, reflection, scientific_iteration=2)
+    assert bare.values["proposal_family"] is None

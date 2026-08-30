@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
-from typing import Literal, Protocol, cast
+from typing import Final, Literal, Protocol, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -82,6 +82,7 @@ from kuairand_agent.campaign.provenance import (
     capture_environment_identity,
     hash_source_tree,
 )
+from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.campaign.qualification_evidence import (
     OfficialFMQualificationEvidence,
     OfficialFMSeedEvidence,
@@ -90,6 +91,7 @@ from kuairand_agent.campaign.qualification_evidence import (
 )
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateCampaignResult,
     ExecutableChangeEvidence,
     OuterPromotionRequest,
     ScientificCampaignCancelled,
@@ -169,6 +171,7 @@ from kuairand_agent.research.production import (
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
     prepare_or_rehydrate_scripted_lambdarank_lineage,
+    proposal_family_of,
 )
 from kuairand_agent.research.provider import (
     OpenAIChatCompletionsConfig,
@@ -185,6 +188,7 @@ from kuairand_agent.research.provider import (
 from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
     ParentSnapshot,
+    Proposal,
     Reflection,
     ReflectionRequest,
     ResearchOperation,
@@ -744,6 +748,14 @@ def _research_context_evidence(
                     "feature_count": features.final.feature_count,
                     "feature_names_csv": ",".join(features.final.feature_names),
                     "feature_bundle_digest": features.digest,
+                    "categorical_code_columns_csv": ",".join(ID_CODE_FEATURE_NAMES),
+                    # Each fold fits its own vocabulary on its own training rows, so these sizes
+                    # describe the outer build only.  A candidate must size any embedding table
+                    # from the training matrix it is handed, never from these numbers.
+                    "outer_code_cardinalities_csv": ",".join(
+                        str(value) for value in features.outer_and_final.code_cardinalities
+                    ),
+                    "code_cardinalities_vary_by_fold": True,
                     "fold_b_selected_fusion_only": True,
                     "uses_public_labels_for_features": False,
                     "uses_prediction_period_outcomes": False,
@@ -1420,13 +1432,50 @@ class _AutonomousFollowupResult:
     rejected_records: tuple[AggregateRecord, ...]
 
 
+_MEASURED_TIER_RUN_COUNT: Final = 3
+
+
+def _measured_primary(
+    candidate_result: CandidateCampaignResult | None,
+    incumbent: IncumbentEvidence,
+) -> tuple[float | None, float | None, str | None]:
+    """Return the candidate's measured primary, its delta, and the tier that produced it.
+
+    The proposer sees only the records built here, so without this a direction that ran and
+    scored is indistinguishable from one that was never tried.  Runs arrive in tier order:
+    the Fold B screen, then the Fold A confirmation, then the matched outer seeds.
+    """
+
+    if candidate_result is None or not candidate_result.runs:
+        return None, None, None
+    scored = [run for run in candidate_result.runs if run.metrics is not None]
+    if not scored:
+        return None, None, None
+    if len(scored) >= _MEASURED_TIER_RUN_COUNT:
+        outer = scored[_MEASURED_TIER_RUN_COUNT - 1 :]
+        primary = sum(float(run.metrics.primary) for run in outer if run.metrics) / len(outer)
+        reference = sum(float(item.metrics.primary) for item in incumbent.outer_by_seed) / len(
+            incumbent.outer_by_seed
+        )
+        return primary, primary - reference, "outer_matched_seed"
+    metrics = scored[-1].metrics
+    assert metrics is not None  # narrowed by the scored filter above
+    folds = dict(incumbent.inner_by_fold)
+    fold_b = folds.get("B")
+    primary = float(metrics.primary)
+    delta = None if fold_b is None else primary - float(fold_b.primary)
+    return primary, delta, "inner_fold"
+
+
 def _iteration_record(
     result: ScientificCampaignResult,
     reflection: Reflection,
     *,
     scientific_iteration: int,
+    proposal: Proposal | None = None,
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
+    primary, delta, tier = _measured_primary(candidate_result, result.incumbent)
     return AggregateRecord(
         name=f"scientific_iteration_{scientific_iteration:02d}",
         values={
@@ -1438,12 +1487,22 @@ def _iteration_record(
                 None if candidate_result is None else candidate_result.outcome.value
             ),
             "candidate_reason": None if candidate_result is None else candidate_result.reason,
+            # The direction this iteration actually tested.  A proposer that cannot see this
+            # cannot avoid restating it, and the convergence rule allows very few attempts.
+            "proposal_family": (None if proposal is None else proposal_family_of(proposal)),
+            "proposal_objective": None if proposal is None else proposal.objective,
+            "proposal_principal_change": None if proposal is None else proposal.principal_change,
+            "candidate_primary": None if primary is None else round(primary, 6),
+            "candidate_primary_tier": tier,
+            "delta_vs_incumbent": None if delta is None else round(delta, 6),
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
             "stop_reason": result.stop_reason.value,
             "reflection_recommendation": reflection.recommendation,
             "reflection_summary": reflection.summary,
+            # Lessons are the richest thing reflection produces and were previously dropped here.
+            "reflection_lessons": " | ".join(reflection.lessons),
         },
     )
 
@@ -2187,6 +2246,7 @@ def _run_autonomous_followups(
             result,
             reflection,
             scientific_iteration=runtime_template.scientific_iteration,
+            proposal=lineage.proposal,
         ),
     ]
     rejected_records = list(prior_records)
@@ -2362,7 +2422,14 @@ def _run_autonomous_followups(
             artifacts=runtime_template.artifacts,
             research_model=research_model,
         )
-        records.append(_iteration_record(result, reflection, scientific_iteration=iteration))
+        records.append(
+            _iteration_record(
+                result,
+                reflection,
+                scientific_iteration=iteration,
+                proposal=lineage.proposal,
+            )
+        )
         if result.incumbent.candidate_id == candidate_id:
             parent = snapshot_materialized_candidate(
                 lineage.materialized,

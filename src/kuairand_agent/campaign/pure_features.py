@@ -54,6 +54,17 @@ _STATIC_FEATURE_NAMES: Final = (
     "date_offset_from_20220408",
     "tab_numeric",
 )
+# Train-fitted categorical codes.  The aggregate columns above summarize an identity's history;
+# these carry the identity itself, so a candidate can learn a per-identity embedding the way the
+# organizer FM does instead of only reweighting summaries.  ``user_id`` is deliberately absent:
+# candidates already receive user identity through the trusted user_groups vector, and a
+# user-constant term cannot reorder a within-user ranking.
+ID_CODE_FEATURE_NAMES: Final = (
+    "video_id_code",
+    "author_id_code",
+    "tab_code",
+    "duration_bucket_code",
+)
 _DATE_CHRONOLOGY_STRIDE: Final = 10_000_000_000_000
 
 
@@ -215,11 +226,79 @@ def _static_matrix(inputs: CanonicalInputs) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.float64)
 
 
-def _augment(causal: FeatureMatrix, inputs: CanonicalInputs) -> FeatureMatrix:
+def _code_source_columns(inputs: CanonicalInputs) -> tuple[tuple[str, ...], ...]:
+    """Return the categorical source column for each ID-code feature, in declared order."""
+
+    return (
+        tuple(str(value) for value in inputs.video_id),
+        tuple(str(value) for value in inputs.author_id),
+        tuple(str(value) for value in inputs.tab),
+        tuple(_duration_bucket(value) for value in inputs.duration_ms),
+    )
+
+
+def fit_code_vocabulary(inputs: CanonicalInputs) -> tuple[dict[str, int], ...]:
+    """Fit one sorted categorical vocabulary per ID-code field.
+
+    Codes are assigned in sorted value order rather than first-seen order.  Simultaneous events
+    may arrive in either permutation, and this module guarantees path-independent features, so a
+    first-seen assignment would make the matrix depend on input ordering.
+
+    This must only ever see prefix rows.  Fitting on query rows would let a validation or final
+    identity claim its own code, which is exactly the leak the frozen-query contract exists to
+    prevent.  Values absent from the fitted vocabulary encode to the trailing unknown slot, so
+    every code stays inside ``[0, cardinality)`` for both matrices.
+    """
+
+    if not isinstance(inputs, CanonicalInputs):
+        raise PureFeatureError("inputs must be CanonicalInputs")
+    return tuple(
+        {value: index for index, value in enumerate(sorted(set(column)))}
+        for column in _code_source_columns(inputs)
+    )
+
+
+def code_cardinalities(vocabulary: Sequence[dict[str, int]]) -> tuple[int, ...]:
+    """Return each field's code count, including its trailing unknown slot."""
+
+    return tuple(len(table) + 1 for table in vocabulary)
+
+
+def _code_matrix(
+    inputs: CanonicalInputs,
+    vocabulary: Sequence[dict[str, int]],
+) -> np.ndarray:
+    columns = _code_source_columns(inputs)
+    if len(vocabulary) != len(columns):
+        raise PureFeatureError("code vocabulary does not match the declared categorical fields")
+    encoded = tuple(
+        np.asarray(
+            [table.get(value, len(table)) for value in column],
+            dtype=np.float64,
+        )
+        for column, table in zip(columns, vocabulary, strict=True)
+    )
+    values = np.column_stack(encoded)
+    if not np.isfinite(values).all():
+        raise PureFeatureError("categorical code transform produced a non-finite value")
+    return np.ascontiguousarray(values, dtype=np.float64)
+
+
+def _augment(
+    causal: FeatureMatrix,
+    inputs: CanonicalInputs,
+    vocabulary: Sequence[dict[str, int]],
+) -> FeatureMatrix:
     if causal.row_count != len(inputs):
         raise PureFeatureError("causal and static feature rows differ")
-    values = np.concatenate((causal.values, _static_matrix(inputs)), axis=1)
-    return FeatureMatrix(values, (*causal.feature_names, *_STATIC_FEATURE_NAMES))
+    values = np.concatenate(
+        (causal.values, _static_matrix(inputs), _code_matrix(inputs, vocabulary)),
+        axis=1,
+    )
+    return FeatureMatrix(
+        values,
+        (*causal.feature_names, *_STATIC_FEATURE_NAMES, *ID_CODE_FEATURE_NAMES),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,11 +310,16 @@ class PureFeaturePair:
     dataset_digest: str
     split_role: str
     causal_cache_key: str
+    code_cardinalities: tuple[int, ...] = ()
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         if self.prefix.feature_names != self.query.feature_names:
             raise PureFeatureError("prefix and query feature schemas differ")
+        if type(self.code_cardinalities) is not tuple or any(
+            type(value) is not int or value <= 0 for value in self.code_cardinalities
+        ):
+            raise PureFeatureError("code_cardinalities must be a tuple of positive integers")
         if (
             type(self.dataset_digest) is not str
             or len(self.dataset_digest) != 64
@@ -260,6 +344,8 @@ class PureFeaturePair:
             "split_role": self.split_role,
             "aggregate_specs": [spec.manifest() for spec in PURE_AGGREGATE_SPECS],
             "static_features": list(_STATIC_FEATURE_NAMES),
+            "id_code_features": list(ID_CODE_FEATURE_NAMES),
+            "code_cardinalities": list(self.code_cardinalities),
             "causal_cache_key": self.causal_cache_key,
             "prefix": self.prefix.manifest(),
             "query": self.query.manifest(),
@@ -308,12 +394,16 @@ def build_pure_feature_pair(
     )
     if causal.query is None:  # pragma: no cover - query input above makes this defensive.
         raise PureFeatureError("causal builder did not return query features")
+    # Fitted on prefix rows only, then applied unchanged to the query matrix, so a query-only
+    # identity encodes to its field's unknown slot rather than gaining a code of its own.
+    vocabulary = fit_code_vocabulary(prefix_inputs)
     return PureFeaturePair(
-        prefix=_augment(causal.prefix, prefix_inputs),
-        query=_augment(causal.query, query_inputs),
+        prefix=_augment(causal.prefix, prefix_inputs, vocabulary),
+        query=_augment(causal.query, query_inputs, vocabulary),
         dataset_digest=dataset_digest,
         split_role=split_role,
         causal_cache_key=causal.cache_key,
+        code_cardinalities=code_cardinalities(vocabulary),
     )
 
 
