@@ -27,6 +27,7 @@ from urllib.parse import quote, urlsplit
 
 from kuairand_agent.research.interface import ResearchModelError
 from kuairand_agent.research.prompts import PROMPT_VERSION, instructions_for
+from kuairand_agent.research.proposal_families import blocked_proposal_families
 from kuairand_agent.research.schemas import (
     GeneratedPackage,
     ImplementationRequest,
@@ -811,10 +812,19 @@ class OpenAIChatCompletionsModel:
             else DEFAULT_CANDIDATE_SOURCE_POLICY
         )
         schema = response_json_schema(operation)
+        # Derived from the same safe-context records the controller's own refusal scans, so the
+        # closures the model is shown cannot drift from the ones enforced against it.
+        safe_context = getattr(request, "safe_context", None)
+        blocked_families = (
+            blocked_proposal_families(safe_context.get("campaign_records"))
+            if isinstance(safe_context, Mapping)
+            else ()
+        )
         instructions = instructions_for(
             operation,
             schema_retry=retry,
             source_policy=source_policy,
+            blocked_families=blocked_families,
         )
         if self.config.response_format == "json_schema":
             output_format: dict[str, object] = {

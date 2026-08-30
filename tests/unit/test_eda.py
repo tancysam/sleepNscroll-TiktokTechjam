@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -8,9 +10,10 @@ from kuairand_agent.campaign.eda import (
     within_user_feature_diagnostics,
     within_user_label_structure,
 )
+from kuairand_agent.research.context import AggregateRecord
 
 
-def _record(records: tuple, name: str) -> dict:
+def _record(records: tuple[AggregateRecord, ...], name: str) -> dict[str, Any]:
     for item in records:
         if item.name == name:
             return dict(item.values)

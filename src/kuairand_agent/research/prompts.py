@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Final
 
 from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
@@ -11,7 +12,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 8
+PROMPT_VERSION: Final = 9
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -77,16 +78,52 @@ GAUC-eligible mixed-label users."""
 
 _PACKAGES: Final = """Execution environment
 
-Available: `numpy` (import as `np`) and `lightgbm` (verified importable in the sandbox), plus the
-Python standard library minus the forbidden import roots supplied in the request.
+Available: `numpy` (import as `np`) and `lightgbm` 4.7.0 (verified importable in the sandbox), plus
+the Python standard library minus the forbidden import roots supplied in the request.
 
 `lightgbm` matters here because it has a native ranking objective. `objective="lambdarank"` with
 per-user group sizes optimises NDCG directly, which is the metric family being scored, and the
 training request already supplies the user grouping you need to build those groups. A gradient
 boosted ranker over the supplied dense columns is a genuinely different model family from the
-parent's linear/FM scorer, not a variation of it. Pin the version you validate against and set the
-deterministic parameters (single thread, fixed seed, no early stopping on a random split), because
-exact replay of your predictions is a release gate. You have `math`, `json`, `dataclasses`, `typing`, `collections`,
+parent's linear/FM scorer, not a variation of it.
+
+Two things about `lightgbm` here will fail your candidate if you do not know them in advance, so
+they are given as verified working recipe rather than as advice.
+
+First, `scikit-learn` is NOT installed, so `LGBMRanker`, `LGBMClassifier`, and everything else
+under `lightgbm.sklearn` raise on construction. Use the native API only: `lgb.Dataset` and
+`lgb.train`.
+
+Second, exact replay of your predictions is a release gate, and the checkpoint you return may
+contain only numeric NumPy arrays -- a Booster is a string, so it must be encoded. This exact
+parameter set and round-trip were verified to reproduce byte-identical float64 predictions:
+
+```python
+params = {
+    "objective": "lambdarank", "metric": "ndcg", "ndcg_eval_at": [5],
+    "deterministic": True, "force_col_wise": True, "num_threads": 1,
+    "seed": seed, "bagging_seed": seed, "feature_fraction_seed": seed,
+    "data_random_seed": seed, "extra_seed": seed, "objective_seed": seed,
+    "bagging_freq": 0, "feature_fraction": 1.0, "verbosity": -1,
+}
+booster = lgb.train(params, lgb.Dataset(features, label=targets, group=group_sizes),
+                    num_boost_round=NUM_ROUNDS)
+# Encode the model as a numeric array so it satisfies the checkpoint contract.
+blob = np.frombuffer(booster.model_to_string().encode("utf-8"), dtype=np.uint8)
+return {"booster_utf8": blob}
+
+# In predict_scores:
+restored = lgb.Booster(model_str=bytes(checkpoint["booster_utf8"].astype(np.uint8)).decode("utf-8"))
+scores = restored.predict(features).astype(np.float64)
+```
+
+`num_threads: 1` is not optional: multi-threaded histogram accumulation sums floats in
+nondeterministic order and will break the replay gate. `bagging_freq: 0` and
+`feature_fraction: 1.0` remove the two remaining stochastic subsamples. `group_sizes` is the
+run-length count of consecutive equal `user_groups` values, in row order, and must sum to N.
+Never use early stopping against a random split.
+
+You have `math`, `json`, `dataclasses`, `typing`, `collections`,
 `itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.
 You do NOT have `os`, `sys`, `pickle`, `shutil`, `glob`, `tempfile`, `importlib`,
 `multiprocessing`, or any network library. The forbidden check is on the FIRST dotted component,
@@ -224,7 +261,32 @@ Neither half alone is the strongest available model. The reason to cross them is
 metric: ranking happens inside one user's own impressions, so a column that is constant across
 that user's rows cannot reorder them by itself -- but multiplied against an item identity it
 becomes "this kind of user prefers this item", which does reorder them. That is what an FM
-interaction term, 0.5 * ((sum v)^2 - sum(v^2)), computes over every pair at once."""
+interaction term, 0.5 * ((sum v)^2 - sum(v^2)), computes over every pair at once.
+
+What an embedding table costs, because this has already been measured and lost. A prior candidate
+embedded these identities at dimension 8 and trained a within-user BPR objective for 6 epochs of
+400,000 sampled pairs. It scored 0.5705 against the incumbent's 0.5754, and the fusion grid was
+monotone: every step of additional weight on that candidate made the blend worse. The architecture
+was right and the training budget was not.
+
+The arithmetic behind that failure, which you should do before proposing any embedding:
+- These five fields total roughly 40,000 embedding rows, dominated by 26,211 users and 7,539
+  videos. A pair sample updates only the handful of rows it touches, so 2.4M pairs is on the order
+  of a few hundred expected updates per video row and fewer per user row.
+- Impression counts are heavily skewed. The average row being trained a few hundred times means
+  the long tail is trained almost never, and an untrained row still holds its random init. Those
+  rows do not contribute zero -- they contribute noise, directly into the within-user comparisons
+  that GAUC scores.
+- So the cost of an identity embedding is paid mostly in the tail, and the fix is not a larger
+  dimension. Measured capacity is already flat (k = 8/16/32 scored 0.5895/0.5902/0.5887).
+
+Three ways to make identities pay, all cheaper than more epochs: initialise the embedding at zero
+rather than randomly, so an untrained row contributes nothing instead of noise; regularise the
+embedding toward zero far more strongly than the dense weights, so rare rows shrink back to the
+aggregate-only model; or cross the aggregates against a low-cardinality identity only
+(`id__tab` at 16, `id__duration_bucket` at 7), where every row is seen thousands of times and
+there is no tail to speak of. The last of these is the cheapest experiment in the space and has
+never been run."""
 
 _SECTIONS: Final = {
     # PROPOSE receives the feature-authority grant because the proposal is where an axis is
@@ -235,6 +297,32 @@ _SECTIONS: Final = {
     ResearchOperation.REPAIR: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE),
     ResearchOperation.REFLECT: (_BENCHMARK,),
 }
+
+
+def _blocked_family_constraints(blocked_families: Sequence[tuple[str, str]]) -> str:
+    """Render the closed families as a pre-proposal directive.
+
+    The controller refuses these deterministically after the fact. Showing the model the same list
+    before it chooses an axis is what turns a wasted provider call into a redirected one.
+    """
+
+    lines = [
+        "Closed proposal families -- CHECK THIS BEFORE CHOOSING YOUR AXIS",
+        "",
+        "The controller will reject a proposal in any family below, deterministically, before your",
+        "code is ever run. This is not a preference to weigh against your own judgement; it is a",
+        "wall. Proposing into it spends the iteration and returns no measurement, and a campaign",
+        "whose proposals are all rejected this way closes having built nothing.",
+        "",
+    ]
+    lines.extend(f"- {family}: {reason}" for family, reason in blocked_families)
+    lines.append("")
+    lines.append(
+        "Choose a different axis. The benchmark briefing lists the organizers' own priority order "
+        "and the feature-authority section describes axes reachable inside your own code; both "
+        "remain open except where named above."
+    )
+    return "\n".join(lines)
 
 
 def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
@@ -331,8 +419,15 @@ def instructions_for(
     *,
     schema_retry: bool = False,
     source_policy: CandidateSourcePolicy = DEFAULT_CANDIDATE_SOURCE_POLICY,
+    blocked_families: Sequence[tuple[str, str]] = (),
 ) -> str:
-    """Return deterministic operation-specific instructions for one provider attempt."""
+    """Return deterministic operation-specific instructions for one provider attempt.
+
+    ``blocked_families`` is the ``(family, reason)`` list from
+    :func:`kuairand_agent.research.proposal_families.blocked_proposal_families`. It is rendered for
+    the operations that choose an axis, so the model is shown the same closures the controller
+    enforces against it.
+    """
 
     if not isinstance(operation, ResearchOperation):
         raise ValueError("operation must be a ResearchOperation")
@@ -340,6 +435,10 @@ def instructions_for(
         raise ValueError("schema_retry must be bool")
     if not isinstance(source_policy, CandidateSourcePolicy):
         raise ValueError("source_policy must be CandidateSourcePolicy")
+    blocked = tuple(blocked_families)
+    for entry in blocked:
+        if len(entry) != 2 or not all(type(item) is str and item for item in entry):
+            raise ValueError("blocked_families entries must be non-empty (family, reason) strings")
     retry = (
         " The previous response was rejected by the local strict parser. Correct only the schema "
         "or request-identity violation and return a fresh complete JSON object."
@@ -352,8 +451,15 @@ def instructions_for(
         in {ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR}
         else ""
     )
+    # PROPOSE chooses the axis and REFLECT recommends the next one, so both need the closures.
+    # IMPLEMENT and REPAIR are already committed to an admitted proposal and cannot act on them.
+    closures = (
+        f"\n\n{_blocked_family_constraints(blocked)}"
+        if blocked and operation in {ResearchOperation.PROPOSE, ResearchOperation.REFLECT}
+        else ""
+    )
     sections = "".join(f"\n\n{section}" for section in _SECTIONS[operation])
-    return f"{_COMMON}{sections}\n\n{_OPERATION[operation]}{policy}{retry}"
+    return f"{_COMMON}{sections}{closures}\n\n{_OPERATION[operation]}{policy}{retry}"
 
 
 __all__ = ["PROMPT_VERSION", "instructions_for"]

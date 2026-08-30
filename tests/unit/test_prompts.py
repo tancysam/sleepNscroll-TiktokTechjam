@@ -163,7 +163,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v3``."""
 
-    assert PROMPT_VERSION == 8
+    assert PROMPT_VERSION == 9
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -175,6 +175,62 @@ def test_instructions_reject_a_non_operation(bad: object) -> None:
 def test_instructions_reject_a_non_boolean_retry_flag() -> None:
     with pytest.raises(ValueError, match="schema_retry must be bool"):
         instructions_for(ResearchOperation.PROPOSE, schema_retry=1)  # type: ignore[arg-type]
+
+
+# A campaign closed with zero candidates built because the controller enforced a family block the
+# proposer was never shown. These pin the guidance that turns that wall into a redirection.
+
+
+@pytest.mark.parametrize("operation", (ResearchOperation.PROPOSE, ResearchOperation.REFLECT))
+def test_axis_choosing_operations_are_shown_the_closed_families(
+    operation: ResearchOperation,
+) -> None:
+    rendered = instructions_for(operation, blocked_families=(("pairwise", "already lost"),))
+    assert "Closed proposal families" in rendered
+    assert "pairwise: already lost" in rendered
+    assert "Choose a different axis." in rendered
+
+
+@pytest.mark.parametrize("operation", (ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR))
+def test_committed_operations_are_not_charged_for_closures(
+    operation: ResearchOperation,
+) -> None:
+    """IMPLEMENT and REPAIR serve an already-admitted proposal and cannot act on a closure."""
+
+    rendered = instructions_for(operation, blocked_families=(("pairwise", "already lost"),))
+    assert "Closed proposal families" not in rendered
+
+
+def test_no_closures_renders_no_section() -> None:
+    assert "Closed proposal families" not in instructions_for(ResearchOperation.PROPOSE)
+
+
+@pytest.mark.parametrize("bad", [(("pairwise",),), (("pairwise", ""),), ((1, "why"),)])
+def test_instructions_reject_malformed_closures(bad: object) -> None:
+    with pytest.raises(ValueError, match="blocked_families entries"):
+        instructions_for(ResearchOperation.PROPOSE, blocked_families=bad)  # type: ignore[arg-type]
+
+
+def test_lightgbm_guidance_states_the_two_facts_that_would_fail_a_candidate() -> None:
+    """`scikit-learn` is absent and a Booster is not a numeric array; both are hard failures."""
+
+    rendered = instructions_for(ResearchOperation.IMPLEMENT)
+    assert "scikit-learn` is NOT installed" in rendered
+    assert "LGBMRanker" in rendered, "the unavailable sklearn entrypoint must be named"
+    assert "lambdarank" in rendered
+    for parameter in ("deterministic", "force_col_wise", "num_threads", "bagging_freq"):
+        assert parameter in rendered, f"{parameter} is required for the replay gate"
+    assert "model_to_string" in rendered, "the Booster must be encoded to satisfy the checkpoint"
+    assert "np.uint8" in rendered
+
+
+def test_feature_authority_states_the_measured_cost_of_an_embedding_table() -> None:
+    """The one candidate that used identities lost monotonically; say why, not just that."""
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert "0.5705" in rendered, "the measured identity-embedding result must be stated"
+    assert "26,211" in rendered and "7,539" in rendered
+    assert "id__tab" in rendered, "the low-cardinality escape hatch must be named"
 
 
 def test_instructions_reject_a_foreign_source_policy() -> None:

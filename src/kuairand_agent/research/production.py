@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import re
 import stat
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -41,6 +40,7 @@ from kuairand_agent.research.materialize import (
     validate_candidate_static,
     validate_model_generated_overlay,
 )
+from kuairand_agent.research.proposal_families import proposal_family_is_blocked
 from kuairand_agent.research.schemas import (
     FailureCategory,
     GeneratedFile,
@@ -270,22 +270,16 @@ def _proposal_family_is_blocked(safe_context: SafeResearchContext, *, proposal_f
       Unlike a cheap pre-admission rejection, that result already cost a real training run, so a
       single occurrence is enough: this is not a heuristic nudge, it is the organizer's own
       comparison already having been run and lost.
+
+    The derivation lives in :mod:`kuairand_agent.research.proposal_families` because the propose
+    instructions render the same list up front. Enforcing a list the proposer was never shown is
+    what closed a campaign with zero candidates built.
     """
 
-    records = safe_context.to_wire().get("campaign_records", [])
-    if not isinstance(records, list):
-        return False
-    for raw_record in records:
-        if not isinstance(raw_record, Mapping):
-            continue
-        values = raw_record.get("values")
-        if not isinstance(values, Mapping) or values.get("proposal_family") != proposal_family:
-            continue
-        if values.get("proposal_family_blocked") is True:
-            return True
-        if values.get("branch_outcome") == "admitted" and values.get("promoted") is False:
-            return True
-    return False
+    return proposal_family_is_blocked(
+        safe_context.to_wire().get("campaign_records", []),
+        proposal_family=proposal_family,
+    )
 
 
 class LiveResearchBranchRejected(ProductionResearchError):
