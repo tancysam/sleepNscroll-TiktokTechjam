@@ -111,13 +111,55 @@ zero. **Do not report either as an improvement.** The controller agrees independ
 `selector.py:456` promotes as `PROMOTE_CONFIRMED` only when the mean paired delta exceeds ε, so
 run 13's candidate was recorded as `promoted_unconfirmed`.
 
-### 3.3 Generated models keep reproducing the FM's exact ordering
+### 3.3 CORRECTED. The "identical ordering" finding was an artifact of our own scorer
 
-Five occurrences across runs 09, 10 and 14: a generated candidate produced **bit-identical GAUC and
-nDCG@5** to the official FM control on fold B. Run 10 `candidate-03` did it with **59,816 distinct
-prediction values across 61,315 rows**, so it is not a degenerate or constant-score artifact — a
-genuinely different model induced the same within-user ordering. With a median slate of four
-impressions and only 63.7% of users GAUC-eligible, there are very few orderings to get right.
+**The previous version of this section was wrong.** It claimed that generated models kept
+independently reproducing the official FM's exact within-user ordering, and called it a robust,
+reportable finding. It is neither robust nor a finding. It is a mechanical consequence of rank
+fusion, and it had been quietly flattering three campaigns.
+
+Every generated prediction is rank-fused with the official FM control over the fixed five-point
+`FUSION_WEIGHT_GRID`, selected on the Fold B screen and frozen for Fold A and every outer seed
+(`full_campaign_runtime.py:912-975`, `generated_scientific_runner.py:1658-1706`). **The metric
+recorded for a candidate is the selected blend's, never the model's own.** When the selector picks
+`(0.0, 1.0)` it discards the model and scores the FM control's own percentile vector, so identical
+metrics are guaranteed by construction.
+
+Verified: `scored_prediction_digest` is the byte-identical value `41629b9c856e1921…` in **four**
+occurrences (run 09 ×1, run 10 ×1, run 14 ×2) and never equals `raw_prediction_logical_digest`.
+The earlier claim of five occurrences could not be reproduced from the scientific records; runs 11
+and 12 hold none, because no candidate executed. The "59,816 distinct prediction values" check was
+run against the raw generated vector, which is not the vector that was scored.
+
+### 3.3b The real finding: no candidate has ever been competitive standalone
+
+Reading the `(1.0, 0.0)` grid point gives each candidate's own score for the first time. Run
+`python3 fusion_audit.py <run-id>` to reproduce this table.
+
+| Run | candidate alone | official FM control alone | gap |
+|---|---:|---:|---:|
+| 09 | 0.5671 / 0.5682 / 0.5684 | 0.5754240304231644 | −0.007 to −0.008 |
+| 10 | 0.5654 | 0.5754240304231644 | −0.010 |
+| 13 | 0.5713 / 0.5708 / 0.5720 | 0.5754240304231644 | −0.003 to −0.005 |
+| 14 | 0.5704 / 0.5688 / 0.5703 | 0.5754240304231644 | −0.005 to −0.007 |
+
+**Every candidate ever executed scored below the control standalone, by 4σ to 12σ** at the measured
+seed σ of 0.0008. That is not noise. The outer numbers of 0.6013 to 0.6017 are blends that are 75%
+to 100% official FM by weight, so the near-ties in §3.2 were never measuring our models.
+
+Root cause, and it is structural rather than a modelling failure:
+`candidate_api/runtime_contract.py` `prediction_request_fields` carries no `user_groups_handle`, so
+until commit `4aa6a25` a candidate held user identity while training and **none at prediction
+time**. It could not evaluate a user embedding when it scored, which rules out the user-by-video
+and user-by-author crosses that are where the baseline FM's ordering power comes from. Fixed by
+adding `user_id_code` to the bundle (38 columns, user vocabulary 26,211, 1.59% of validation rows
+on the unknown slot).
+
+The agent could not see any of this either: the word "fusion" appeared nowhere in `prompts.py`, and
+the primary fed back to reflection was the blend's. Run 14 iteration-03 wrote into its own method
+attribution that recency weighting *"successfully measured 0.5754240304, matching
+official_fm_fold_B"* and excluded the direction — when the truth was that its model had been thrown
+away. Fixed by commit `8124607`.
 
 ### 3.4 The pairwise objective is a poorly aligned surrogate here
 

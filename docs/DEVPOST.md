@@ -42,6 +42,52 @@ rule is what makes the run log trustworthy evidence rather than a transcript of 
 
 ## What we think is interesting about it
 
+**Our agent was being lied to by its own evaluation harness, and we caught it by auditing the
+harness instead of the agent.**
+
+For three campaigns the records showed generated candidates landing at almost exactly the
+baseline's score. Several came back *bit-identical* to it. We wrote that up as a finding about the
+task — with a median slate of four impressions and only 63.7% of users GAUC-eligible, there are
+genuinely few distinct orderings available, so different models plausibly induce the same one. It
+was a tidy, and completely wrong, explanation.
+
+The controller rank-fuses every candidate's predictions with the official FM baseline over a fixed
+five-point weight grid, picks the best blend on an inner screen, and freezes it. The score written
+into the record is the *blend's*. When the selector picks weight `0.0` for the model, it discards
+the model and scores the baseline's own prediction vector — so identical metrics are a certainty,
+not a coincidence. The proof is a digest: `scored_prediction_digest` is the same value
+`41629b9c856e1921…` in every such case, and never equals the raw generated prediction.
+
+Reading the grid point the selector *didn't* choose gave us each candidate's own score for the
+first time. Every generated candidate we had ever run was **4σ to 12σ below the baseline
+standalone**. We had not been narrowly missing an improvement for three campaigns; we had never
+been in contention, and fusion had been substituting the baseline's score for ours the whole time.
+
+Two causes, both structural:
+
+- **No user identity at prediction time.** Candidates received user grouping during training and a
+  bare feature matrix at prediction. They could not evaluate a user-conditioned term when it
+  mattered, which rules out the user×video and user×author crosses that are where a factorization
+  machine's ranking power actually lives. We were asking the agent to beat a model while
+  withholding that model's main mechanism.
+- **The agent was never told fusion existed.** The word appeared nowhere in its briefing, and the
+  primary returned to its reflection step was the blend's. One iteration recorded in its own
+  reasoning that a direction *"successfully measured 0.5754240304, matching official_fm_fold_B"*
+  and dropped it — reading "my model was thrown away" as "my model tied the baseline." It then
+  reasoned correctly from a false premise, which is the failure mode you cannot debug by reading
+  the model's output.
+
+The lesson generalises past this competition. We built elaborate guarantees that the agent could
+not tamper with its evaluator — hash-pinned scorer, no filesystem, no label access — and every one
+of them held. What we did not check was whether the evaluator was telling the agent the truth. A
+feedback channel that silently floors a bad result at the baseline's score is not an integrity
+violation; nothing is compromised, every digest verifies, and the agent's reasoning is impeccable
+on the numbers it is given. It is simply wrong, and it is invisible from inside the loop. **An
+agent's feedback signal deserves the same adversarial scrutiny as its permissions.**
+
+Both are fixed, both are one commit each, and the diagnostic that found it ships in the repo as
+`fusion_audit.py` so any reviewer can rerun it against our recorded campaigns.
+
 **We deliberately did not use an agent framework.** No LangChain, no LiteLLM, no orchestration
 library, not even the `openai` SDK. Provider calls are `urllib.request` from the standard library
 against an OpenAI-compatible Chat Completions endpoint with strict JSON-schema structured
@@ -87,14 +133,32 @@ install cannot silently change the execution profile.
 
 ## Honest status
 
-A scripted full-data campaign completes end to end and emits an organizer-valid submission
-(170,588 rows, checker return code 0, replay verified). It reproduces the official baseline to
-within noise — a +0.000144 validation delta, about one fifth of one seed standard deviation. **We
-do not claim it as an improvement.**
+**Six live-provider autonomous campaigns completed end to end**, every one terminating on
+`converged` under the organizers' own frozen rule (ε = 0.002, patience 3) with **zero manual
+interventions**. Five published organizer-valid submission bundles: 170,588 rows, checker return
+code 0, replay verified, byte-identical SHA-256 `e12746ae…` across all five.
 
-No live-provider autonomous campaign has completed, so we do not claim autonomous research
-results, and hidden-test performance is unknown and unclaimed. Full detail, including what is not
-demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).
+**We do not claim an improvement over the baseline, and the reason is the most useful result we
+have.** One run promoted a generated candidate at 0.6017118 against an incumbent of 0.6014403 —
++0.0002715, or 0.34 of one seed standard deviation. We reran the same method rather than reporting
+it. It landed at 0.6014124, on the other side of zero. That is what a non-significant margin does
+when you replicate it, and it is why the number is not in our headline.
+
+Reported honestly, best first:
+
+| Result | Public validation | vs organizer 0.6016 | Provenance |
+|---|---:|---:|---|
+| Five-seed rank ensemble of the organizer FM | 0.6026034 | +0.0010 | controller-side, **not agent-generated** |
+| Shipped fallback `official-fm-fallback-seed-4` | 0.6020371 | +0.0004 | best-of-five **selected on this split** |
+| Best agent candidate (run 13, fused) | 0.6017118 | +0.0001 | within noise, 75% organizer FM by weight |
+
+Every caveat in that table is one we went looking for. The ensemble is real and reproducible but
+it is an engineering property of *their* baseline, not our agent doing research, and it is below
+our own materiality threshold. The shipped fallback's margin is a selection effect. And the agent's
+own number is a blend.
+
+Hidden-test performance is organizer-computed and is neither known nor claimed. Full detail,
+including a section on what is *not* demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).
 
 We would rather report a small honest number than a large unverifiable one.
 
