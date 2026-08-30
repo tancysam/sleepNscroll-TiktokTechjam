@@ -255,6 +255,23 @@ def _proposal_signature(proposal: Proposal) -> str:
 
 
 def _proposal_family_is_blocked(safe_context: SafeResearchContext, *, proposal_family: str) -> bool:
+    """Deterministically refuse a family the evidence already rules out.
+
+    Two independent triggers, both scanning the same ``campaign_records`` the model itself was
+    shown -- this never depends on the model choosing to heed that context:
+
+    * ``proposal_family_blocked`` -- set locally when this campaign's own static/materiality
+      checks rejected the same family twice in a row (see ``_run_autonomous_followups``).
+    * ``branch_outcome == "admitted"`` with ``promoted`` explicitly ``False`` -- the family
+      previously reached a full inner-fold evaluation, in this campaign or (via
+      ``prior_campaign_lesson_*`` records sourced from the cross-run
+      :class:`~kuairand_agent.campaign.store.ResearchLineageLedger`) an earlier one against the
+      exact same benchmark/starter/trusted-source identity, and still lost to the incumbent.
+      Unlike a cheap pre-admission rejection, that result already cost a real training run, so a
+      single occurrence is enough: this is not a heuristic nudge, it is the organizer's own
+      comparison already having been run and lost.
+    """
+
     records = safe_context.to_wire().get("campaign_records", [])
     if not isinstance(records, list):
         return False
@@ -262,11 +279,11 @@ def _proposal_family_is_blocked(safe_context: SafeResearchContext, *, proposal_f
         if not isinstance(raw_record, Mapping):
             continue
         values = raw_record.get("values")
-        if (
-            isinstance(values, Mapping)
-            and values.get("proposal_family_blocked") is True
-            and values.get("proposal_family") == proposal_family
-        ):
+        if not isinstance(values, Mapping) or values.get("proposal_family") != proposal_family:
+            continue
+        if values.get("proposal_family_blocked") is True:
+            return True
+        if values.get("branch_outcome") == "admitted" and values.get("promoted") is False:
             return True
     return False
 

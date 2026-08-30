@@ -448,6 +448,104 @@ def test_live_lineage_blocks_excluded_proposal_family_before_implementation(
     assert captured.value.root_failure.fingerprint == captured.value.terminal_failure.fingerprint
 
 
+def test_live_lineage_blocks_a_family_already_admitted_and_not_promoted(
+    tmp_path: Path,
+) -> None:
+    """A family that already reached a full inner-fold evaluation and lost is hard-blocked.
+
+    This is the cross-run circuit breaker: the record here has exactly the shape a
+    ``prior_campaign_lesson_*`` advisory record takes when sourced from the
+    ``ResearchLineageLedger`` (see ``full_campaign_runtime._run_autonomous_followups``'s
+    ``prior_lineage_advisory_records``), so this exercises the same code path a real second
+    campaign would hit -- one strike from a real training run is enough, unlike the two-strike
+    threshold for cheap pre-admission rejections.
+    """
+
+    model = _LiveFixtureModel()
+    parent = load_parent_snapshot(
+        ROOT / "candidate_seed", candidate_id="official-fm-fallback-seed-4"
+    )
+    safe_context = build_safe_research_context(
+        starter_manifest_sha256="a" * 64,
+        dataset_manifest_sha256="b" * 64,
+        capability_manifests=(),
+        budgets=ResearchBudgetContext(44, 18_000, 1, 0),
+        campaign_records=(
+            AggregateRecord(
+                "prior_campaign_lesson_0001",
+                {
+                    "campaign_id": "earlier-campaign",
+                    "branch_outcome": "admitted",
+                    "proposal_family": "binary-long-view-ranking",
+                    "inner_fold_a_primary": 0.6074,
+                    "parent_fold_a_primary": 0.6074,
+                    "promoted": False,
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(LiveResearchBranchRejected) as captured:
+        prepare_or_rehydrate_live_lineage(
+            campaign_id="live-cross-run-family-block-campaign",
+            scientific_iteration=1,
+            parent=parent,
+            generated_root=tmp_path / "generated",
+            artifact_store=ArtifactStore(tmp_path / "artifacts"),
+            safe_context=safe_context,
+            model=model,
+        )
+
+    assert model.calls == ["propose"]
+    assert captured.value.proposal_family == "binary-long-view-ranking"
+    assert captured.value.root_failure.code == "proposal_family_blocked"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        # Promoted: the family won last time, so it must remain eligible.
+        {
+            "branch_outcome": "admitted",
+            "proposal_family": "binary-long-view-ranking",
+            "promoted": True,
+        },
+        # Screen-rejected-only (Fold B evidence, no Fold A run): `promoted` is absent, not False,
+        # for exactly this reason -- a single cheap-fold miss should not permanently exile a
+        # family the way a full, expensive evaluation loss does.
+        {"branch_outcome": "admitted", "proposal_family": "binary-long-view-ranking"},
+        # A pre-admission rejection of a *different* family must not leak into this one.
+        {"branch_outcome": "admitted", "proposal_family": "some-other-family", "promoted": False},
+    ],
+)
+def test_live_lineage_does_not_block_a_family_without_a_losing_full_evaluation(
+    tmp_path: Path, values: dict[str, str | bool]
+) -> None:
+    model = _LiveFixtureModel()
+    parent = load_parent_snapshot(
+        ROOT / "candidate_seed", candidate_id="official-fm-fallback-seed-4"
+    )
+    safe_context = build_safe_research_context(
+        starter_manifest_sha256="a" * 64,
+        dataset_manifest_sha256="b" * 64,
+        capability_manifests=(),
+        budgets=ResearchBudgetContext(44, 18_000, 1, 0),
+        campaign_records=(AggregateRecord("prior_campaign_lesson_0001", values),),
+    )
+
+    lineage = prepare_or_rehydrate_live_lineage(
+        campaign_id="live-cross-run-family-not-blocked-campaign",
+        scientific_iteration=1,
+        parent=parent,
+        generated_root=tmp_path / "generated",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        safe_context=safe_context,
+        model=model,
+    )
+
+    assert lineage.candidate_id is not None
+
+
 def test_live_lineage_routes_reserved_filename_through_agent_repair_and_rehydrates(
     tmp_path: Path,
 ) -> None:
