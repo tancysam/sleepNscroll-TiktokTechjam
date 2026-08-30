@@ -225,6 +225,47 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | 5-campaign auto-retry batch | **0** | `scripts/auto_retry_campaigns.sh` launched five consecutive independent campaigns unattended. The script only launches and stops; it cannot alter a campaign's search, and the frozen organizer ε/N are enforced at config-parse time and are not reachable from it. |
 | 3 crashed live campaigns | n/a | Both were abandoned rather than hand-repaired mid-run. The defects were fixed in source and a fresh campaign launched, so no intervention altered a running campaign. |
 
+## 4.1 Correction: the outer-validation ration is per campaign
+
+**Disclosed because it changes a number we previously reported, and because it loosens a limit we
+had been enforcing on ourselves.**
+
+`OuterQueryLedger.reserve` counted every reservation ever made, across all campaigns, against a
+single allowance of six. Fourteen live campaigns therefore shared one allocation, and it reached
+zero on 2026-08-30 at 11:59:17 (`runs/ctx-1-115456Z`). At that point no candidate could ever be
+outer-confirmed again: every future campaign would terminate at `baseline_reproduced` regardless of
+quality.
+
+That is not what this project's own design specifies. [`plan.md`](../plan.md) 12.2 states: *"At most
+six distinct scientific candidates **per campaign** receive a public-validation score,"* and the
+very next line explains that the log is project-wide for a different reason — *"so restarting or
+changing a campaign fingerprint does not erase the development history."* The ration is
+per-campaign; the log is project-wide. The implementation collapsed the two.
+
+Nor is the limit an organizer rule. The problem statement rations exactly one thing — *"hidden test
+scored once, on the final submission"* — and explicitly names public-validation feedback as the
+intended development signal.
+
+**We are not presenting this as an accidental drift.** A test
+(`test_project_six_slot_limit_survives_distinct_campaign_databases`) had deliberately locked in the
+lifetime behaviour, so this reverses a considered earlier decision, made when the stricter reading
+seemed the safer default.
+
+What changed, precisely: the reservation count is now scoped by `campaign_id`. What did **not**
+change:
+
+- The append-only project log still records **every** query ever made, across all campaigns. No
+  history is erased and none of the six already-spent slots is reclaimed or reused.
+- Reopening the *same* campaign against a fresh local database still cannot reissue its ration —
+  the project ledger remembers what that `campaign_id` already spent. This anti-gaming property is
+  covered by `test_six_slot_limit_is_per_campaign_and_not_reset_by_a_fresh_database`.
+- The per-campaign cap of six, the eligibility gates, and the matched-seed confirmation rule are
+  untouched.
+
+The scientific discipline this budget exists to protect — not tuning on public validation, and
+rationing how many times we look — is preserved at the campaign level, which is where our design
+placed it.
+
 ## 5. Evaluation integrity
 
 Current work on ML-engineering agents identifies two ways an agent can compromise its own
@@ -271,10 +312,8 @@ Stated plainly, because the gap matters more than the architecture:
    tested, but it reads a ledger scoped by trusted-source digest, and every code change resets
    that scope — including the change that added the breaker. It needs two consecutive campaigns on
    an unchanged tree, which we have not yet run.
-4. **The outer-validation budget is nearly exhausted.** One of six project-wide slots remains. The
-   ledger is scoped by benchmark, dataset, and scorer digest only, so it does not reset between
-   campaigns or on code changes. At most one further candidate can ever be outer-confirmed against
-   this dataset.
+4. **The outer-validation ration was corrected from project-lifetime to per-campaign** — see
+   §4.1. Fourteen campaigns shared a single allocation of six, and it reached zero.
 5. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
 
 ## 7. Artifact index

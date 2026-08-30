@@ -144,26 +144,41 @@ def test_project_ledger_is_global_and_query_lifecycle_is_replayable(tmp_path: Pa
                 candidate_fingerprint="5" * 64,
             )
 
-        with pytest.raises(OuterQueryLimitError, match="project-wide"):
+        # The ration is per campaign, so campaign-2 still holds its own second slot even though
+        # campaign-1 has already spent one.
+        third_reservation = second.reserve_public_query(
+            ledger,
+            query_id="outer-003",
+            candidate_fingerprint="5" * 64,
+            scorer_digest=_SCORER,
+            expected_revision=1,
+        )
+        assert third_reservation.state == "RESERVED"
+        assert second.snapshot().outer_queries_used == 2
+
+        # Its third is refused: exhaustion is enforced, just scoped to the campaign.
+        with pytest.raises(OuterQueryLimitError, match="campaign public-validation limit"):
             second.reserve_public_query(
                 ledger,
-                query_id="outer-003",
-                candidate_fingerprint="5" * 64,
-                scorer_digest="6" * 64,
-                expected_revision=1,
+                query_id="outer-004",
+                candidate_fingerprint="6" * 64,
+                scorer_digest=_SCORER,
+                expected_revision=2,
             )
-        assert second.snapshot().outer_queries_used == 1
-        assert second.snapshot().revision == 1
+        assert second.snapshot().outer_queries_used == 2
+        assert second.snapshot().revision == 2
 
+        # The log itself stays project-wide: every query ever made is retained for disclosure,
+        # which is exactly what plan.md 12.2 asks the append-only project log to preserve.
         ledger_snapshot = ledger.snapshot(
             benchmark_digest="7" * 64,
             dataset_digest="8" * 64,
             scorer_digest="9" * 64,
         )
         assert ledger_snapshot.max_queries == 2
-        assert ledger_snapshot.queries_used == 2
-        assert ledger_snapshot.queries_remaining == 0
-        assert ledger_snapshot.revision == 3
+        assert ledger_snapshot.queries_used == 3
+        # Four appended events: outer-001 reserve and complete, then outer-002 and outer-003.
+        assert ledger_snapshot.revision == 4
 
         with sqlite3.connect(first_path) as raw:
             metric = raw.execute(
@@ -181,7 +196,7 @@ def test_project_ledger_is_global_and_query_lifecycle_is_replayable(tmp_path: Pa
                 dataset_digest=_DATASET,
                 scorer_digest=_SCORER,
             ).queries_used
-            == 2
+            == 3
         )
         with pytest.raises(StoreInvariantError, match="read-only"):
             reopened.reserve(
@@ -211,9 +226,12 @@ def test_project_reservation_crash_window_is_conservatively_charged(tmp_path: Pa
         OuterQueryLedger.create(ledger_path, max_queries=1) as ledger,
         _create_campaign(campaign_path, "campaign-local") as campaign,
     ):
+        # The orphan belongs to this same campaign: the ration is per campaign, so a crash between
+        # the project reservation and the local commit must still be charged to the campaign that
+        # made it, rather than being silently reissued.
         orphaned = ledger.reserve(
             query_id="orphaned-before-local-commit",
-            campaign_id="crashed-campaign",
+            campaign_id="campaign-local",
             benchmark_digest=_BENCHMARK,
             dataset_digest=_DATASET,
             scorer_digest=_SCORER,
@@ -222,7 +240,7 @@ def test_project_reservation_crash_window_is_conservatively_charged(tmp_path: Pa
         )
         assert orphaned.state == "RESERVED"
 
-        with pytest.raises(OuterQueryLimitError, match="project-wide"):
+        with pytest.raises(OuterQueryLimitError, match="campaign public-validation limit"):
             campaign.reserve_public_query(
                 ledger,
                 query_id="must-not-score",

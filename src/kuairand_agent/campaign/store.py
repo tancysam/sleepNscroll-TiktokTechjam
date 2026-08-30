@@ -3858,13 +3858,23 @@ class OuterQueryLedger:
                 if latest is None:
                     raise StoreInvariantError("outer-query reservation lost its latest event")
                 return self._record_from_row(latest)
+            # The cap is per campaign, matching plan.md 12.2: "At most six distinct scientific
+            # candidates per campaign receive a public-validation score." The very next line of
+            # that section explains why the *log* is nonetheless project-wide -- "so restarting or
+            # changing a campaign fingerprint does not erase the development history" -- so the
+            # ledger records every query ever made while rationing each campaign separately.
+            # Counting every campaign's reservations here instead turned the documented
+            # per-campaign ration into a permanent project lifetime budget, which is not what the
+            # plan specifies and is far stricter than the organizer contract, which rations only
+            # the single hidden-test scoring run.
             used = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM outer_queries WHERE event_seq = 1"
+                    "SELECT COUNT(*) FROM outer_queries WHERE event_seq = 1 AND campaign_id = ?",
+                    (campaign,),
                 ).fetchone()[0]
             )
             if used >= self.max_queries:
-                raise OuterQueryLimitError("project-wide public-validation limit is exhausted")
+                raise OuterQueryLimitError("campaign public-validation limit is exhausted")
             connection.execute(
                 """INSERT INTO outer_queries(
                     query_id, event_seq, campaign_id, benchmark_digest, dataset_digest,

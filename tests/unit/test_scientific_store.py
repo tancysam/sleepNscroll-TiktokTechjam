@@ -466,36 +466,63 @@ def test_completion_fault_reuses_persisted_seed_metrics_without_double_score(
         assert ledger.projection().revision == 2
 
 
-def test_project_six_slot_limit_survives_distinct_campaign_databases(tmp_path: Path) -> None:
+def test_six_slot_limit_is_per_campaign_and_not_reset_by_a_fresh_database(
+    tmp_path: Path,
+) -> None:
+    """The ration is per campaign; a fresh database does not reset one campaign's own count.
+
+    plan.md 12.2 specifies "at most six distinct scientific candidates *per campaign*", and keeps
+    the log project-wide only "so restarting or changing a campaign fingerprint does not erase the
+    development history". The anti-gaming property that matters is therefore narrower than a
+    lifetime cap: reopening the *same* campaign against a new local database must not hand it a
+    fresh ration, because the project ledger still remembers what that campaign_id already spent.
+    """
+
     ledger_path = tmp_path / "outer.sqlite"
     ledger = OuterQueryLedger.create(ledger_path, max_queries=6)
     stores: list[CampaignStore] = []
     try:
-        for index in range(6):
-            store = _create_store(tmp_path / f"campaign-{index}.sqlite", f"campaign-{index}")
-            stores.append(store)
-            request = _request(index)
-            adapter = DurableScientificLedgerAdapter(
-                store,
-                ledger,
-                scorer_digest=_SCORER,
-                evidence_registry={},
-            )
-            assert adapter.reserve(request).ledger_revision == index + 1
-        seventh = _create_store(tmp_path / "campaign-6.sqlite", "campaign-6")
-        stores.append(seventh)
+        first = _create_store(tmp_path / "campaign-a.sqlite", "campaign-a")
+        stores.append(first)
         adapter = DurableScientificLedgerAdapter(
-            seventh,
-            ledger,
-            scorer_digest=_SCORER,
-            evidence_registry={},
+            first, ledger, scorer_digest=_SCORER, evidence_registry={}
         )
+        for index in range(6):
+            assert adapter.reserve(_request(index)).ledger_revision == index + 1
         with pytest.raises(ScientificStoreError, match="failed closed"):
             adapter.reserve(_request(6))
+
+        # A genuinely different campaign receives its own documented ration.
+        second = _create_store(tmp_path / "campaign-b.sqlite", "campaign-b")
+        stores.append(second)
+        other = DurableScientificLedgerAdapter(
+            second, ledger, scorer_digest=_SCORER, evidence_registry={}
+        )
+        assert other.reserve(_request(6)).ledger_revision == 7
+
+        # The same campaign on a brand-new database is still exhausted: swapping the local store
+        # cannot reissue a ration the project ledger has already charged to that campaign_id.
+        rehomed = _create_store(tmp_path / "campaign-a-again.sqlite", "campaign-a")
+        stores.append(rehomed)
+        rehomed_adapter = DurableScientificLedgerAdapter(
+            rehomed, ledger, scorer_digest=_SCORER, evidence_registry={}
+        )
+        with pytest.raises(ScientificStoreError, match="failed closed"):
+            rehomed_adapter.reserve(
+                _request(
+                    0,
+                    overrides={
+                        "candidate_id": "candidate-rehomed",
+                        "candidate_fingerprint": "ab" * 32,
+                    },
+                )
+            )
+        assert rehomed.snapshot().outer_queries_used == 0
+
+        # Every query ever made is retained project-wide for disclosure.
         projection = ledger.projection()
-        assert projection.revision == 6
-        assert len(projection.candidate_fingerprints) == 6
-        assert seventh.snapshot().outer_queries_used == 0
+        assert projection.revision == 7
+        assert len(projection.candidate_fingerprints) == 7
     finally:
         for store in stores:
             store.close()
