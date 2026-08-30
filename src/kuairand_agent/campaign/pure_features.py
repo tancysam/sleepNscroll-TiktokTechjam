@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, pairwise
 from pathlib import Path
@@ -275,6 +275,7 @@ def build_pure_feature_pair(
     split_role: str,
     builder_source_digest: str,
     cache_dir: Path | str | None = None,
+    prefix_auxiliary: Mapping[str, Sequence[int]] | None = None,
 ) -> PureFeaturePair:
     """Build the fixed feature table with strict-past prefix and frozen-query semantics."""
 
@@ -295,7 +296,7 @@ def build_pure_feature_pair(
         raise PureFeatureError("builder_source_digest must be a lowercase SHA-256")
     causal = build_causal_feature_pair(
         prefix_inputs=_causal_inputs(prefix_inputs),
-        prefix_outcomes=OutcomeEvents(long_view=labels),
+        prefix_outcomes=OutcomeEvents(long_view=labels, auxiliary=prefix_auxiliary),
         specs=PURE_AGGREGATE_SPECS,
         identity=BuildIdentity(
             dataset=dataset_digest,

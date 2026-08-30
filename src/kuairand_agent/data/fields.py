@@ -256,6 +256,10 @@ _NUMBER_LOG_FIELDS: Final = frozenset(
 # would need mean semantics rather than the exposure/positive counting shape.
 _HISTORY_GRANTED_AUXILIARY_FIELDS: Final = frozenset({"is_click", "is_like"})
 
+# Deterministic order, exported so the feature builder and the data plane cannot drift from the
+# reviewed field policy: the grant is declared once, here, and read everywhere else.
+HISTORY_GRANTED_AUXILIARY_OUTCOMES: Final = tuple(sorted(_HISTORY_GRANTED_AUXILIARY_FIELDS))
+
 _AUXILIARY_FIELDS: Final = frozenset(
     {
         "is_click",

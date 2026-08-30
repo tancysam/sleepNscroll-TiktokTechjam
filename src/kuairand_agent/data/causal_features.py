@@ -908,7 +908,7 @@ class CausalFeatureCache:
                     else np.array(archive["query_values"], copy=True)
                 )
 
-            names = _feature_names(request.specs)
+            names = _feature_names(request.specs, request.prefix_outcomes.auxiliary_names)
             prefix = FeatureMatrix(prefix_values, names)
             query = None if query_values is None else FeatureMatrix(query_values, names)
             pair = CausalFeaturePair(

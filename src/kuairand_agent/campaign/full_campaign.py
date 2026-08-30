@@ -64,6 +64,7 @@ from kuairand_agent.data.capabilities import (
 )
 from kuairand_agent.data.causal_features import FeatureMatrix
 from kuairand_agent.data.fields import (
+    HISTORY_GRANTED_AUXILIARY_OUTCOMES,
     STANDARD_LATE_MEMBER,
     VIDEO_BASIC_MEMBER,
     FieldKey,
@@ -1619,12 +1620,26 @@ class FoldDataPlane:
     prefix_labels: tuple[int, ...] = field(repr=False)
     query_inputs: CanonicalInputs
     query_labels: tuple[int, ...] = field(repr=False)
+    prefix_auxiliary: Mapping[str, tuple[int, ...]] = field(
+        repr=False, default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.fold, TemporalFold):
             raise FullCampaignError("fold data plane requires a TemporalFold")
         if len(self.prefix_inputs) != len(self.prefix_labels):
             raise FullCampaignError("fold prefix inputs and targets differ in row count")
+        for name, values in self.prefix_auxiliary.items():
+            # Misaligned auxiliary history would silently corrupt every derived feature, so the
+            # row count is checked against the primary label column it must travel with.
+            if len(values) != len(self.prefix_labels):
+                raise FullCampaignError(
+                    f"fold auxiliary outcome {name} differs from prefix targets in row count"
+                )
+            if any(type(value) is not int or value not in (0, 1) for value in values):
+                raise FullCampaignError(
+                    f"fold auxiliary outcome {name} must remain binary integers"
+                )
         if len(self.query_inputs) != len(self.query_labels):
             raise FullCampaignError("fold query inputs and targets differ in row count")
         if any(type(value) is not int or value not in (0, 1) for value in self.prefix_labels):
@@ -1649,6 +1664,9 @@ class CampaignDataPlane:
     outer_train_labels: tuple[int, ...] = field(repr=False)
     outer_validation_inputs: CanonicalInputs
     final_inputs: CanonicalInputs
+    outer_train_auxiliary: Mapping[str, tuple[int, ...]] = field(
+        repr=False, default_factory=lambda: MappingProxyType({})
+    )
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1661,6 +1679,15 @@ class CampaignDataPlane:
             raise FullCampaignError("outer train inputs and targets differ in row count")
         if any(type(value) is not int or value not in (0, 1) for value in self.outer_train_labels):
             raise FullCampaignError("outer train targets must remain binary integers")
+        for name, values in self.outer_train_auxiliary.items():
+            if len(values) != len(self.outer_train_labels):
+                raise FullCampaignError(
+                    f"outer train auxiliary outcome {name} differs from targets in row count"
+                )
+            if any(type(value) is not int or value not in (0, 1) for value in values):
+                raise FullCampaignError(
+                    f"outer train auxiliary outcome {name} must remain binary integers"
+                )
         manifest = self.manifest()
         object.__setattr__(self, "digest", _manifest_digest(b"data-plane\0", manifest))
 
@@ -1699,13 +1726,22 @@ def _fold_data(
     train_inputs: CanonicalInputs,
     labels: tuple[int, ...],
     fold: TemporalFold,
+    auxiliary: Mapping[str, tuple[int, ...]] = MappingProxyType({}),
 ) -> FoldDataPlane:
+    # Every auxiliary stream is subset by the *same* train positions as the primary label, in one
+    # place, so the streams cannot drift out of alignment with each other or with the inputs.
     return FoldDataPlane(
         fold=fold,
         prefix_inputs=subset_canonical_inputs(train_inputs, fold.train_positions),
         prefix_labels=subset_values(labels, fold.train_positions),
         query_inputs=subset_canonical_inputs(train_inputs, fold.valid_positions),
         query_labels=subset_values(labels, fold.valid_positions),
+        prefix_auxiliary=MappingProxyType(
+            {
+                name: subset_values(values, fold.train_positions)
+                for name, values in auxiliary.items()
+            }
+        ),
     )
 
 
@@ -1740,14 +1776,24 @@ def prepare_campaign_data_plane(
     if not isinstance(valid.targets, ProtectedTargets):
         raise FullCampaignError("public validation lacks protected scorer targets")
     labels = train.targets.long_view
+    # Auxiliary outcome history, read from the trusted training targets under the grant declared
+    # in the reviewed field policy. These are aggregated over strictly-past rows only; they are
+    # never candidate inputs, which the field policy enforces independently.
+    auxiliary = MappingProxyType(
+        {
+            name: cast(tuple[int, ...], train.targets.column(name))
+            for name in HISTORY_GRANTED_AUXILIARY_OUTCOMES
+        }
+    )
     folds = build_temporal_folds(train)
     return CampaignDataPlane(
         dataset_digest=dataset.digest,
         folds=folds,
-        fold_a=_fold_data(train.inputs, labels, folds.fold_a),
-        fold_b=_fold_data(train.inputs, labels, folds.fold_b),
+        fold_a=_fold_data(train.inputs, labels, folds.fold_a, auxiliary),
+        fold_b=_fold_data(train.inputs, labels, folds.fold_b, auxiliary),
         outer_train_inputs=train.inputs,
         outer_train_labels=labels,
+        outer_train_auxiliary=auxiliary,
         outer_validation_inputs=valid.inputs,
         final_inputs=final.inputs,
     )
@@ -1810,6 +1856,7 @@ def build_production_feature_bundle(
     fold_a = build_pure_feature_pair(
         prefix_inputs=data.fold_a.prefix_inputs,
         prefix_labels=data.fold_a.prefix_labels,
+        prefix_auxiliary=data.fold_a.prefix_auxiliary,
         query_inputs=data.fold_a.query_inputs,
         dataset_digest=data.dataset_digest,
         split_role="inner_fold_A",
@@ -1819,6 +1866,7 @@ def build_production_feature_bundle(
     fold_b = build_pure_feature_pair(
         prefix_inputs=data.fold_b.prefix_inputs,
         prefix_labels=data.fold_b.prefix_labels,
+        prefix_auxiliary=data.fold_b.prefix_auxiliary,
         query_inputs=data.fold_b.query_inputs,
         dataset_digest=data.dataset_digest,
         split_role="inner_fold_B",
@@ -1829,6 +1877,7 @@ def build_production_feature_bundle(
     outer_and_final = build_pure_feature_pair(
         prefix_inputs=data.outer_train_inputs,
         prefix_labels=data.outer_train_labels,
+        prefix_auxiliary=data.outer_train_auxiliary,
         query_inputs=combined_query,
         dataset_digest=data.dataset_digest,
         split_role="outer_validation_and_final",
