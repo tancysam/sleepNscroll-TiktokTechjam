@@ -397,7 +397,8 @@ GPU-hours consumed: **0.00**. Every configuration is CPU-only.
 ## Limitations, and what we would do with more time
 
 **What is not demonstrated.** No generated candidate has produced a validation-primary improvement
-above ε = 0.002. Eight completed live campaigns all terminated at `baseline_reproduced`; the one
+above ε = 0.002 — though a defect that blocked promotion outright (RESULTS.md §3.5, defect 5) means
+that evidence was gathered through a closing gate and is not yet a clean measurement. Eight completed live campaigns all terminated at `baseline_reproduced`; the one
 promotion we observed was +0.00052 on Fold A, an order of magnitude too small to matter.
 Hidden-test performance is unknown and unclaimed. The search also did not meaningfully diversify —
 17 of 24 admissions across 8 campaigns were the same pairwise family, and deterministically

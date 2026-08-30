@@ -148,7 +148,7 @@ rather than to the science.
 
 ### 3.5 Defects found by running live, and fixed
 
-Robustness is judged on how the agent handles difficulty, not on whether it meets any. All four
+Robustness is judged on how the agent handles difficulty, not on whether it meets any. All five
 of these were found by real live runs, root-caused from the actual failure, and fixed with a
 regression test that was confirmed to fail without the fix.
 
@@ -157,6 +157,16 @@ regression test that was confirmed to fail without the fix.
 | 1 | Lineage CHECK-constraint violation | `sqlite3.IntegrityError` killed the campaign on iteration 2 | `promoted` was written as a real boolean even for screen-rejected candidates that had no Fold A metrics, violating the ledger's all-or-nothing invariant | `promoted` made genuinely optional; only computed when both folds are present |
 | 2 | Screen-rejected evidence discarded | Ledger silently dropped the most common outcome | The schema required both folds present to record anything | Fold A and Fold B groups made independently all-or-nothing |
 | 3 | Finalization rejected multi-candidate campaigns | Campaign promoted a candidate, then died with `scientific record source, config, or environment identity changed`, emitting no bundle | The exporter required *every* scientific record to carry the *selected* candidate's source/config/snapshot triple, but those are per-candidate identities — the crashed run held three distinct triples across seven records | Only `environment_digest` is campaign-wide and checked globally; the triple is pinned to records belonging to the selection, plus any record claiming its snapshot so a forged mix is still rejected |
+| 4 | Repeated circuit-breaker refusals collapsed into one line | Campaign died emitting its report with `failures_and_recoveries entries must be unique`, losing the run | The proposal-family circuit breaker refuses the same family with the same stage, category, code and diagnostic every time, so blocked proposals differed only by iteration and candidate — both validated, then discarded by the rendered line | Render the iteration and candidate that were already being validated |
+| 5 | Promotion permanently blocked by other campaigns' history | The best candidate the project has produced -- +0.000578 Fold A, +0.000161 Fold B, positive on both -- was discarded as `inner_rejected / outer_candidate_limit` while its own campaign had spent zero of its six outer queries | `DurableScientificLedgerAdapter.snapshot` passed *every* campaign's candidate fingerprints to the selector, which compares that set against `outer_promotion_limit`. Six historical queries therefore exhausted the allowance of every future campaign | Scope the fingerprint set to the campaign, matching the ration the ledger enforces on reservation. The project log is untouched |
+
+Defect 5 requires a correction to how the rest of this document should be read. The project-wide
+count reached 6 at 11:59:17 on 2026-08-30, and from that moment **no candidate could be promoted
+by any campaign, regardless of its score**; before then each campaign inherited the accumulated
+count and so ran with a progressively smaller allowance. Statements elsewhere here that no
+generated candidate beat the baseline are therefore measurements taken through a closing gate, not
+clean evidence about the science. The one promotion we did observe (SS3.4) occurred while only four
+fingerprints existed. We have not yet run a campaign end to end with this defect fixed.
 
 Defect 3 is the most consequential: it fired *precisely when the campaign succeeded*, and
 `proposal_breadth = 2` made multi-candidate campaigns the normal case. The fix is verified end to
@@ -298,10 +308,14 @@ the mechanisms are testable rather than promised.
 
 Stated plainly, because the gap matters more than the architecture:
 
-1. **No improvement over the baseline has been demonstrated.** No generated candidate has produced
-   a validation-primary delta above ε = 0.002. The single promotion we observed (§3.4) was
-   +0.00052 on Fold A — real, reproducible, and an order of magnitude too small to matter. Eight
-   completed campaigns all terminated at `baseline_reproduced`.
+1. **No improvement over the baseline has been demonstrated, and the evidence for that is itself
+   compromised.** No generated candidate has produced a validation-primary delta above ε = 0.002,
+   and every completed campaign terminated at `baseline_reproduced`. But defect 5 (§3.5) means
+   promotion was progressively blocked through the day and fully closed from 11:59:17, so those
+   results were measured through a closing gate. The best inner-fold result we have, +0.000578 on
+   Fold A with +0.000161 on Fold B, was discarded by that defect rather than by the science. It is
+   still far below ε, so we claim no improvement — but we cannot yet claim a clean measurement
+   either, because no campaign has run end to end with the defect fixed.
 2. **The search has not meaningfully diversified, and enforcing diversity did not fix it.** Across
    the 8 advisory-memory campaigns, 17 of 24 admissions were the same `pairwise` family. A
    deterministic cross-run block then refused that family 14 times in a single campaign; the model
