@@ -934,9 +934,18 @@ def _manifest_metrics(value: object, location: str) -> dict[str, float]:
     return result
 
 
-def _require_close(left: float, right: float, location: str) -> None:
-    if not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-15):
+def _require_close(left: float, right: float, location: str, *, abs_tol: float = 1e-15) -> None:
+    if not math.isclose(left, right, rel_tol=0.0, abs_tol=abs_tol):
         raise ProductionFinalizationError(f"{location} differs from reconstructed evidence")
+
+
+# Two independently *recorded* copies of one measurement, rather than a value recomputed from the
+# other's own inputs. Organizer metrics originate as float32, so a copy that has crossed that
+# boundary in one path and not the other differs at about 1e-8 while denoting the same number.
+# `_manifest_metrics` already accepts 2e-7 for exactly this reason when it checks that primary is
+# the mean of its own components, and this matches it. Every other comparison in this module
+# reconstructs its right-hand side by identical float64 arithmetic and stays exact at 1e-15.
+_RECORDED_METRIC_TOLERANCE: Final = 2e-7
 
 
 def _derive_bundle_status(manifest: Mapping[str, object]) -> FinalStatus:
@@ -1092,7 +1101,12 @@ def _derive_bundle_status(manifest: Mapping[str, object]) -> FinalStatus:
     if representative is None or representative_fm is None or representative_record is None:
         raise ProductionFinalizationError("bundle representative matched seed is absent")
     for name in ("GAUC", "nDCG@5", "primary"):
-        _require_close(metrics[name], representative[name], f"representative {name}")
+        _require_close(
+            metrics[name],
+            representative[name],
+            f"representative {name}",
+            abs_tol=_RECORDED_METRIC_TOLERANCE,
+        )
     candidate_mean = _manifest_metrics(summary.get("candidate_mean"), "candidate seed mean")
     fm_mean = _manifest_metrics(summary.get("official_fm_mean"), "FM seed mean")
     reconstructed_candidate_mean = _mean_metric_rows(candidate_rows)
@@ -3071,6 +3085,7 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
     operation_summary = "+".join(operations) if operations else "none"
     usage = science.get("provider_usage")
     if live_provider_used or isinstance(usage, Mapping):
+
         def valid_context_limits(value: object) -> bool:
             if value is None:
                 return True
@@ -3114,14 +3129,19 @@ def _judge_progress_facts(outcome: FullCampaignOutcome) -> _JudgeProgressFacts:
         retry_usage_fields = {"retry_wait_seconds"}
         usage_fields = frozenset(usage) if isinstance(usage, Mapping) else frozenset()
         usage_fields_without_limits = usage_fields - {"context_limits"}
-        if not isinstance(usage, Mapping) or usage_fields_without_limits not in {
-            frozenset(legacy_usage_fields),
-            frozenset(legacy_usage_fields | retry_usage_fields),
-            frozenset(legacy_usage_fields | chain_usage_fields),
-            frozenset(legacy_usage_fields | chain_usage_fields | retry_usage_fields),
-        } or (
-            "context_limits" in usage_fields
-            and not valid_context_limits(usage["context_limits"])
+        if (
+            not isinstance(usage, Mapping)
+            or usage_fields_without_limits
+            not in {
+                frozenset(legacy_usage_fields),
+                frozenset(legacy_usage_fields | retry_usage_fields),
+                frozenset(legacy_usage_fields | chain_usage_fields),
+                frozenset(legacy_usage_fields | chain_usage_fields | retry_usage_fields),
+            }
+            or (
+                "context_limits" in usage_fields
+                and not valid_context_limits(usage["context_limits"])
+            )
         ):
             raise ProductionFinalizationError("live provider usage evidence is malformed")
         integer_fields = legacy_usage_fields - {
@@ -4620,8 +4640,7 @@ def _outcome_from_bundle(
     if request.campaign_id != research.campaign_id:
         raise ProductionFinalizationError("campaign and research outcome identity differ")
     if (
-        resource_evidence.get("hard_wall_seconds")
-        != request.config.benchmark.wall_clock_seconds
+        resource_evidence.get("hard_wall_seconds") != request.config.benchmark.wall_clock_seconds
         or resource_evidence.get("finalization_reserve_seconds")
         != request.config.runner.finalization_reserve_seconds
     ):

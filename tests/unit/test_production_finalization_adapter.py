@@ -2994,3 +2994,41 @@ def _unique_lines_ok(values: tuple[str, ...]) -> bool:
 
     _unique_lines(values, "failures_and_recoveries")
     return True
+
+
+def test_recorded_metric_copies_may_differ_by_float32_rounding() -> None:
+    """Two recorded copies of one measurement must not be compared at float64 exactness.
+
+    Reproduces the `runs/batch-20260830T135900Z` finalization failure. The first generated
+    candidate ever promoted -- an interaction block over strictly-past click and like history --
+    reached bundle verification and was rejected with "representative primary differs from
+    reconstructed evidence". Its GAUC and nDCG@5 were byte-identical between the bundle headline
+    and the representative seed row; only `primary` differed, by 3e-8, because one copy had
+    crossed the scorer's float32 boundary. `_manifest_metrics` already tolerates exactly that when
+    checking primary against its own components.
+    """
+
+    headline = 0.601422905921936
+    representative = 0.6014229357242584
+    assert abs(headline - representative) > 1e-15
+    assert abs(headline - representative) < production._RECORDED_METRIC_TOLERANCE
+
+    production._require_close(
+        headline,
+        representative,
+        "representative primary",
+        abs_tol=production._RECORDED_METRIC_TOLERANCE,
+    )
+
+    # A genuinely different measurement is still caught.
+    with pytest.raises(ProductionFinalizationError, match="differs from reconstructed evidence"):
+        production._require_close(
+            headline,
+            headline + 1e-5,
+            "representative primary",
+            abs_tol=production._RECORDED_METRIC_TOLERANCE,
+        )
+
+    # Reconstructed values, compared by identical float64 arithmetic, stay exact by default.
+    with pytest.raises(ProductionFinalizationError, match="differs from reconstructed evidence"):
+        production._require_close(headline, representative, "seed 0 primary")
