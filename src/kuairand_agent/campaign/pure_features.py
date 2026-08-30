@@ -54,6 +54,21 @@ _STATIC_FEATURE_NAMES: Final = (
     "date_offset_from_20220408",
     "tab_numeric",
 )
+# Entity identity columns, appended after the static ones. The organizer baseline is itself an FM
+# over exactly these fields encoded to integer ids, so withholding them meant a generated candidate
+# could not express the architecture it is asked to beat, and in particular could not learn an
+# identity embedding to cross with the causal aggregates.
+#
+# Vocabularies are fitted on the prefix (training) rows only and every unseen value falls into a
+# per-field UNK slot, mirroring the organizer's own `encode()`. Codes carry no outcome information:
+# they are dense relabelings of values the field policy already marks enabled inference inputs.
+_IDENTITY_FIELD_NAMES: Final = (
+    "id__user",
+    "id__video",
+    "id__author",
+    "id__tab",
+    "id__duration_bucket",
+)
 _DATE_CHRONOLOGY_STRIDE: Final = 10_000_000_000_000
 
 
@@ -215,11 +230,60 @@ def _static_matrix(inputs: CanonicalInputs) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.float64)
 
 
-def _augment(causal: FeatureMatrix, inputs: CanonicalInputs) -> FeatureMatrix:
+def _identity_values(inputs: CanonicalInputs) -> tuple[tuple[object, ...], ...]:
+    return (
+        tuple(inputs.user_id),
+        tuple(inputs.video_id),
+        tuple(inputs.author_id),
+        tuple(inputs.tab),
+        tuple(_duration_bucket(value) for value in inputs.duration_ms),
+    )
+
+
+def identity_vocabularies(inputs: CanonicalInputs) -> tuple[dict[object, int], ...]:
+    """Fit one integer vocabulary per identity field from training rows alone."""
+
+    # Codes are assigned in sorted value order, never first-appearance order: the vocabulary must
+    # be a pure function of the set of values so that permuting equal-timestamp rows permutes the
+    # features identically, which the builder's invariance tests and exact replay both require.
+    return tuple(
+        {value: code for code, value in enumerate(sorted(set(column), key=str))}
+        for column in _identity_values(inputs)
+    )
+
+
+def identity_cardinalities(vocabularies: Sequence[dict[object, int]]) -> tuple[int, ...]:
+    """Embedding sizes per identity field, including the trailing UNK slot."""
+
+    return tuple(len(vocabulary) + 1 for vocabulary in vocabularies)
+
+
+def _identity_matrix(
+    inputs: CanonicalInputs, vocabularies: Sequence[dict[object, int]]
+) -> np.ndarray:
+    columns = _identity_values(inputs)
+    if len(columns) != len(vocabularies):
+        raise PureFeatureError("identity vocabularies and columns disagree")
+    encoded = np.empty((len(inputs), len(columns)), dtype=np.float64)
+    for index, (column, vocabulary) in enumerate(zip(columns, vocabularies, strict=True)):
+        unknown = len(vocabulary)
+        encoded[:, index] = [float(vocabulary.get(value, unknown)) for value in column]
+    return np.ascontiguousarray(encoded, dtype=np.float64)
+
+
+def _augment(
+    causal: FeatureMatrix,
+    inputs: CanonicalInputs,
+    vocabularies: Sequence[dict[object, int]],
+) -> FeatureMatrix:
     if causal.row_count != len(inputs):
         raise PureFeatureError("causal and static feature rows differ")
-    values = np.concatenate((causal.values, _static_matrix(inputs)), axis=1)
-    return FeatureMatrix(values, (*causal.feature_names, *_STATIC_FEATURE_NAMES))
+    values = np.concatenate(
+        (causal.values, _static_matrix(inputs), _identity_matrix(inputs, vocabularies)), axis=1
+    )
+    return FeatureMatrix(
+        values, (*causal.feature_names, *_STATIC_FEATURE_NAMES, *_IDENTITY_FIELD_NAMES)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,9 +373,11 @@ def build_pure_feature_pair(
     )
     if causal.query is None:  # pragma: no cover - query input above makes this defensive.
         raise PureFeatureError("causal builder did not return query features")
+    # Fitted on training rows only; query rows resolve unseen values to each field's UNK slot.
+    vocabularies = identity_vocabularies(prefix_inputs)
     return PureFeaturePair(
-        prefix=_augment(causal.prefix, prefix_inputs),
-        query=_augment(causal.query, query_inputs),
+        prefix=_augment(causal.prefix, prefix_inputs, vocabularies),
+        query=_augment(causal.query, query_inputs, vocabularies),
         dataset_digest=dataset_digest,
         split_role=split_role,
         causal_cache_key=causal.cache_key,

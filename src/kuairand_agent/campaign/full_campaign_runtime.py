@@ -86,6 +86,10 @@ from kuairand_agent.campaign.provenance import (
     capture_environment_identity,
     hash_source_tree,
 )
+from kuairand_agent.campaign.pure_features import (
+    identity_cardinalities,
+    identity_vocabularies,
+)
 from kuairand_agent.campaign.qualification_evidence import (
     OfficialFMQualificationEvidence,
     OfficialFMSeedEvidence,
@@ -722,6 +726,11 @@ def _research_context_evidence(
 ) -> _ResearchContextEvidence:
     train_positive_count = sum(data.outer_train_labels)
     train_count = len(data.outer_train_labels)
+    identity_vocabs = identity_vocabularies(data.outer_train_inputs)
+    identity_sizes = identity_cardinalities(identity_vocabs)
+    identity_columns = tuple(
+        name for name in features.final.feature_names if name.startswith("id__")
+    )
     return _ResearchContextEvidence(
         capability_manifests=(
             _input_capability_manifest(DataPhase.TRAIN, data.outer_train_inputs),
@@ -767,6 +776,26 @@ def _research_context_evidence(
                     "fold_b_selected_fusion_only": True,
                     "uses_public_labels_for_features": False,
                     "uses_prediction_period_outcomes": False,
+                },
+            ),
+            # Without the cardinalities a candidate cannot size an embedding table, so the
+            # identity columns would be unusable in practice even though they are present.
+            AggregateRecord(
+                "controller_identity_columns",
+                {
+                    "columns_csv": ",".join(identity_columns),
+                    "cardinalities_csv": ",".join(str(size) for size in identity_sizes),
+                    "encoding": (
+                        "integer codes stored as float64 in the feature matrix; vocabularies are "
+                        "fitted on training rows only and every value unseen in training resolves "
+                        "to that field's final code, which is the UNK slot"
+                    ),
+                    "intended_use": (
+                        "learn an embedding per identity and cross it with the causal aggregate "
+                        "columns; a feature constant within a user cannot reorder that user's own "
+                        "impressions on its own, but becomes able to once crossed with an item "
+                        "identity"
+                    ),
                 },
             ),
         ),
@@ -3703,7 +3732,13 @@ def run_provider_free_campaign(
             benchmark_digest=request.benchmark_digest,
             dataset_digest=qualification.canonical_digest,
             scorer_digest=scorer_digest,
-            feature_bundle_digest=features.digest,
+            # The bundle's own digest embeds `builder_source_digest=request.source_digest`, i.e.
+            # the whole trusted source tree, so it moves on every commit. Using it here made the
+            # evaluation scope inherit that source dependence transitively and reset cross-run
+            # memory on each code change -- the exact failure this scope exists to prevent. The
+            # matrix digest hashes the feature names, shape and float bytes, so it changes when
+            # the features genuinely change and not when a prompt does.
+            feature_bundle_digest=features.outer_and_final.prefix.digest,
         )
         _stage(
             progress,

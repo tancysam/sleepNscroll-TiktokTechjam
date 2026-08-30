@@ -9,6 +9,8 @@ from kuairand_agent.campaign.pure_features import (
     build_pure_feature_pair,
     concat_canonical_inputs,
     estimated_matrix_bytes,
+    identity_cardinalities,
+    identity_vocabularies,
     split_feature_matrix,
     subset_canonical_inputs,
     subset_values,
@@ -112,7 +114,15 @@ def test_feature_pair_has_frozen_schema_and_strict_past_query_state() -> None:
 
     assert pair.prefix.row_count == 2
     assert pair.query.row_count == 2
-    assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5
+    # 1 global prior + 3 per aggregate spec + 5 static + 5 entity identity codes.
+    assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + 5
+    assert pair.prefix.feature_names[-5:] == (
+        "id__user",
+        "id__video",
+        "id__author",
+        "id__tab",
+        "id__duration_bucket",
+    )
     assert pair.prefix.feature_names == pair.query.feature_names
     assert "duration_at_least_18_seconds" in pair.query.feature_names
     assert all("row_id" not in name for name in pair.query.feature_names)
@@ -233,3 +243,73 @@ def test_matrix_size_admission_is_exact_and_validated() -> None:
     assert estimated_matrix_bytes(1_000, 33) == 264_000
     with pytest.raises(PureFeatureError):
         estimated_matrix_bytes(0, 33)
+
+
+def test_identity_codes_are_fitted_on_training_rows_and_unseen_values_fall_to_unk() -> None:
+    """The vocabulary must come from the prefix alone, exactly as the organizer's encode() does.
+
+    Query rows are validation or final-period impressions. Fitting a vocabulary over them would
+    let the query split influence the encoding the model was trained under, so anything the
+    training rows never contained has to resolve to a per-field UNK slot instead.
+    """
+
+    prefix = _inputs(times=(10, 20, 30, 40))
+    query = _inputs(times=(50, 60), suffix="-unseen")
+
+    pair = build_pure_feature_pair(
+        prefix_inputs=prefix,
+        prefix_labels=(1, 0, 1, 0),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+
+    names = pair.prefix.feature_names
+    video_column = names.index("id__video")
+    train_videos = {value for value in prefix.video_id}
+    unknown_code = float(len(train_videos))
+
+    # Every training video has its own code, all strictly below the UNK slot.
+    train_codes = pair.prefix.values[:, video_column]
+    assert sorted(train_codes) == [0.0, 1.0, 2.0, 3.0]
+    # The query's videos never appeared in training, so all of them land on UNK.
+    query_codes = pair.query.values[:, video_column]
+    assert list(query_codes) == [unknown_code, unknown_code]
+
+
+def test_identity_codes_do_not_depend_on_row_order() -> None:
+    """Codes must be a pure function of the value set, or exact replay breaks.
+
+    Assigning codes in first-appearance order made the features depend on how equal-timestamp rows
+    happened to be ordered, which the builder's permutation-invariance contract forbids.
+    """
+
+    forward = _inputs(times=(10, 20, 30, 40))
+    reversed_rows = CanonicalInputs(
+        user_id=tuple(reversed(forward.user_id)),
+        video_id=tuple(reversed(forward.video_id)),
+        date=tuple(reversed(forward.date)),
+        duration_ms=tuple(reversed(forward.duration_ms)),
+        tab=tuple(reversed(forward.tab)),
+        author_id=tuple(reversed(forward.author_id)),
+        time_ms=tuple(reversed(forward.time_ms)),
+    )
+
+    left = identity_vocabularies(forward)
+    right = identity_vocabularies(reversed_rows)
+
+    assert left == right
+    assert identity_cardinalities(left) == identity_cardinalities(right)
+
+
+def test_identity_cardinalities_reserve_one_unk_slot_per_field() -> None:
+    inputs = _inputs(times=(10, 20, 30, 40))
+
+    vocabularies = identity_vocabularies(inputs)
+    cardinalities = identity_cardinalities(vocabularies)
+
+    # user, video, author, tab, duration_bucket -- each +1 for UNK.
+    assert len(cardinalities) == 5
+    assert cardinalities == tuple(len(vocabulary) + 1 for vocabulary in vocabularies)
+    assert cardinalities[0] == 3  # two distinct users plus UNK

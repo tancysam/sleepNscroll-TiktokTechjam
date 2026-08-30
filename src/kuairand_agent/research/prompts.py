@@ -11,7 +11,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 7
+PROMPT_VERSION: Final = 8
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -77,8 +77,16 @@ GAUC-eligible mixed-label users."""
 
 _PACKAGES: Final = """Execution environment
 
-Available: `numpy` (import as `np`), plus the Python standard library minus the forbidden import
-roots supplied in the request. You have `math`, `json`, `dataclasses`, `typing`, `collections`,
+Available: `numpy` (import as `np`) and `lightgbm` (verified importable in the sandbox), plus the
+Python standard library minus the forbidden import roots supplied in the request.
+
+`lightgbm` matters here because it has a native ranking objective. `objective="lambdarank"` with
+per-user group sizes optimises NDCG directly, which is the metric family being scored, and the
+training request already supplies the user grouping you need to build those groups. A gradient
+boosted ranker over the supplied dense columns is a genuinely different model family from the
+parent's linear/FM scorer, not a variation of it. Pin the version you validate against and set the
+deterministic parameters (single thread, fixed seed, no early stopping on a random split), because
+exact replay of your predictions is a release gate. You have `math`, `json`, `dataclasses`, `typing`, `collections`,
 `itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.
 You do NOT have `os`, `sys`, `pickle`, `shutil`, `glob`, `tempfile`, `importlib`,
 `multiprocessing`, or any network library. The forbidden check is on the FIRST dotted component,
@@ -202,7 +210,21 @@ construction is a proposable axis and not only a model-side detail.
 Two rules bound it. First, apply the identical transformation in training and in inference,
 deriving it only from the training matrix, or your scores will not correspond to your model.
 Second, this authority extends only to arithmetic on the matrix you are given: it is not permission
-to read raw columns, current-row outcomes, or any capability the field policy withholds."""
+to read raw columns, current-row outcomes, or any capability the field policy withholds.
+
+Entity identity columns. The matrix ends with integer identity codes -- `id__user`, `id__video`,
+`id__author`, `id__tab`, `id__duration_bucket` -- stored as float64. The
+`controller_identity_columns` method card gives their exact cardinalities, including the trailing
+UNK slot that every value unseen in training resolves to. Cast with `.astype(np.int64)` and index
+an embedding table.
+
+These exist because the official baseline you are asked to beat is itself a factorization machine
+over exactly these fields, and the aggregate columns beside them are what that baseline lacks.
+Neither half alone is the strongest available model. The reason to cross them is specific to this
+metric: ranking happens inside one user's own impressions, so a column that is constant across
+that user's rows cannot reorder them by itself -- but multiplied against an item identity it
+becomes "this kind of user prefers this item", which does reorder them. That is what an FM
+interaction term, 0.5 * ((sum v)^2 - sum(v^2)), computes over every pair at once."""
 
 _SECTIONS: Final = {
     # PROPOSE receives the feature-authority grant because the proposal is where an axis is

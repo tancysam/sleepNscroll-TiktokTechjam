@@ -44,6 +44,9 @@ def test_a_user_constant_feature_is_reported_as_inert() -> None:
     inert = _record(records, "train_features_inert_within_user")
     assert inert["count"] == 1
     assert "user_constant" in inert["features_csv"]
+    # The guidance must not tell the agent to discard these: crossed with an item identity they
+    # are exactly the interaction that makes user-side signal usable for within-user ranking.
+    assert "interaction terms rather than as features to drop" in inert["note"]
     top = _record(records, "train_feature_signal_01")
     assert top["feature"] == "user_constant"
     assert top["within_user_variance_share"] == 0.0

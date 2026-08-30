@@ -139,8 +139,11 @@ def within_user_feature_diagnostics(
                     "count": len(inert),
                     "features_csv": ",".join(name for name, _share, _corr in inert[:24]),
                     "note": (
-                        "constant within each user, so these cannot reorder a user's own "
-                        "impressions and contribute nothing to GAUC or nDCG on their own"
+                        "constant within each user, so on their own these cannot reorder that "
+                        "user's impressions -- but they are not useless: crossed with an item "
+                        "identity or an item-side column they become 'this kind of user prefers "
+                        "this item', which does reorder a slate. Treat them as candidates for "
+                        "interaction terms rather than as features to drop"
                     ),
                 },
             )
