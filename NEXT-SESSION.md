@@ -65,12 +65,45 @@ mypy    1 error in src/kuairand_agent/execution/runner.py:909 "Statement is unre
         Not ours.
 ```
 
-> **A campaign is running right now.** `runs/maki-overnight-09` was launched at 12:29 SGT on
+> ## RESULT: maki-overnight-09 finished. Read this first.
+>
+> Completed 2026-08-30 ~13:59 SGT in **11.6 minutes**. `campaign_status: COMPLETED`,
+> `failures: []`, valid submission written to `runs/maki-overnight-09/final/`.
+>
+> **This is the furthest this project has ever got.** Three candidates proposed, implemented and
+> trained with **zero rejections** — every previous run had candidates die at the static gates.
+> Two of them reached **matched-seed outer validation** across seeds 0/1/2, which no run had ever
+> reached. `maximum_repairs` came back as 2, confirming the prompt fix landed.
+>
+> | Candidate | Seeds 0/1/2 mean | Delta vs 0.6015722 |
+> |---|---:|---:|
+> | candidate-01 (GAUC-matched pairwise softplus) | 0.6012030 | **-0.0003692** |
+> | candidate-03 (corrected pairwise softplus) | 0.6011940 | **-0.0003782** |
+>
+> **Neither beat the baseline.** Both are marginal regressions, smaller than the 0.0008 seed
+> standard deviation, so they sit within noise. The official-FM fallback correctly shipped and the
+> run is recorded as `baseline_reproduced`. The loop is proven; the score is not yet won.
+>
+> **KNOWN REPORTING BUG, fix this first.** `final/report.md` shows `-` for both Inner primary and
+> Outer primary on all three iterations, even though the numbers above are durably recorded in
+> `campaign.sqlite3` under `metrics.metadata_json -> seed_metrics`. `_with_selected_metric` in
+> `finalization/production.py` only carries the metric for the *selected* candidate, so when the
+> fallback ships every generated candidate renders as a dash. Per-iteration metrics are a
+> **required deliverable** — a judge currently cannot see that these candidates scored at all.
+>
+> No campaign is running now. To start another, use a fresh run directory (`maki-overnight-10`).
+
+<details>
+<summary>Earlier status, superseded</summary>
+
+> **A campaign was running.** `runs/maki-overnight-09` was launched at 12:29 SGT on
 > 2026-08-30 on the corrected code, with both provider keys verified live. Do not launch another
 > one — only one campaign may run at a time. Check on it with
 > `ls runs/maki-overnight-09/final/` (empty means still going) and grade it with the ladder in
 > section 3. If it is no longer in `ps -eo pid,args | grep "[.]venv/bin/kuairand-agent"` and there
 > is no `final/` directory, it died: read `logs/overnight-09.log`.
+
+</details>
 
 Two earlier campaigns were stopped at ~11:52 today:
 
