@@ -1,405 +1,283 @@
 # Start here — session handoff
 
-**Written 2026-08-30 ~12:00 SGT. Submission deadline: Tue 2026-09-01 12:00. About 48 hours left.**
+**Written 2026-08-30 ~23:30 SGT. Submission deadline: Tue 2026-09-01 12:00 SGT.**
 
-If you are a fresh Claude Code session, read this file top to bottom before touching anything.
-It is written to be the only context you need.
+Supersedes the 2026-08-30 12:00 version, which is stale in every section. `PROJECT-CONTEXT.md`
+remains correct on architecture, the task spec and the environment; this file replaces its
+"Where things actually stand" section entirely.
 
----
-
-## 1. What this project is
-
-TikTok TechJam 2026, **Track 2**. We are not building a recommender by hand. We are building an
-**autonomous ML research agent** that proposes hypotheses, writes model code, runs experiments,
-reads its own results, and iterates — on the KuaiRand-Pure dataset.
-
-- **Task:** within-user ranking. Label is **`long_view`**. *(Some older briefs in the repo say
-  `click`. They are stale. It is `long_view`.)*
-- **Metrics:** GAUC and nDCG@5. The **primary** score is the mean of the two.
-- **The number to beat:** the official FM baseline scores **0.6016 on validation**. That is the
-  split every promotion decision is measured on. The same baseline scores **0.5946 on the
-  organizers' held-out test period**, which only they can measure. When comparing anything, use
-  **0.6016**.
-- **Ceiling:** an oracle reaches 0.8645, so there is real headroom.
-- **Convergence:** epsilon = 0.002, patience N = 3.
-
-### The architecture in one paragraph
-
-Two planes. A **trusted controller** (our code, deterministic, audited) and an **LLM** that is
-reached through exactly four typed methods: `propose`, `implement`, `repair`, `reflect`. The LLM
-never touches the filesystem, never parses a protocol, never picks a metric. It returns typed JSON.
-The controller materializes it, runs static gates, executes it in a sandbox, scores it, and decides.
-This separation is the project's best asset — do not erode it to make something pass.
-
-### The candidate contract (this trips up every model, including you)
-
-- `candidate.py` is a **protected wrapper**. The LLM may not return it. It owns argument parsing,
-  capability loading, checkpoint I/O, and writing scores.
-- The LLM writes **`model_impl.py`**, which defines four functions: `validate_config`,
-  `train_model`, `predict_scores`, `training_diagnostics`.
-- `files_expected` in a proposal is the **final tree manifest** and **must include `candidate.py`**
-  (`provider._parse` validates this). The **response** is an **overlay** and **must not** contain
-  `candidate.py`. These are two different things. Confusing them cost a live campaign four
-  proposals — do not "simplify" this.
-- Helper modules must be imported **by plain name** (`import pairwise_sampler`), never relatively.
-  A relative import is invisible to the reachability walk that decides materiality, *and* the
-  candidate runs as a script so `from . import helper` also fails at execution.
+Everything runs in **WSL2 Ubuntu**, in `~/sleepNscroll-TiktokTechjam`. Never Windows, never the
+stale Windows Desktop copy.
 
 ---
 
-## 2. Where things stand right now
+## 1. Status in one paragraph
 
-**Branch: `Maki`. 10 commits ahead of `origin/Maki` and unpushed.** Do not push to `main`.
-
-Everything is committed and green:
-
-```
-suite   1479 passed, 21 skipped, 1 failed
-        the 1 failure is pre-existing: tests/unit/test_starter_fm.py::
-        test_first_update_matches_untouched_organizer_float32_golden
-        (an arm64 float32 golden; we are on x86 WSL). Not ours, do not chase it.
-ruff    check clean, format clean
-mypy    1 error in src/kuairand_agent/execution/runner.py:909 "Statement is unreachable"
-        pre-existing and platform-dependent: the line is inside a `sys.platform != "darwin"`
-        branch, so it is unreachable on Linux and reachable on the macOS the code also targets.
-        Not ours.
-```
-
-> ## RESULT: maki-overnight-09 finished. Read this first.
->
-> Completed 2026-08-30 ~13:59 SGT in **11.6 minutes**. `campaign_status: COMPLETED`,
-> `failures: []`, valid submission written to `runs/maki-overnight-09/final/`.
->
-> **This is the furthest this project has ever got.** Three candidates proposed, implemented and
-> trained with **zero rejections** — every previous run had candidates die at the static gates.
-> Two of them reached **matched-seed outer validation** across seeds 0/1/2, which no run had ever
-> reached. `maximum_repairs` came back as 2, confirming the prompt fix landed.
->
-> | Candidate | Seeds 0/1/2 mean | Delta vs 0.6015722 |
-> |---|---:|---:|
-> | candidate-01 (GAUC-matched pairwise softplus) | 0.6012030 | **-0.0003692** |
-> | candidate-03 (corrected pairwise softplus) | 0.6011940 | **-0.0003782** |
->
-> **Neither beat the baseline.** Both are marginal regressions, smaller than the 0.0008 seed
-> standard deviation, so they sit within noise. The official-FM fallback correctly shipped and the
-> run is recorded as `baseline_reproduced`. The loop is proven; the score is not yet won.
->
-> **KNOWN REPORTING BUG, fix this first.** `final/report.md` shows `-` for both Inner primary and
-> Outer primary on all three iterations, even though the numbers above are durably recorded in
-> `campaign.sqlite3` under `metrics.metadata_json -> seed_metrics`. `_with_selected_metric` in
-> `finalization/production.py` only carries the metric for the *selected* candidate, so when the
-> fallback ships every generated candidate renders as a dash. Per-iteration metrics are a
-> **required deliverable** — a judge currently cannot see that these candidates scored at all.
->
-> No campaign is running now. To start another, use a fresh run directory (`maki-overnight-10`).
-
-<details>
-<summary>Earlier status, superseded</summary>
-
-> **A campaign was running.** `runs/maki-overnight-09` was launched at 12:29 SGT on
-> 2026-08-30 on the corrected code, with both provider keys verified live. Do not launch another
-> one — only one campaign may run at a time. Check on it with
-> `ls runs/maki-overnight-09/final/` (empty means still going) and grade it with the ladder in
-> section 3. If it is no longer in `ps -eo pid,args | grep "[.]venv/bin/kuairand-agent"` and there
-> is no `final/` directory, it died: read `logs/overnight-09.log`.
-
-</details>
-
-Two earlier campaigns were stopped at ~11:52 today:
-
-| Run dir | Code | Status |
-|---|---|---|
-| `runs/maki-overnight-07` | pre-fix | ran 1h14m, stopped. Evidence kept — see §6. |
-| `runs/maki-overnight-08` | post-fix | ran 3 minutes, stopped. Partial, ignore it. |
-
-**Both run dirs are left on disk deliberately as evidence. Start a new run in a new directory
-(`maki-overnight-09`) rather than reusing either.**
-
-**API keys are configured and both were verified live at 11:47 today** — main and fallback both
-return HTTP 200 on a strict `json_schema` request. They live in `.env.local`, which is gitignored
-and `chmod 600`. **Never print a key into the chat.** `.env.example` is tracked in git and its key
-fields must stay blank.
+Branch `Maki`, HEAD `e758693`, tree clean, **20 commits unpushed**. Suite: **1497 passed, 21
+skipped, 1 failed** — the one failure is the pre-existing arm64 float32 golden
+(`test_starter_fm.py::test_first_update_matches_untouched_organizer_float32_golden`). Ruff clean
+over `src tests candidate_seed`; mypy has one pre-existing error at `execution/runner.py:909`.
+**Five valid submission bundles exist** (runs 09, 10, 11, 12, 14). The agent now executes
+reliably, has promoted a candidate once, and **has not beaten the baseline by a material margin.**
 
 ---
 
-## 3. How to run the campaign
+## 1b. Do these first, in this order
 
-Everything runs inside **WSL2 Ubuntu**, not Windows. The runtime uses `resource`, `os.killpg`,
-`SIGKILL`, and `os.getpgid`, which are POSIX-only. That is the whole reason WSL exists here.
+Nothing is running. No campaign is in flight. Read `PROJECT-CONTEXT.md` for architecture and the
+task spec, then this file, then act.
 
-Open the Ubuntu terminal and run:
+**1. Check the fusion lever before launching anything.** This is the cheapest untried idea and it
+was half-investigated when the last session ended. The machinery already exists:
 
 ```sh
-cd ~/sleepNscroll-TiktokTechjam
-mkdir -p logs
-nohup sh scripts/run_full_campaign.sh \
-  configs/full-pure.toml \
+grep -rn "FUSION_WEIGHT_GRID\|fuse_ranked_predictions" src/kuairand_agent/candidates/fusion.py
+grep -rn "fusion" src/kuairand_agent/campaign/generated_scientific_runner.py | head
+```
+
+The question to answer: **is rank fusion wired for generated candidates, or only for the official
+FM control?** If a generated candidate can be fused with the official FM, that is the most likely
+route to a material gain, because our candidates score level with the FM but make different errors
+(see §3.3 — except where they reproduce its ordering exactly, which is the case fusion cannot
+help). If it is not wired, decide whether wiring it is cheaper than lever 2 or 3 in §7.
+
+**2. Launch run 15 regardless.** It costs ~$2 and ~25 minutes, runs unattended, and the promotion
+path is now fixed so a win would actually publish a bundle. Command in §8. Grade **execution rate
+first**, then promotion, then the bundle.
+
+**3. Finish the deliverables.** They are worth more marks than another 0.0003. See §9. The Devpost
+writeup has not been started and is the largest outstanding item.
+
+**Do not** spend the session patching one traceback at a time. If a run fails, sweep the whole run
+before concluding — that mistake cost four runs.
+
+---
+
+## 2. Run history, 09 to 14
+
+All six converged (`stop_reason: converged`) with **zero manual interventions**.
+
+| Run | Candidates executed | Best outer primary | Promoted | Bundle | Cost |
+|---|---:|---:|---|---|---:|
+| 09 | **3 / 3** | 0.6012030 | no | yes | $0.68 |
+| 10 | 1 / 3 | — | no | yes | $1.82 |
+| 11 | 0 / 3 | — | no | yes | $2.31 |
+| 12 | 0 / 3 | — | no | yes | $1.93 |
+| 13 | **3 / 3** | **0.6017118** | **yes** (`promoted_unconfirmed`) | **NO — bug** | $2.21 |
+| 14 | **3 / 3** | 0.6014124 | no | yes | $1.69 |
+
+Total spend across every run ever: **$24.74**, 114 provider calls, 2,438,868 tokens. GPU hours
+**0.00**. Reconstruct with the per-attempt journals in
+`runs/*/production/provider-attempt-journal/`.
+
+Comparators, all on public validation:
+- Organizer baseline primary **0.6016**; hidden test 0.5946 (organizer-only).
+- Official FM five-seed mean **0.6015721679**.
+- **`fallback_outer_mean` = 0.6014402508735657** — the in-run apples-to-apples incumbent, and the
+  number every promotion decision is actually made against.
+- Seed-to-seed standard deviation **0.0008**. Materiality threshold **ε = 0.002**.
+
+---
+
+## 3. The findings (this is the science)
+
+### 3.1 Code volume predicts whether a candidate runs at all
+
+| Run | `model_impl.py` lines | Executed |
+|---|---|---:|
+| 01–08 | 1 (truncated stubs) | 0 |
+| 09 | 217, 209, 250 | 3 / 3 |
+| 10 | 587, 873, **533** | 1 / 3 (the 533) |
+| 11 | 786, 640, 428 | 0 / 3 |
+| 12 | 611, 585, 749 | 0 / 3 |
+| 13 | 491, 518, 572 | 3 / 3 |
+| 14 | — | 3 / 3 |
+
+Every candidate at or under ~260 lines executed. Of the eight over 580 lines, none did. Adding
+identity codes did not break anything directly — it made the model write two to three times more
+code, and defect probability scaled with volume.
+
+### 3.2 The margin is noise, and this is now replicated
+
+The same method, two runs:
+
+| Run | Candidate-01 outer mean | Delta vs incumbent | Sigma |
+|---|---:|---:|---:|
+| 13 | 0.6017118 | **+0.0002715** | +0.34σ |
+| 14 | 0.6014124 | **−0.0000278** | −0.03σ |
+
+Run 13 was above on both inner folds and all three outer seeds. Run 14 landed on the other side of
+zero. **Do not report either as an improvement.** The controller agrees independently:
+`selector.py:456` promotes as `PROMOTE_CONFIRMED` only when the mean paired delta exceeds ε, so
+run 13's candidate was recorded as `promoted_unconfirmed`.
+
+### 3.3 Generated models keep reproducing the FM's exact ordering
+
+Five occurrences across runs 09, 10 and 14: a generated candidate produced **bit-identical GAUC and
+nDCG@5** to the official FM control on fold B. Run 10 `candidate-03` did it with **59,816 distinct
+prediction values across 61,315 rows**, so it is not a degenerate or constant-score artifact — a
+genuinely different model induced the same within-user ordering. With a median slate of four
+impressions and only 63.7% of users GAUC-eligible, there are very few orderings to get right.
+
+### 3.4 The pairwise objective is a poorly aligned surrogate here
+
+`runs/pairwise-sweep.json`, 12 cells, full 1,141,112-row train split. **Every cell is below the
+local baseline.** Best is 0.6015003 vs 0.6015722, i.e. −0.0000719, and that best is best-of-12
+selected on the split it is reported on, one seed, against a five-seed mean. More importantly:
+mean pairwise training loss fell in every cell (0.687 → 0.539 → 0.390 as epochs went 10 → 20 → 40)
+while the ranking metric **peaked at 10 epochs and then degraded monotonically**. Training the
+surrogate harder makes the scored metric worse.
+
+### 3.5 What the winning method actually was (run 13, candidate-01)
+
+`hybrid_pairwise_fm`, rank 12. A factorization machine holding **both** identity embeddings (video,
+author, tab, duration bucket) **and** the 33 causal aggregate columns, with the FM interaction term
+`0.5·((Σv)² − Σv²)` crossing them, trained under a GAUC-matched within-user pairwise softplus loss,
+Adam, frequency-aware L2. The organizer baseline has identities but no aggregates; our run 09
+candidates had aggregates but no identities. This held both. The agent derived that itself from the
+campaign records of our own failed runs.
+
+---
+
+## 4. What changed this session (5 commits on `Maki`)
+
+| Commit | Change |
+|---|---|
+| `d82f15a` | **Identity codes.** Feature bundle 33 → 37 columns: `video_id_code`, `author_id_code`, `tab_code`, `duration_bucket_code`. Train-fitted vocabularies, sorted assignment (first-seen order breaks path-independence), UNK slot for unseen identities. Verified in production: cardinalities **7539, 6483, 16, 7**. Also fixed the dashed trajectory table and raised `reasoning_effort` low → high. |
+| `784ae49` | **Crash disclosure.** `_iteration_record` now carries `execution_failed`, `proposal_family`, `objective`, `candidate_primary`, `delta_vs_incumbent`, and `reflection_lessons` (previously discarded). Sampler bounds guidance added to the briefing. |
+| `7b7d83e` | **Diagnostics no longer fatal.** `candidate_seed/candidate.py` contains `training_diagnostics` failures and reports `diagnostics_failed: 1.0` in-schema. Reflection stopped receiving fallback metrics for crashed branches. |
+| `f66e364` | **The fix that worked.** Four tested helpers in the seed: `categorical_codes`, `embedding_table_size`, `fm_interaction_scores` (harvested from run 10 `candidate-03`, the only candidate that ever ran end to end), `within_user_pairs` (written fresh — no working version had ever existed). Briefing carries the size finding. |
+| `e758693` | **Promotion path fix.** Ledger export attributed every run to the selected candidate; now attributed to its real owner via `_candidate_run_ownership`. Plus RESULTS.md and README corrections. |
+
+---
+
+## 5. Bugs found and fixed (all were latent, all cost real runs)
+
+1. **Reflection was told a crashed candidate had tied the baseline.** `_reflect` substituted the
+   fallback's seed-0 metrics whenever a run produced none, because `ExperimentResultSummary`
+   requires three finite metrics. Run 11's reflection duly concluded a candidate that never
+   executed was "indistinguishable from the official FM reference". Fixed: zeros plus
+   `execution_failed`.
+2. **`training_diagnostics` destroyed successful training runs.** Run 11 lost two candidates that
+   had already trained (14s and 154s) to exceptions in purely informational code.
+3. **The promotion path had never executed.** Run 13 was the first campaign to promote a generated
+   candidate, and finalization died with `scientific record source, config, or environment identity
+   changed`. The ledger export required **every** retained run to carry the *selected* candidate's
+   source and config digest; run 13 had seven runs across three distinct source digests. It also
+   stamped every exported row with the winner's id, misattributing losing candidates' runs.
+
+**Run 13's bundle is permanently unrecoverable.** Finalization checks the working tree still hashes
+to the digest recorded at campaign creation, so the only source that can finalize it is the source
+containing the bug. Deleting the other candidates' evidence would satisfy the old check but would
+fabricate the audit trail. Its scores survive in `runs/maki-overnight-13/production/`.
+
+---
+
+## 6. Verified facts. Do not re-litigate these.
+
+- **A candidate receives exactly three arrays**: `features` (37 cols), `targets`, `user_groups`.
+  Nothing else. No prompt wording can widen this — it is `candidate_api/runtime_contract.py:55-57`.
+- **Five of the organizers' six open directions are unreachable** through that seam: sequences,
+  multi-task, censored watch-time and the randomized log all need data the candidate never gets.
+- **`hash_source_tree` covers** `src/**.py`, `configs/*.toml`, `scripts`, `candidate_seed`,
+  `candidate_templates`, plus `.python-version`, `pyproject.toml`, `uv.lock`. It does **not** cover
+  `docs/` or `README.md`, so writeup edits are safe during a live run. Any other edit strands a
+  running campaign at `FINALIZING`.
+- **`sys` is a forbidden import in candidate source**, including the protected wrapper, which is
+  materialized into every candidate.
+- **`ExperimentResultSummary` is request-side only.** The strict provider schema
+  (`_REFLECTION_SCHEMA`) constrains only the model's reply, so adding a defaulted field there costs
+  no wire-contract change.
+- **The repair loop covers pre-execution only** (`production.py` catches
+  `CandidateMaterializationError` and `CandidateStaticError`). A crash inside `train_model` ends the
+  branch with no retry.
+- **The fallback provider slot is a different model** (`gpt-5.6-terra` vs main `gpt-5.6-sol`), and
+  failover is sticky, so a mid-campaign failover silently changes experimental conditions.
+- **Each bundle only replays at the commit that produced it**: run 09 → `0978e46`, run 10 →
+  `d82f15a`, run 11 → `784ae49`, run 12 → `7b7d83e`. Whichever we submit, the README reproduce
+  steps must name its commit.
+
+---
+
+## 7. Levers still open, best first
+
+1. **Rank fusion of a generated candidate with the official FM.** The machinery already exists
+   (`candidates/fusion.py`, `FUSION_WEIGHT_GRID`, `fuse_ranked_predictions`, and the method card
+   already reports `fold_b_selected_fusion_only`). Two models that score equally but make different
+   errors usually fuse to something better than either. **Not yet investigated whether it is wired
+   for generated candidates — check this first, it is the cheapest untried idea.**
+2. **History and recency features.** `time_ms` is already enabled as `STRICT_PAST_HISTORY_SOURCE`
+   and the causal engine already sorts by it, but the bundle builds **zero** history features. No
+   field-policy change needed. Same class of change as the identity codes, which worked.
+3. **Auxiliary signals** (`is_click`, `play_time_ms`, 20 fields disabled at
+   `data/fields.py:296-302`). `long_view` is a binary threshold *on* play time, so `play_time_ms` is
+   a strictly richer version of the label. Requires enabling the fields, plumbing through
+   `CampaignDataPlane` (which carries binary `long_view` only), and **re-qualification** because
+   `FIELD_POLICY_DIGEST` changes. `docs/RESULTS.md` records a full six-launch qualification plus
+   clean replay at **170.76 s**, so re-qualification may be far cheaper than previously assumed —
+   verify before ruling it out.
+4. **Allow a runtime crash to consume a repair attempt.** Would have saved six branches across runs
+   11 and 12. Structural, bigger change.
+
+---
+
+## 8. How to run and grade
+
+```sh
+cd ~/sleepNscroll-TiktokTechjam && nohup sh scripts/run_full_campaign.sh configs/full-pure.toml \
   "$HOME/sleepNscroll-TiktokTechjam/runs/maki-qualification" \
-  "$HOME/sleepNscroll-TiktokTechjam/runs/maki-overnight-09" \
-  > logs/overnight-09.log 2>&1 &
+  "$HOME/sleepNscroll-TiktokTechjam/runs/maki-overnight-15" \
+  > logs/overnight-15.log 2>&1 &
 ```
 
-That is it. `nohup ... &` detaches it, so you can close the terminal and it keeps running. The
-script sources `.env.local` itself and syncs dependencies before starting.
+Fresh run directory every time; one campaign at a time (they share
+`runs/outer-query-ledger.sqlite3`). Roughly 25 minutes and ~$2 each.
 
-**It runs for 6 hours** (`wall_clock_seconds = 21600`), of which the **last hour is reserved for
-finalization** (`finalization_reserve_seconds = 3600`). So roughly 5 hours of research, then it
-writes the submission bundle. Leave the laptop on and plugged in. It will use up to 4 threads and
-16 GB.
-
-**Only ever run one campaign at a time.** Two campaigns write the same
-`runs/outer-query-ledger.sqlite3` and fight over the CPU. That is exactly what happened today.
-
-### Checking on it
+**Grade execution rate first, then promotion, then the bundle.** A candidate that runs and scores
+0.601 beats a campaign of crashes.
 
 ```sh
-cd ~/sleepNscroll-TiktokTechjam
+# execution rate — the gate that matters
+python3 -c "
+import sqlite3;from pathlib import Path
+r=Path.home()/'sleepNscroll-TiktokTechjam'/'runs'/'maki-overnight-15'
+c=sqlite3.connect(f'file:{r}/campaign.sqlite3?mode=ro',uri=True)
+x=list(c.execute(\"SELECT status FROM executions WHERE experiment_id IS NOT NULL\"))
+print(len(x),'executions,',sum(1 for s in x if s[0]=='SUCCEEDED'),'succeeded')"
 
-# is it alive?
-ps -eo pid,args | grep "[.]venv/bin/kuairand-agent"
+# why anything crashed — stderr IS retained here, workspaces are cleaned
+for d in runs/maki-overnight-15/production/candidate-control/*/; do tail -6 "$d/stderr.log"; done
 
-# recent log
-tail -40 logs/overnight-09.log
-
-# what the agent has actually produced
-ls runs/maki-overnight-09/production/generated-source/
-
-# every provider call, with outcome
-python3 - <<'PY'
-import json, glob, collections
-c = collections.Counter()
-for f in glob.glob("runs/maki-overnight-09/production/provider-attempt-journal/*.json"):
-    d = json.load(open(f))
-    c[(d.get("operation"), d.get("outcome"))] += 1
-for k, v in sorted(c.items()):
-    print(k, v)
-PY
-
-# why any branch was rejected
-for f in runs/maki-overnight-09/production/generated-source/controller-rejection-journal/*.json; do
-  python3 -c "
-import json,sys
-v=json.load(open(sys.argv[1]))['record']['values']
-print(v.get('candidate_id'), '|', v.get('root_failure_code'), '| repairs=', v.get('repairs_attempted'))
-print('   ', str(v.get('root_failure_diagnostic'))[:160])
-" "$f"
-done
+# scores
+ls runs/maki-overnight-15/final/          # bundle exists?
+grep -A 8 "Experiment trajectory" runs/maki-overnight-15/final/report.md
 ```
 
-### Stopping it
-
-```sh
-pkill -TERM -f "bin/kuairand-agent"
-```
-
-### What good looks like in the first 20 minutes
-
-1. `runs/.../generated-source/iteration-01-lineage.json` appears. That means propose → implement
-   → materialize succeeded end to end.
-2. A malformed or failed provider response **costs a branch, not the campaign**. Historically we
-   saw ~43% non-accepted responses, so one will happen early. The run must keep going.
-3. `repairs_attempted` on any rejection should be **greater than 0**. If it is still 0, the model
-   is emitting `maximum_repairs: 0` and the prompt fix did not land — see §6.
-
-### What "done" looks like, and how to grade it
-
-Nothing is required of the operator during the run. Launch it and walk away.
-
-A finished run writes:
-
-```
-runs/maki-overnight-09/final/
-  report.md          the deliverable writeup
-  submission.csv     the predictions
-  experiments.csv    the trajectory in tabular form
-  manifest.json      digests for every artifact
-  reproduce.sh       the replay entrypoint
-```
-
-**If `final/` exists at all, the run finalized.** That alone is a pass on the failure this project
-kept hitting: runs 04, 05 and 07 never got there.
-
-Grade the outcome from one table in `report.md`, **Experiment trajectory and candidate tree**.
-Every completed run so far:
-
-| Run | Trajectory row | Meaning |
-|---|---|---|
-| 02, 03 | `official-fm-fallback-seed-4 / baseline_reproduced` | no candidate was ever admitted |
-| 06 | `candidate-01-...-repair-2 / rejected_before_execution` | code was written, rejected before it ran |
-
-The ladder, worst to best:
-
-1. Only `official-fm-fallback-seed-4`. The agent produced nothing usable; the safety net shipped.
-2. A `candidate-NN-...` row appears. The agent wrote code that cleared the static gates. Run 06.
-3. **A number in `Inner primary`.** The candidate actually trained and was scored. **No run has
-   ever reached this.** This is the first real milestone.
-4. A number in `Outer primary`. It cleared inner folds and was promoted to matched-seed outer
-   validation.
-5. Multiple iterations, 1, 2, 3... The agent proposed, failed, learned and retried. This is the
-   Track 2 deliverable — judges grade the loop, not only the score.
-
-**Did it beat the baseline?** Check the **Baseline parity** table. If the selected row is
-`official-fm-fallback-seed-4` at tier `qualified fallback`, the fallback shipped. If it is a
-`candidate-NN-...` at tier `matched-seed outer validation`, the agent's own model won and its
-primary is the score. The bar is **0.6016**, the official FM validation primary. For reference the
-fallback's own seed-4 row reads 0.6020370721817017 and the five-seed mean reads 0.6015721678733825.
-
-**A run that ends with no `final/` directory is a bug, not a bad result** — that was the entire
-point of the work in section 5.
+Exit code **3** is `EXIT_CONTRACT` — a controller integrity refusal, not a crash.
 
 ---
 
-## 4. Cost
+## 9. Deliverable state
 
-Every campaign spends real money on OpenRouter API calls. A 6-hour run makes on the order of tens
-of provider calls. It is not free, but it is not large either. Reasoning tokens are billed as
-completion tokens, which is why `max_output_tokens` is set to 65536 rather than something smaller
-(see §7).
-
----
-
-## 5. What was fixed in the last session, and why
-
-Seven campaigns had failed. Each time the proximate cause was fixed and the run relaunched. The
-audit found that was the wrong loop — the real problem was structural.
-
-**The chain that killed every run:**
-
-1. The scientific clock advances `elapsed_seconds` **only by candidate subprocess wall time**.
-   Provider latency, materialization, feature builds and reflection are invisible to it. Summing
-   our own provider journals: `overnight-05` alone had **4011 seconds** of unaccounted provider
-   latency — more than the entire 3600s finalization reserve, in a partial run.
-2. So the loop believed it had slack it did not have and kept calling past the real reserve
-   boundary, where the provider raises a deadline error **by design**.
-3. **Nothing caught it.** The autonomous followup loop caught only `LiveResearchBranchRejected`,
-   and the reflection call was unguarded entirely.
-4. `cli.py` runs research and finalization as sequential statements in one `try`. Anything escaping
-   research means **finalization never runs**. Five hours of work, no bundle.
-
-**What changed (commit `ce1c692`):**
-
-- The followup loop now consults the engine's real clock every iteration and breaks on the
-  finalization reserve or a hard expiry.
-- It catches `ResearchModelError` and `ProductionResearchError`, records a closure, and **returns
-  normally** so finalization runs. A provider deadline is reported as `FINALIZATION_RESERVE` (a
-  scheduled stop), anything else as `CANDIDATES_EXHAUSTED`.
-- The closure record also reaches the **durable rejection ledger** — the local list died with the
-  frame, so the report would have shown research stopping with no stated cause.
-- Reflection degrades to a named substitute (`_unavailable_reflection`) instead of propagating.
-- Three separate ways the *fallback* could still lose a submission are closed: `_report_context`
-  degrades instead of raising (it could fail three different ways, one caught and then re-raised);
-  the official-FM fallback builder is now wrapped like the generated one; and model-authored text
-  is collapsed to one line, because `schemas._text` permits newlines that `report._text` rejects
-  and lineage records are written read-only.
-- The selected candidate carries its measured primary into the trajectory table, which had been
-  rendering a dash for the one row whose score is actually known.
-- Prompt fixes: the baseline number (0.5946 → 0.6016), removal of stale file-I/O and
-  request-parsing guidance the wrapper owns, the relative-import correction, removal of a vacuous
-  condition about `candidate.py`, and an explanation of `maximum_repairs`.
-
-14 new tests cover all of it.
+- `docs/RESULTS.md` — §3.2 (pairwise sweep) and §3.3 (live campaigns) written; token consumption
+  and manual interventions tables filled; §6 corrected. **Needs runs 13 and 14 added.**
+- `README.md` — Results and Limitations corrected. **Needs the per-bundle replay commit noted.**
+- **Devpost writeup — not started.** This is the largest outstanding item.
+- Per-iteration run logs are generated from
+  `runs/<id>/production/generated-source/iteration-NN-lineage.json` and render in `report.md`.
 
 ---
 
-## 6. What to do next, in order
+## 10. Working preferences
 
-### First — read the evidence from run 07
-
-It is the best diagnostic we have, and it directly tests whether the prompt fixes work. On the
-**old** code it produced:
-
-```
-propose    accepted 3
-implement  accepted 2, failed 3, malformed 1
-
-candidate-01  declared_symbol_unchanged  repairs=0
-              declared material symbol(s) did not change executable source: ['confirmno']
-candidate-02  invalid_python             repairs=0
-              invalid Python in 'model_impl.py' at line 1: invalid syntax
-```
-
-Two things stand out. **`repairs=0` on both** — the model was emitting `maximum_repairs: 0`, so
-the very first static-gate miss ended each branch with no chance to fix itself. The new prompt
-explicitly tells it to set 2. **And `['confirmno']` and `invalid syntax at line 1`** are
-truncation/garbage artifacts, meaning output quality is still the binding constraint.
-
-**So: launch a fresh run and check whether `repairs_attempted > 0`.** If it is still 0, the model
-is ignoring the instruction and the next move is to stop trusting the model with that field —
-either clamp it controller-side or drop it from the schema and use the configured
-`max_repairs_per_experiment` (which is currently dead code).
-
-### Then — carry-over work
-
-1. **Write the pairwise FM result into `docs/RESULTS.md` §3.2.** The sweep is at
-   `runs/pairwise-sweep.json`. Report it honestly: best primary **0.6015003** against a local
-   baseline of **0.6015722**, i.e. **−0.00007 — a marginal regression, not a win**. And state the
-   caveats: hyperparameters were selected on the reported split, one seed, best-of-12 against a
-   five-seed mean. The file itself already carries the right note: *"Manual experiment.
-   candidates/pairwise_fm.py is not wired into the campaign, so this measures the direction rather
-   than demonstrating agent behaviour."* Keep that framing.
-2. **Push `Maki`.** 10 commits are unpushed. Do not push to `main`.
-3. **Deliberately deferred, with reasons** (do not treat these as oversights):
-   - The hard-deadline absorbing state (`production.py` discards a published bundle) is real but
-     only reachable if we overshoot, which the clock fix prevents.
-   - Bit-exact replay has no reachable tolerance path — a genuine single point of failure, but
-     same-host and same-lockfile makes it unlikely, and changing it risks the integrity guarantee
-     that is the project's best asset.
-   - Prompt token bloat (~9,200 tokens/iteration, with the benchmark block paid on IMPLEMENT where
-     it cannot influence direction) is an optimisation, not a survival fix.
-
----
-
-## 7. Facts that were measured. Do not re-litigate them.
-
-Each of these cost real time to establish. They are recorded in code comments too.
-
-- **`tools: []` and `tool_choice: "none"` are NOT the cause of the OpenRouter 404.** Measured
-  2026-08-30 against the live endpoint: a strict `json_schema` request returns 200 with them,
-  without them, with either one alone, and with `require_parameters` off. The 404 was an
-  **account-level data policy** on the old key. Do not remove those fields on suspicion.
-- **Provider dialects differ.** OpenRouter honours `reasoning: {effort, exclude}`. TokenRouter
-  honours only `thinking: {type: enabled|disabled}` and **ignores `budget_tokens` at realistic
-  request sizes** — a 4096 budget still returned 11k–26k reasoning tokens.
-- **Do not disable thinking.** With it off, the model stopped writing code and returned 18-character
-  stubs — every file identical, with `import numpy as np` written into `config.json`. Reasoning
-  stays on; the cost is paid in output budget instead, which is why `max_output_tokens` is 65536
-  and the timeout is 600s.
-- **Never probe provider behaviour with a trivial prompt.** A budget that appears to work on a toy
-  request is ignored at real payload size. Bracket empirically at realistic size.
-- **Samuel's screenshot comparison (+0.00047) is invalid.** Seed 4 is inside the five-seed mean it
-  is being compared against.
-- **Every previous campaign ended at `official-fm-fallback-seed-4`** because the fallback ships
-  when all candidates fail. That is the system working, not the system winning.
-
----
-
-## 8. Working preferences
-
-- **The user runs the campaign themselves.** Do not launch it for them. Give them the command.
-- Lead with plain English. The user is new to RecSys — give an opinion, not a survey of options.
-- Ask before committing.
-- Commit messages: no hyphens or dashes as punctuation, no quote marks.
-- Never paste API keys into the chat.
-- Stay on `Maki`. Do not push to `main`.
-- `wsl.exe -e bash -lc '...'` breaks on nested quotes constantly. For any multi-line edit, write a
-  Python patch script to a file and `cp` it into WSL, then run it. Anchor every substitution and
-  assert the match count is exactly 1.
-
----
-
-## 9. Repo orientation
-
-```
-src/kuairand_agent/
-  campaign/full_campaign_runtime.py   the autonomous research loop (the survivability fixes)
-  campaign/scientific.py              the inner scientific campaign and its clock
-  research/prompts.py                 every instruction the LLM sees
-  research/provider.py                HTTP, payload shape, retries, provider dialects
-  research/production.py              lineage construction, branch rejection
-  finalization/production.py          bundle, report, the official-FM fallback path
-  finalization/iteration_evidence.py  recovers the per-iteration trajectory for the report
-configs/full-pure.toml                6h budget, 1h reserve, epsilon, provider profiles
-scripts/run_full_campaign.sh          the launcher
-docs/RESULTS.md                       the deliverable writeup
-runs/maki-qualification               the qualified baseline every run depends on
-```
+- The user launches campaigns. Give the command; never launch or `nohup` on their behalf.
+- Lead with plain English, give an opinion not a survey, ask before committing.
+- Never paste an API key. Stay on `Maki`; never push `main`.
+- Commit messages: no hyphens or dashes as punctuation, no quote marks; end with the
+  `Co-Authored-By` and `Claude-Session` trailers.
+- **Verify before asserting.** Several confident claims in this project were false on inspection,
+  including two of mine this session: that candidate stderr was not retained (it is, in
+  `production/candidate-control/*/stderr.log`), and that `ExperimentResultSummary` was part of the
+  strict provider schema (it is request-side only).
+- **Sweep the whole run before concluding.** Patching one traceback at a time is how four runs went
+  by before anyone noticed code volume was the variable.
