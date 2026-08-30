@@ -248,6 +248,14 @@ _BINARY_LOG_FIELDS: Final = frozenset(
 _NUMBER_LOG_FIELDS: Final = frozenset(
     {"play_time_ms", "duration_ms", "profile_stay_time", "comment_stay_time"}
 )
+# Auxiliary outcomes the trusted controller may aggregate over strictly-past rows. Enabling a
+# TRAINING_AUXILIARY_TARGET field never makes it a candidate input -- `candidate_input_enabled`
+# additionally requires the INFERENCE_INPUT role -- so these can become history features but can
+# never be read from the impression being scored. Restricted to dense binary engagement signals:
+# the sparse ones add columns without signal, and the duration/stay-time fields are not binary and
+# would need mean semantics rather than the exposure/positive counting shape.
+_HISTORY_GRANTED_AUXILIARY_FIELDS: Final = frozenset({"is_click", "is_like"})
+
 _AUXILIARY_FIELDS: Final = frozenset(
     {
         "is_click",
@@ -294,13 +302,26 @@ def _standard_spec(column: str) -> FieldSpec:
             rationale="native ranking label; same-row use is target-only",
         )
     if column in _AUXILIARY_FIELDS:
+        granted = column in _HISTORY_GRANTED_AUXILIARY_FIELDS
         return FieldSpec(
             FieldRole.TRAINING_AUXILIARY_TARGET,
             dtype,
-            enabled=False,
+            enabled=granted,
             history_eligible=True,
-            conditions=("explicit auxiliary loss, observability mask, and weight",),
-            rationale="same-impression outcome withheld from the initial FM slice",
+            conditions=(
+                (
+                    "strictly-past aggregation only; never a same-impression candidate input",
+                    "explicit auxiliary loss, observability mask, and weight if used as a target",
+                )
+                if granted
+                else ("explicit auxiliary loss, observability mask, and weight",)
+            ),
+            rationale=(
+                "dense binary engagement signal aggregated over strictly-past rows by the trusted "
+                "controller, exactly as long_view already is"
+                if granted
+                else "same-impression outcome withheld from the initial FM slice"
+            ),
         )
     if column == "time_ms":
         return FieldSpec(

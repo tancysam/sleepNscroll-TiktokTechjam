@@ -112,11 +112,16 @@ def test_standard_log_roles_and_secondary_history_metadata_are_exact() -> None:
             "comment_stay_time",
             "is_profile_enter",
         }
+        # is_click and is_like are granted for strictly-past aggregation by the trusted
+        # controller. Every auxiliary field stays history_eligible and none is ever a candidate
+        # input, because that additionally requires the INFERENCE_INPUT role.
+        granted = {"is_click", "is_like"}
         for name in auxiliary_names:
             spec = field_spec(FieldKey(member, name))
             assert spec.role is FieldRole.TRAINING_AUXILIARY_TARGET
-            assert not spec.enabled
+            assert spec.enabled is (name in granted)
             assert spec.history_eligible
+            assert not spec.candidate_input_enabled
 
 
 def test_source_qualification_overrides_same_column_name() -> None:

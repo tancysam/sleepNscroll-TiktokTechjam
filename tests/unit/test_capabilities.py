@@ -196,7 +196,8 @@ def test_training_targets_reject_nontraining_phases_and_disabled_auxiliary() -> 
         with pytest.raises(CapabilityError, match="only for train or inner_train"):
             build_train_targets(phase, available)
 
-    auxiliary = FieldKey(STANDARD_TRAIN_MEMBER, "is_click")
+    # is_follow remains an ungranted auxiliary target, so requesting it must still fail closed.
+    auxiliary = FieldKey(STANDARD_TRAIN_MEMBER, "is_follow")
     with pytest.raises(CapabilityError, match="disabled"):
         build_train_targets(
             DataPhase.TRAIN,
