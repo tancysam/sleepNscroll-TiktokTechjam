@@ -2947,7 +2947,7 @@ def _research_rejection_lines(science: Mapping[str, object]) -> tuple[str, ...]:
         )
         if iteration == 0:
             raise ProductionFinalizationError("research rejection iteration must be positive")
-        _bounded_rejection_text(
+        candidate_id = _bounded_rejection_text(
             entry["candidate_id"],
             f"research rejection example {index} candidate",
             maximum=256,
@@ -2981,7 +2981,14 @@ def _research_rejection_lines(science: Mapping[str, object]) -> tuple[str, ...]:
             f"research rejection example {index} diagnostic",
             maximum=2_048,
         )
-        lines.append(f"Research rejection example ({role}): {fingerprint}; {diagnostic}")
+        # Iteration and candidate are part of the rendered line because two distinct rejections
+        # can otherwise collapse into byte-identical text -- the deterministic proposal-family
+        # circuit breaker refuses the same family with the same fingerprint and the same
+        # diagnostic on every attempt -- and `FinalReportContext` requires unique failure lines.
+        lines.append(
+            f"Research rejection example ({role}) at iteration {iteration} "
+            f"for {candidate_id}: {fingerprint}; {diagnostic}"
+        )
     if raw["examples_truncated"]:
         lines.append("Additional research rejection examples were retained in the durable ledger.")
     return tuple(lines)

@@ -1725,9 +1725,9 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
         f"forbidden_basename/baseline.py [{_digest('1')}] x2.",
         "Research rejection terminals: repair/materiality/declared_symbol_unchanged/"
         f"main [{_digest('2')}] x2.",
-        f"Research rejection example (root): {_digest('1')}; "
+        f"Research rejection example (root) at iteration 2 for candidate-02: {_digest('1')}; "
         "reserved candidate filename is forbidden: baseline.py",
-        f"Research rejection example (terminal): {_digest('2')}; "
+        f"Research rejection example (terminal) at iteration 2 for candidate-02: {_digest('2')}; "
         "declared material symbol did not change: main",
     )
     limitations = production._bundle_known_limitations(
@@ -2928,3 +2928,69 @@ def test_scientific_record_export_rejects_a_changed_environment_on_any_record(
             selection_config=_digest("3"),
             environment_digest=_digest("9"),
         )
+
+
+def test_repeated_family_blocks_render_as_distinct_failure_lines() -> None:
+    """Two identical circuit-breaker refusals must not collapse into one duplicated line.
+
+    Reproduces the `runs/cb-b-112152Z` finalization crash. The deterministic proposal-family
+    circuit breaker refuses the same family with the same stage, category, code, subject and
+    diagnostic every time it fires, so two blocked proposals differ only by iteration and
+    candidate. Those two fields were validated but not rendered, the two lines came out
+    byte-identical, and `FinalReportContext` rejected them with "failures_and_recoveries entries
+    must be unique" -- losing the whole campaign at finalization.
+    """
+
+    fingerprint = _digest("1")
+    diagnostic = "proposal family 'pairwise' is blocked by prior admission evidence"
+    science = {
+        "research_stage_counts": {"branches_rejected_pre_execution": 2},
+        "research_rejection_summary": {
+            "branches_rejected_pre_execution": 2,
+            "root_counts": [
+                {
+                    "fingerprint": fingerprint,
+                    "stage": "proposal_admission",
+                    "category": "novelty_policy",
+                    "code": "proposal_family_blocked",
+                    "subject": "pairwise",
+                    "count": 2,
+                }
+            ],
+            "terminal_counts": [],
+            "examples": [
+                {
+                    "scientific_iteration": iteration,
+                    "candidate_id": candidate,
+                    "proposal_family": "pairwise",
+                    "proposal_signature": None,
+                    "role": "root",
+                    "fingerprint": fingerprint,
+                    "diagnostic": diagnostic,
+                }
+                for iteration, candidate in (
+                    (1, "candidate-01-1f5ee2a5"),
+                    (2, "candidate-02-0f3a5300"),
+                )
+            ],
+            "counts_truncated": False,
+            "examples_truncated": False,
+        },
+    }
+
+    lines = production._research_rejection_lines(science)
+
+    example_lines = [item for item in lines if "example" in item]
+    assert len(example_lines) == 2
+    assert len(set(example_lines)) == 2, "identical blocks must still render distinctly"
+    assert "iteration 1" in example_lines[0] and "candidate-01-1f5ee2a5" in example_lines[0]
+    assert "iteration 2" in example_lines[1] and "candidate-02-0f3a5300" in example_lines[1]
+    # The whole point: these must survive the report's uniqueness invariant.
+    assert _unique_lines_ok(tuple(lines))
+
+
+def _unique_lines_ok(values: tuple[str, ...]) -> bool:
+    from kuairand_agent.finalization.report import _unique_lines
+
+    _unique_lines(values, "failures_and_recoveries")
+    return True
