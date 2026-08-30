@@ -375,23 +375,47 @@ Headline, stated conservatively:
 
 | | GAUC | nDCG@5 | primary |
 |---|---|---|---|
+| FM — official baseline (validation) | 0.6674 | 0.5357 | 0.6016 |
 | FM — official baseline (test) | 0.6610 | 0.5282 | 0.5946 |
 | Oracle ceiling (test) | 1.0000 | 0.7289 | 0.8645 |
-| Best completed run (validation) | 0.6671879292 | 0.5359807014 | 0.6015843153 |
+| Best agent-generated candidate (validation, matched outer seeds 0/1/2) | — | — | 0.6012030 |
 
-That run reproduces the official baseline to within noise — a **+0.000144** delta against this
-repository's official-FM confirmation-seed mean, roughly one fifth of one seed standard deviation.
-**We do not claim it as an improvement.** It demonstrates that the pipeline runs end to end
-without human intervention and emits an organizer-valid submission.
+**No generated candidate has beaten the baseline, and we do not claim an improvement.** Four live
+autonomous campaigns converged with zero manual interventions on 2026-08-30, and each selected the
+protected official-FM fallback rather than a generated candidate. The best generated result,
+`maki-overnight-09` `candidate-01`, scored 0.6012030 against an incumbent of 0.6014403 on the same
+matched outer seeds — a difference well inside the baseline's own 0.0008 seed-to-seed standard
+deviation, and therefore statistically indistinguishable from it.
+
+The shipped submission is the official FM at seed 4. Its 0.6020370722 is **not** an improvement
+over the 0.6015721679 five-seed mean: seed 4 is one of the five seeds in that mean, so comparing
+the two compares the baseline against itself.
+
+What the runs do demonstrate is that the loop runs end to end without human intervention,
+converges under the frozen rule, and emits an organizer-valid submission every time.
+
+GPU-hours consumed: **0.00**. Total provider spend across every run to date: **$20.84** for
+1,965,299 tokens over 92 calls.
 
 GPU-hours consumed: **0.00**. Every configuration is CPU-only.
 
 ## Limitations, and what we would do with more time
 
-**What is not demonstrated.** No live-provider autonomous campaign has completed; every finalized
-run records `provider = scripted` and zero API calls. Consequently we have not shown a
-validation-primary improvement above ε = 0.002, and hidden-test performance is unknown and
-unclaimed.
+**What is not demonstrated.** We have not shown a validation-primary improvement above ε = 0.002.
+Four live campaigns converged and every one selected the official-FM fallback, and the pairwise
+direction was separately swept to convergence over twelve configurations without beating the
+baseline in any of them. Hidden-test performance is unknown and unclaimed; only the organizers can
+measure it.
+
+**The current bottleneck is candidate execution, not modelling.** Across the three campaigns after
+identity-code features were added, only one of nine generated candidates executed at all. The rest
+raised before evaluation, in three recurring classes: within-user pair-sampling index arithmetic,
+mixing an `(N,)` accumulator with an `(N, rank)` one inside hand-written factorization-machine
+interaction maths, and a non-scalar checkpoint entry read by the candidate's own
+`training_diagnostics`. Implementation size predicted this almost perfectly: candidates at or under
+roughly 260 lines executed 3 for 3, while none of the eight written at over 580 lines executed.
+A crash inside `train_model` currently ends a branch outright, because the repair loop covers
+pre-execution static gates only — the clearest structural gap we know of in the loop.
 
 **The constraint-transmission asymmetry.** The most instructive defect we found was in our own
 design. `materialize.py` enforces 44 distinct constants on generated code — forbidden import

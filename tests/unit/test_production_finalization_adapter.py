@@ -2857,3 +2857,57 @@ def test_judge_ledger_exports_exact_lineage_commands_resources_and_portfolio_clo
     assert portfolio["advanced_wp7_branches_entered"] is False
     assert portfolio["advanced_wp7_disposition"].startswith("not_entered")
     assert first_csv.startswith(b"record_type,record_id,candidate_id,parent_id,tier,seed,status")
+
+
+def test_scientific_runs_are_attributed_to_the_candidate_that_produced_them() -> None:
+    """A promoted campaign holds runs from every candidate, not only the winner.
+
+    `maki-overnight-13` promoted a generated candidate for the first time and finalization died
+    with "scientific record source, config, or environment identity changed", because the export
+    required every retained run to carry the selected candidate's own source and config identity.
+    Three candidates produced three distinct source digests, so that check could never pass. The
+    same bug also labelled every exported row with the winner's id, misattributing other
+    candidates' runs in the judge ledger.
+    """
+
+    outcomes = [
+        {"candidate_id": "candidate-01-winner", "run_digests": [_digest("a"), _digest("b")]},
+        {"candidate_id": "candidate-02-other", "run_digests": [_digest("c")]},
+        {"candidate_id": "candidate-03-other", "run_digests": [_digest("d")]},
+    ]
+
+    owners, expected, selected = production._candidate_run_ownership(
+        outcomes, selected_candidate_id="candidate-01-winner"
+    )
+
+    assert expected == {_digest("a"), _digest("b"), _digest("c"), _digest("d")}
+    # Only the winner's own runs may be held to the selection's source and config identity.
+    assert selected == {_digest("a"), _digest("b")}
+    # Every run keeps its real owner, so the ledger cannot misattribute a losing candidate's run.
+    assert owners[_digest("c")] == "candidate-02-other"
+    assert owners[_digest("d")] == "candidate-03-other"
+    assert owners[_digest("a")] == "candidate-01-winner"
+
+
+def test_candidate_run_ownership_rejects_malformed_outcomes() -> None:
+    with pytest.raises(ProductionFinalizationError, match="candidate outcome is malformed"):
+        production._candidate_run_ownership(["not a mapping"], selected_candidate_id="x")
+
+    with pytest.raises(ProductionFinalizationError, match="run digests are malformed"):
+        production._candidate_run_ownership(
+            [{"candidate_id": "x", "run_digests": "not a list"}], selected_candidate_id="x"
+        )
+
+
+def test_candidate_run_ownership_handles_a_fallback_selection_owning_no_runs() -> None:
+    """Every previous campaign selected the fallback, which owns no scientific runs."""
+
+    outcomes = [{"candidate_id": "candidate-01", "run_digests": [_digest("a")]}]
+
+    owners, expected, selected = production._candidate_run_ownership(
+        outcomes, selected_candidate_id="official-fm-fallback-seed-4"
+    )
+
+    assert expected == {_digest("a")}
+    assert selected == set()
+    assert owners[_digest("a")] == "candidate-01"

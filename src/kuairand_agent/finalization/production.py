@@ -3950,6 +3950,39 @@ def _scientific_result_document(
     return cast(dict[str, object], decoded)
 
 
+def _candidate_run_ownership(
+    candidate_outcomes: Sequence[object],
+    *,
+    selected_candidate_id: str,
+) -> tuple[dict[str, str], set[str], set[str]]:
+    """Attribute every retained scientific run to the candidate that produced it.
+
+    A campaign evaluates several candidates, so the record repository holds runs from all of
+    them. Returns the run-to-candidate map, every expected run digest, and the subset belonging
+    to the selected candidate. Only that subset can be expected to carry the selection's own
+    source and config identity.
+    """
+
+    owners: dict[str, str] = {}
+    expected: set[str] = set()
+    selected: set[str] = set()
+    for index, candidate in enumerate(candidate_outcomes):
+        if not isinstance(candidate, Mapping):
+            raise ProductionFinalizationError("scientific candidate outcome is malformed")
+        run_digests = candidate.get("run_digests")
+        if not isinstance(run_digests, list):
+            raise ProductionFinalizationError("scientific candidate run digests are malformed")
+        owner = candidate.get("candidate_id")
+        for run_index, digest in enumerate(run_digests):
+            normalized = _digest(digest, f"candidate outcome {index} run {run_index}")
+            expected.add(normalized)
+            if isinstance(owner, str) and owner:
+                owners[normalized] = owner
+                if owner == selected_candidate_id:
+                    selected.add(normalized)
+    return owners, expected, selected
+
+
 def _scientific_record_rows(
     *,
     run_dir: Path,
@@ -3964,15 +3997,9 @@ def _scientific_record_rows(
     candidate_outcomes = scientific_result.get("candidate_outcomes")
     if not isinstance(candidate_outcomes, list):
         raise ProductionFinalizationError("scientific result candidate outcomes are missing")
-    expected_run_digests: set[str] = set()
-    for index, candidate in enumerate(candidate_outcomes):
-        if not isinstance(candidate, Mapping):
-            raise ProductionFinalizationError("scientific candidate outcome is malformed")
-        run_digests = candidate.get("run_digests")
-        if not isinstance(run_digests, list):
-            raise ProductionFinalizationError("scientific candidate run digests are malformed")
-        for run_index, digest in enumerate(run_digests):
-            expected_run_digests.add(_digest(digest, f"candidate outcome {index} run {run_index}"))
+    candidate_by_run, expected_run_digests, selected_run_digests = _candidate_run_ownership(
+        candidate_outcomes, selected_candidate_id=selection.candidate_id
+    )
 
     record_root = run_dir / "production" / "scientific-records"
     try:
@@ -4001,14 +4028,20 @@ def _scientific_record_rows(
             raise ProductionFinalizationError("scientific result has duplicate run evidence")
         observed_run_digests.add(record.evidence.digest)
         records_by_request[request_digest] = record
-        if (
+        # The environment is campaign-wide, so every retained run must share it.
+        if record.evidence.identities.environment_digest != request.environment_digest:
+            raise ProductionFinalizationError("scientific record environment identity changed")
+        # Source and config identity are per candidate. Only the selected candidate's own runs
+        # can match the selection, and requiring every run to match it made finalization
+        # impossible for any campaign that promoted a generated candidate after evaluating more
+        # than one.
+        if record.evidence.digest in selected_run_digests and (
             record.source_snapshot_digest != selection.source_snapshot.sha256
             or record.evidence.identities.source_digest != selection.source_digest
             or record.evidence.identities.config_digest != selection.config_digest
-            or record.evidence.identities.environment_digest != request.environment_digest
         ):
             raise ProductionFinalizationError(
-                "scientific record source, config, or environment identity changed"
+                "selected candidate scientific record source or config identity changed"
             )
         for reference in (
             record.checkpoint,
@@ -4032,7 +4065,9 @@ def _scientific_record_rows(
                 request_digest,
                 record.manifest() | {"digest": record.digest},
                 summary={
-                    "candidate_id": selection.candidate_id,
+                    "candidate_id": candidate_by_run.get(
+                        record.evidence.digest, selection.candidate_id
+                    ),
                     "tier": "bound_in_request_digest_and_execution_records",
                     "seed": next(
                         (

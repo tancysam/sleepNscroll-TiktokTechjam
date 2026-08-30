@@ -98,18 +98,96 @@ useful: *the currently frozen bounded acceptance configuration is severely under
 0.5537 and must not replace the baseline as-is.* The mechanism is implemented, deterministic, and
 scoreable; it is simply not trained, and it is not wired into the campaign portfolio.
 
-### 3.3 Live autonomous campaign
+#### Full-training sweep — `runs/pairwise-sweep.json`
 
-`PENDING` — see §6. No live-provider campaign has completed. Every finalized run in `runs/`
-records `provider = scripted` and zero API calls.
+The undertraining question above was then settled directly. The same pairwise FM was trained to
+convergence across a 12-cell grid over learning rate and epochs/sampled pairs, on the full
+1,141,112-row train split (1,130,240 GAUC-eligible rows) with the encoding verified identical to
+the qualified baseline.
 
-| Item | Value |
-|---|---|
-| Validation GAUC / nDCG@5 / primary | PENDING |
-| Absolute delta vs official baseline | PENDING |
-| Terminal reason (`CONVERGED` / cap / deadline) | PENDING |
-| Scientific iterations | PENDING |
-| Manual interventions | PENDING |
+| Learning rate | Epochs | Sampled pairs | primary | Delta vs local baseline |
+|---|---:|---:|---:|---:|
+| 0.001 | 10 | 10,000,000 | **0.6015003** | **−0.0000719** |
+| 0.001 | 5 | 5,000,000 | 0.5989000 | −0.0026722 |
+| 0.001 | 20 | 20,000,000 | 0.5974734 | −0.0040988 |
+| 0.001 | 40 | 40,000,000 | 0.5849371 | −0.0166351 |
+| 0.01 | 5 | 5,000,000 | 0.5805469 | −0.0210253 |
+| 0.01 | 10 | 10,000,000 | 0.5684834 | −0.0330888 |
+| 0.03 | 5 | 5,000,000 | 0.5653120 | −0.0362602 |
+| 0.01 | 20 | 20,000,000 | 0.5613660 | −0.0402062 |
+| 0.03 | 10 | 10,000,000 | 0.5598870 | −0.0416852 |
+| 0.03 | 20 | 20,000,000 | 0.5590336 | −0.0425386 |
+| 0.01 | 40 | 40,000,000 | 0.5576836 | −0.0438886 |
+| 0.03 | 40 | 40,000,000 | 0.5573751 | −0.0441971 |
+
+Best configuration: GAUC 0.6676200628, nDCG@5 0.5353804827, primary **0.6015002728**, against a
+local baseline primary of **0.6015721679**.
+
+**This is a marginal regression, not a win, and it must not be reported as one.** Four caveats
+travel with that −0.0000719, and each of them makes the true expected result worse:
+
+1. **Every one of the twelve cells is below the baseline.** The headline number is the best cell,
+   not a typical one.
+2. **Best-of-12 was selected on the same split it is reported on**, so the figure is optimistically
+   biased by selection.
+3. **One seed (seed 0), compared against a five-seed mean.** FM seed-to-seed standard deviation on
+   this benchmark is 0.0008, which is more than eleven times the size of the delta. The two results
+   are statistically indistinguishable.
+4. **This is a manual experiment.** `runs/pairwise-sweep.json` records
+   `is_autonomous_agent_result: false`, and `candidates/pairwise_fm.py` is imported by nothing under
+   `src/`. It measures the direction; it does not demonstrate agent behaviour.
+
+The more interesting result is the shape of the grid rather than its best cell. The mean pairwise
+training loss fell in every cell — from 0.6873 to 0.5386 in the best one, and to 0.3898 by 40
+epochs — while the ranking metric *peaked at 10 epochs and then degraded monotonically*. Training
+the surrogate harder makes the scored metric worse. On this dataset the pairwise objective is a
+poorly aligned proxy for GAUC and nDCG@5 beyond a narrow band, which is a substantive qualification
+of the organizers' stated expectation that the pointwise/ranking objective mismatch is the single
+largest available opportunity.
+
+### 3.3 Live autonomous campaigns
+
+Four live-provider campaigns completed end to end on 2026-08-30, all against
+`openai/gpt-5.6-sol` with a configured failover slot. Each terminated on `converged` under the
+frozen rule (epsilon 0.002, patience 3) with **zero manual interventions**, and each published a
+verified submission bundle.
+
+| Run | Iterations | Candidates that executed | Reached outer validation | Selected | Terminal reason | Cost |
+|---|---:|---:|---:|---|---|---:|
+| `maki-overnight-09` | 3 | **3** | 2 | `official-fm-fallback-seed-4` | converged | $0.68 |
+| `maki-overnight-10` | 3 | 1 | 0 | `official-fm-fallback-seed-4` | converged | $1.82 |
+| `maki-overnight-11` | 3 | 0 | 0 | `official-fm-fallback-seed-4` | converged | $2.31 |
+| `maki-overnight-12` | 3 | 0 | 0 | `official-fm-fallback-seed-4` | converged | $1.93 |
+
+**No generated candidate has beaten the baseline, and the fallback shipped in every run.** All
+four published a byte-identical submission, SHA-256 `e12746ae…`, so the submitted artifact never
+regressed across the series.
+
+The best generated result remains run 09, measured on matched outer seeds 0/1/2:
+
+| Model | Outer primary (mean of seeds 0, 1, 2) | Delta vs incumbent |
+|---|---:|---:|
+| official FM incumbent (`fallback_outer_mean`) | 0.6014403 | — |
+| `candidate-01` pairwise softplus | 0.6012030 | −0.0002372 |
+| `candidate-03` metric-matched pairwise FM | 0.6011940 | −0.0002462 |
+
+Both sit well inside the baseline's own 0.0008 seed-to-seed standard deviation and are therefore
+statistically indistinguishable from it, not improvements and not meaningful regressions.
+
+**Execution rate, not modelling ambition, was the binding constraint.** Candidate implementations
+at or under roughly 260 lines executed 3 for 3 in run 09; of the eight written at over 580 lines in
+runs 10 to 12, none executed. Nine post-baseline candidates failed in three classes: within-user
+pair-sampling index arithmetic (3), mixing an `(N,)` accumulator with an `(N, rank)` one inside
+hand-written factorization-machine interaction maths (3), and a non-scalar checkpoint entry read by
+the candidate's own `training_diagnostics` (2). One executed cleanly. All three classes are
+recorded per-iteration in each run's `production/candidate-control/*/stderr.log`.
+
+A separate observation, seen three times across runs 09 and 10: a generated candidate produced
+predictions that were *rank-identical* to the official FM within every scored user slate, giving
+bit-identical GAUC and nDCG@5. Run 10's `candidate-03` did this with 59,816 distinct prediction
+values across 61,315 rows, so it is not a degenerate or constant-score artifact. With a median
+slate of four impressions and only 63.7% of users GAUC-eligible, distinct models can and do induce
+the same within-user ordering.
 
 ### 3.4 Independent qualification on a second platform
 
@@ -151,11 +229,28 @@ full six-launch qualification plus clean replay completed in **170.76 s**.
 
 ### Token consumption
 
-| Run | Input | Output | Total | Cost |
-|---|---|---|---|---|
-| Scripted campaigns (all) | 0 | 0 | **0** | $0.00 |
-| Live smoke probe (`configs/live-smoke.toml`) | PENDING | PENDING | PENDING | PENDING |
-| Live autonomous campaign | PENDING | PENDING | PENDING | PENDING |
+Every provider call ever made by this project, reconstructed from the per-attempt journals in
+each run's `production/provider-attempt-journal/`. Reasoning tokens are billed as output tokens.
+
+| Run | Calls | Input | Output | Total | Cost |
+|---|---:|---:|---:|---:|---:|
+| Scripted campaigns (all) | 0 | 0 | 0 | 0 | $0.00 |
+| `maki-overnight-01` | 8 | 83,030 | 138,653 | 221,683 | $3.05 |
+| `maki-overnight-03` | 4 | 33,964 | 42,910 | 76,874 | $0.93 |
+| `maki-overnight-04` | 5 | 43,685 | 62,224 | 105,909 | $1.35 |
+| `maki-overnight-05` | 15 | 196,363 | 254,015 | 450,378 | $5.58 |
+| `maki-overnight-06` | 10 | 151,194 | 2,956 | 154,150 | $0.48 |
+| `maki-overnight-07` | 9 | 80,556 | 128,136 | 208,692 | $2.70 |
+| `maki-overnight-09` | 9 | 97,238 | 17,219 | 114,457 | $0.68 |
+| `maki-overnight-10` | 9 | 116,097 | 70,792 | 186,889 | $1.82 |
+| `maki-overnight-11` | 11 | 149,934 | 88,222 | 238,156 | $2.31 |
+| `maki-overnight-12` | 10 | 135,560 | 72,551 | 208,111 | $1.93 |
+| **Total** | **92** | **1,087,621** | **877,678** | **1,965,299** | **$20.84** |
+
+Runs 02 and 08 made calls that returned no usage and are counted at zero. Runs 01 to 08 predate
+the survivability fixes and produced only truncated candidate stubs; their spend is included
+because the Feasibility criterion asks for total consumption to reach the result, not the cost of
+the final run alone.
 
 The provider adapter records input, cached-input, output, reasoning, and total tokens per call,
 plus estimated cost from the frozen pricing block in the config, provider wall time, transcript
@@ -163,9 +258,9 @@ count, and bounded unaccounted attempts. Pricing is pinned in configuration
 (`[research.openai.pricing]`) rather than inferred at runtime, so cost figures are reproducible
 rather than dependent on a rate card that may change.
 
-**Accounting rule we hold ourselves to:** live smoke-probe tokens count toward the total. The
-probe is real spend that preceded the converged result, and the Feasibility criterion asks for
-total consumption to reach that result — not the cost of the final run alone.
+**Accounting rule we hold ourselves to:** every live call counts toward the total, including
+probes and campaigns that failed before producing a candidate. GPU hours remain 0.00 throughout;
+all training is CPU-only by design.
 
 ### Manual interventions
 
@@ -177,7 +272,10 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | Run | Interventions | Detail |
 |---|---|---|
 | `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
-| Live autonomous campaign | PENDING | |
+| `maki-overnight-09` | 0 | Converged with no human action after launch. |
+| `maki-overnight-10` | 0 | Converged with no human action after launch. |
+| `maki-overnight-11` | 0 | Converged with no human action after launch. |
+| `maki-overnight-12` | 0 | Converged with no human action after launch. |
 
 ## 5. Evaluation integrity
 
@@ -207,16 +305,21 @@ the mechanisms are testable rather than promised.
   earlier feature; changing the current outcome must not alter the current feature vector;
   permuting rows within an equal-timestamp bucket must not alter features.
 
-## 6. What is not yet demonstrated
+## 6. What is not demonstrated
 
 Stated plainly, because the gap matters more than the architecture:
 
-1. **No live autonomous campaign has completed.** Every finalized run records
-   `provider = scripted`, `API calls = 0`. The typed research seam is implemented, tested against
-   a fake transport, and exercised by integration tests, but has not driven a scored campaign.
-2. **No improvement over the baseline has been demonstrated.** The best completed run reproduces
-   the baseline to within noise (§3.1). We have not shown a validation-primary delta above
-   ε = 0.002.
+1. **No improvement over the baseline has been demonstrated.** Four live campaigns converged and
+   every one selected the official-FM fallback. The best generated candidate reached outer primary
+   0.6012030 against an incumbent of 0.6014403, inside the baseline's own 0.0008 seed-to-seed
+   standard deviation. We have not shown a validation-primary delta above ε = 0.002, and the
+   pairwise direction was additionally swept to convergence over twelve configurations without
+   beating the baseline in any of them (§3.2).
+2. **Candidate execution, not modelling, is the current bottleneck.** Across runs 10 to 12 only one
+   of nine generated candidates executed at all; the rest raised before evaluation. Three failure
+   classes are catalogued in §3.3. A crash inside `train_model` currently ends a branch outright:
+   the repair loop covers pre-execution static gates only, so runtime defects get no fix attempt.
+   That is the clearest known structural gap in the loop.
 3. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
 
 ### 6.4 Bit-exact replay is platform-bound
