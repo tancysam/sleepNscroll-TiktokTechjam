@@ -3769,11 +3769,22 @@ def run_provider_free_campaign(
             candidate_id = SCRIPTED_CANDIDATE_ID
         else:
             with _open_lineage_ledger(lineage_path) as prior_lineage_ledger:
+                # Controller-attributable failures stay scoped to this exact source tree, so a
+                # corrective fix starts them clean.
                 prior_lineage = prior_lineage_ledger.summary(
                     benchmark_digest=request.benchmark_digest,
                     starter_digest=request.starter_manifest_digest,
                     source_digest=request.source_digest,
                 )
+                # Measured outcomes are scoped by evaluation identity instead, so what a proposal
+                # family actually scored survives our own commits. Reading these through the
+                # source scope was what made cross-run memory reset on every code change.
+                durable_admissions = prior_lineage_ledger.admissions_for_evaluation(
+                    benchmark_digest=request.benchmark_digest,
+                    evaluation_digest=evaluation_scope,
+                )
+            prior_events = {event.event_id: event for event in prior_lineage.recent_events}
+            prior_events.update({event.event_id: event for event in durable_admissions})
             prior_lineage_advisory_records = tuple(
                 AggregateRecord(
                     name=f"prior_campaign_lesson_{event.event_id:04d}",
@@ -3815,7 +3826,7 @@ def run_provider_free_campaign(
                         if value is not None
                     },
                 )
-                for event in prior_lineage.recent_events
+                for event in sorted(prior_events.values(), key=lambda item: item.event_id)
             )
 
             def remaining_research_seconds() -> float:

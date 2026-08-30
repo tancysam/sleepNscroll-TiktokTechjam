@@ -286,3 +286,55 @@ def test_metric_evidence_survives_a_controller_edit_but_not_a_feature_change(
         )
     finally:
         ledger.close()
+
+
+def test_admissions_are_readable_after_a_source_change_but_rejections_are_not(
+    tmp_path: Path,
+) -> None:
+    """The read path, not just the write path, must use the durable scope.
+
+    Storing metric evidence under an evaluation scope achieves nothing if the runtime still reads
+    it through the source scope: the write half alone leaves memory resetting on every commit,
+    which is exactly the half-finished state this test exists to prevent regressing to.
+    """
+
+    ledger = ResearchLineageLedger.create(tmp_path / "lineage.sqlite3")
+    edited_source = "9" * 64
+    try:
+        ledger.record_admission(
+            campaign_id="run-before",
+            benchmark_digest=_BENCHMARK,
+            starter_digest=_STARTER,
+            source_digest=_SOURCE,
+            evaluation_digest=_EVALUATION,
+            candidate_id="cand-pairwise",
+            proposal_family="pairwise",
+            proposal_signature=None,
+            inner_fold_a=LineageFoldMetrics(gauc=0.66, ndcg_at_5=0.55, primary=0.6071),
+            inner_fold_b=LineageFoldMetrics(gauc=0.65, ndcg_at_5=0.49, primary=0.5754),
+            parent_fold_a_primary=0.6071,
+            parent_fold_b_primary=0.5754,
+            promoted=False,
+        )
+        _record_rejection(ledger, campaign_id="run-before", candidate_id="cand-broken")
+
+        # After a controller edit the source scope is empty -- both kinds of evidence vanish from
+        # it, which is what used to make the agent re-derive a rejected family every commit.
+        after_edit = ledger.summary(
+            benchmark_digest=_BENCHMARK,
+            starter_digest=_STARTER,
+            source_digest=edited_source,
+        )
+        assert after_edit.recent_events == ()
+
+        # The measured outcome is still there, because what it means did not change.
+        durable = ledger.admissions_for_evaluation(
+            benchmark_digest=_BENCHMARK, evaluation_digest=_EVALUATION
+        )
+        assert [item.candidate_id for item in durable] == ["cand-pairwise"]
+        assert durable[0].promoted is False
+        assert durable[0].inner_fold_a is not None
+        # And it is exactly the trigger the deterministic family block reads.
+        assert durable[0].proposal_family == "pairwise"
+    finally:
+        ledger.close()

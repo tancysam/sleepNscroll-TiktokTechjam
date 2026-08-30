@@ -37,6 +37,15 @@ MIN_OUTER_QUERIES_REMAINING=${5:-0}
 # search. Each attempt here is an independent random restart and its result should be read as one
 # of N, not as a single measurement.
 #
+# By default the loop stops as soon as a campaign selects a generated candidate, because the
+# interesting event has happened and further attempts only add looks at public validation. Set
+# CONTINUE_ON_SUCCESS=1 to run every attempt regardless, which is what you want when the question
+# is "does this behave consistently across campaigns" rather than "did it work once".
+#
+# Use that mode for diagnosis, not for producing a headline. Running N campaigns and reporting the
+# best of them is selection over N looks at public validation and would inflate the reported number
+# while degrading the hidden-test score it is supposed to predict.
+#
 # A campaign that exits nonzero (a real failure, not a converged baseline fallback) stops the loop
 # immediately for human review, rather than burning further attempts against a live bug.
 
@@ -108,9 +117,13 @@ while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
   echo "auto-retry: attempt $attempt completed -- selected_status=$selected_status" >&2
 
   if [ "$selected_status" != "baseline_reproduced" ]; then
-    echo "auto-retry: a generated candidate ('$selected_status') was selected over the baseline in $run_dir -- stopping (success)" >&2
-    exit 0
+    if [ "${CONTINUE_ON_SUCCESS:-0}" = "1" ]; then
+      echo "auto-retry: a generated candidate ('$selected_status') was selected in $run_dir -- continuing, because CONTINUE_ON_SUCCESS=1" >&2
+    else
+      echo "auto-retry: a generated candidate ('$selected_status') was selected over the baseline in $run_dir -- stopping (success)" >&2
+      exit 0
+    fi
   fi
 done
 
-echo "auto-retry: finished $attempt attempt(s) with no generated candidate beating the baseline; see $LOG_FILE" >&2
+echo "auto-retry: finished $attempt attempt(s); see $LOG_FILE for every attempt's selected_status" >&2
