@@ -252,7 +252,7 @@ def test_gateway_payload_uses_gateway_reasoning_contract(
         # implement calls past the configured timeout, so the effort is sent as an explicit
         # budget instead, which the host honours exactly.
         assert "reasoning" not in payload
-        assert payload["thinking"] == {"type": "disabled"}
+        assert payload["thinking"] == {"type": "enabled"}
     else:
         assert payload["reasoning"] == {"effort": "low", "exclude": True}
         assert "thinking" not in payload

@@ -64,7 +64,10 @@ _GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai"})
 # The switch is therefore treated as binary here.  Efforts at or below ``low`` disable
 # thinking outright; higher efforts enable it and accept that the budget is not enforced.
 _THINKING_SWITCH_HOSTS: Final = frozenset({"api.tokenrouter.com"})
-_THINKING_DISABLED_EFFORTS: Final = frozenset({"none", "minimal", "low"})
+# Measured: with thinking disabled this model stops writing code and returns 18-character
+# stubs -- every file identical, and "import numpy as np" written into config.json.  Only an
+# explicit request for no reasoning disables it; the cost is paid in output budget instead.
+_THINKING_DISABLED_EFFORTS: Final = frozenset({"none", "minimal"})
 _SECRET_PATTERN: Final = re.compile(r"(?i)(?:bearer\s+|sk-(?:proj-)?)[A-Za-z0-9_.-]{8,}")
 
 
