@@ -838,6 +838,8 @@ def require_material_executable_change(
             else {}
         )
         for name, subtree in child_symbols.items():
+            if name in _FROZEN_PROTOCOL_SYMBOLS:
+                continue
             if parent_symbols.get(name) != subtree:
                 qualified = f"{path}:{name}"
                 if name in changed_by_name:

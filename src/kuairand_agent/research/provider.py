@@ -825,7 +825,6 @@ class OpenAIChatCompletionsModel:
                 "allow_fallbacks": True,
                 "require_parameters": True,
             }
->>>>>>> origin/codex/candidate-stable
         return payload
 
     def _record(
