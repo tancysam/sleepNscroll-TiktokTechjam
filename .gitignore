@@ -36,3 +36,6 @@ KuaiRand-Pure.tar.gz
 .vscode/
 *.swp
 logs/
+
+# Generated ensemble submission (regenerate with build_ensemble_submission.py)
+ensemble-submission/
