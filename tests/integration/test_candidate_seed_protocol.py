@@ -237,3 +237,96 @@ def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(
     assert (first_prediction / "prediction_result.json").read_bytes() == (
         second_prediction / "prediction_result.json"
     ).read_bytes()
+
+
+def test_failing_training_diagnostics_does_not_discard_a_successful_training_run(
+    tmp_path: Path,
+) -> None:
+    """Diagnostics are informational, so they must never destroy real evaluation evidence.
+
+    In overnight-11 two of three candidates trained successfully and were then thrown away by an
+    exception inside their own ``training_diagnostics``: one stored a non scalar under a scalar
+    key, the other rejected its own checkpoint. Nothing downstream scores diagnostics.
+    """
+
+    work = tmp_path / "candidate"
+    work.mkdir()
+    (work / "config.json").write_bytes((SEED / "config.json").read_bytes())
+    (work / "candidate.py").write_bytes((SEED / "candidate.py").read_bytes())
+    model = (SEED / "model_impl.py").read_text(encoding="utf-8")
+    # Reproduce the overnight-11 failure shape: training works, diagnostics raise.
+    model += (
+        "\n\ndef training_diagnostics(config, checkpoint):\n"
+        "    raise TypeError('only 0-dimensional arrays can be converted to Python scalars')\n"
+    )
+    (work / "model_impl.py").write_text(model, encoding="utf-8")
+
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    _write_npy(
+        inputs / "train-features.npy",
+        np.array([[-2.0, 0.0], [2.0, 0.0], [-1.0, 1.0], [1.0, 1.0]], dtype="<f8"),
+    )
+    _write_npy(inputs / "train-targets.npy", np.array([0.0, 1.0, 0.0, 1.0], dtype="<f8"))
+    _write_npy(inputs / "train-user-groups.npy", np.array([10, 10, 20, 20], dtype="<i8"))
+    config_digest = _sha256(work / "config.json")
+    request = tmp_path / "train-request.json"
+    _write_request(
+        request,
+        approved=(
+            ("features", "inputs/train-features.npy"),
+            ("targets", "inputs/train-targets.npy"),
+            ("user_groups", "inputs/train-user-groups.npy"),
+        ),
+        split_role="train",
+        request={
+            "protocol_schema_version": 1,
+            "source_digest": SOURCE,
+            "config_digest": config_digest,
+            "data_digest": TRAIN_DATA,
+            "split_token": "train-seed-fold",
+            "seed": 7,
+            "features_handle": "features",
+            "targets_handle": "targets",
+            "user_groups_handle": "user_groups",
+        },
+    )
+
+    output = tmp_path / "train-out"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(work / "candidate.py"),
+            "train",
+            "--request",
+            str(request),
+            "--output",
+            str(output),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    validated = validate_train_outputs(
+        output,
+        TrainExpectation(
+            source_digest=SOURCE,
+            config_digest=config_digest,
+            data_digest=TRAIN_DATA,
+            split_token="train-seed-fold",
+            checkpoint_path="checkpoint/model.txt",
+        ),
+    )
+    assert validated.checkpoint_path.exists()
+    result = json.loads((output / "candidate_result.json").read_text(encoding="utf-8"))
+    diagnostics = result["diagnostics"]
+    # The failure is reported in schema, and the model authored keys are absent.
+    assert diagnostics["diagnostics_failed"] == 1.0
+    assert "epochs" not in diagnostics
+    assert "final_objective" not in diagnostics
+    # Controller owned shape facts still describe the run that did happen.
+    assert diagnostics["row_count"] == 4

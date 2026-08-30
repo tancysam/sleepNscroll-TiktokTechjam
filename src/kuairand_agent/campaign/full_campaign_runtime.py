@@ -1312,6 +1312,12 @@ def _reflect(
     if candidate_result is not None and candidate_result.runs:
         outer = [item for item in candidate_result.runs if item.metrics is not None]
         run = outer[-1] if outer else None
+    # A branch that produced no run has no metrics.  Substituting the fallback's numbers here
+    # told the model its crashed candidate had tied the baseline, and overnight-11's reflection
+    # duly concluded a candidate that never executed was "indistinguishable from the official FM
+    # reference".  Report zeros with the failure flag instead, so the summary cannot be read as a
+    # measurement.
+    execution_failed = run is None or run.metrics is None
     metrics = (
         _metrics(result.fallback.outer_by_seed[0].metrics)
         if run is None or run.metrics is None
@@ -1321,9 +1327,10 @@ def _reflect(
     summary = ExperimentResultSummary(
         tier="outer" if promoted else "inner",
         status="promoted" if promoted else "rejected",
-        gauc=metrics.gauc,
-        ndcg_at_5=metrics.ndcg_at_5,
-        primary=metrics.primary,
+        gauc=0.0 if execution_failed else metrics.gauc,
+        ndcg_at_5=0.0 if execution_failed else metrics.ndcg_at_5,
+        primary=0.0 if execution_failed else metrics.primary,
+        execution_failed=execution_failed,
         runtime_seconds=0.0 if run is None else run.resources.wall_seconds,
         peak_memory_mb=(0.0 if run is None else run.resources.peak_rss_bytes / float(1024**2)),
     )

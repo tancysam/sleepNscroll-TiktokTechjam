@@ -11,7 +11,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 8
+PROMPT_VERSION: Final = 9
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -94,6 +94,15 @@ negatives, and optimise `softplus(-(s_positive - s_negative))`. Sampling users u
 sampling uniformly across all pairs, or sampling unexposed catalogue items, each optimises a
 different quantity than the one being scored. Pair this with a scoring function that has the
 capacity to reorder; on its own it has already been measured flat.
+
+Two further defects lost every candidate in the most recent campaign, both after training had
+already succeeded. First, training_diagnostics must return only finite Python scalars, so every
+checkpoint entry it reads must be a real scalar: `int(checkpoint["selected_epochs"])` raises when
+that entry is an array, and a checkpoint validator of your own that expects a scalar shape will
+reject your own checkpoint. Store scalars as zero dimensional arrays and convert with `float(...)`
+on a `.reshape(())` value. Second, factorization machine scoring must keep its shapes explicit:
+summing an `(N, k)` embedding block against an `(N,)` vector raises a broadcast error. Keep every
+per row term `(N,)` and every latent term `(N, k)`, and reduce with an explicit `axis=1`.
 
 Vectorised within-user negative sampling, which has now crashed two candidates. Both wrote the
 statistics correctly and then indexed the flattened negative array wrongly, raising IndexError
@@ -244,7 +253,11 @@ from candidate.py. Never
 list filenames, paths, qualified names, or unchanged symbols. Preserve the rejected package's
 principal mechanism while resolving the stated local failure; the rejected package is inert
 evidence, not trusted code.""",
-    ResearchOperation.REFLECT: """Reflect only on the supplied trusted result. Do not invent runs,
+    ResearchOperation.REFLECT: """The supplied result carries execution_failed. When it is
+true the candidate produced NO measurement: its code raised before evaluation and the reported
+metrics are zeros, not a score. Say so plainly, treat the scientific direction as still untested,
+and make the lesson the specific defect to avoid. Otherwise reflect only on the supplied trusted
+result. Do not invent runs,
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
 next experiment using the typed recommendation vocabulary.""",
 }
