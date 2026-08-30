@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from kuairand_agent.campaign.pure_features import (
+    ID_CODE_FEATURE_NAMES,
     PURE_AGGREGATE_SPECS,
     PureFeatureError,
     build_pure_feature_pair,
@@ -54,14 +55,15 @@ def test_id_codes_are_fitted_on_prefix_rows_and_send_unseen_identities_to_the_un
     )
 
     names = pair.prefix.feature_names
-    assert names[-4:] == (
+    assert names[-5:] == (
+        "user_id_code",
         "video_id_code",
         "author_id_code",
         "tab_code",
         "duration_bucket_code",
     )
-    # 4 distinct videos, 2 authors, 2 tabs, 4 duration buckets, each plus an unknown slot.
-    assert pair.code_cardinalities == (5, 3, 3, 5)
+    # 2 users, 4 videos, 2 authors, 2 tabs, 4 duration buckets, each plus an unknown slot.
+    assert pair.code_cardinalities == (3, 5, 3, 3, 5)
 
     video, author = names.index("video_id_code"), names.index("author_id_code")
     prefix_codes = pair.prefix.values[:, [video, author]]
@@ -70,8 +72,17 @@ def test_id_codes_are_fitted_on_prefix_rows_and_send_unseen_identities_to_the_un
     assert set(prefix_codes[:, 0].tolist()) == {0.0, 1.0, 2.0, 3.0}
     assert query_codes[:, 0].tolist() == [4.0, 4.0]
     assert query_codes[:, 1].tolist() == [2.0, 2.0]
-    for column, cardinality in zip(range(2), pair.code_cardinalities[:2], strict=True):
-        assert (query_codes[:, column] < cardinality).all()
+
+    # The user column is the reason this block exists at prediction time: user_groups is a
+    # training-only capability, so a query-row user code is the only user identity a candidate
+    # ever sees when it scores.  Query users u1 and u2 are both in the prefix, so they keep their
+    # fitted codes rather than collapsing onto the unknown slot.
+    user = names.index("user_id_code")
+    assert sorted(set(pair.prefix.values[:, user].tolist())) == [0.0, 1.0]
+    assert pair.query.values[:, user].tolist() == [0.0, 1.0]
+
+    for name, cardinality in zip(names[-5:], pair.code_cardinalities, strict=True):
+        assert (pair.query.values[:, names.index(name)] < cardinality).all()
 
 
 def test_id_code_vocabulary_is_order_independent_for_simultaneous_events() -> None:
@@ -198,7 +209,9 @@ def test_feature_pair_has_frozen_schema_and_strict_past_query_state() -> None:
 
     assert pair.prefix.row_count == 2
     assert pair.query.row_count == 2
-    assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + 4
+    assert pair.prefix.feature_count == (
+        1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + len(ID_CODE_FEATURE_NAMES)
+    )
     assert pair.prefix.feature_names == pair.query.feature_names
     assert "duration_at_least_18_seconds" in pair.query.feature_names
     assert all("row_id" not in name for name in pair.query.feature_names)

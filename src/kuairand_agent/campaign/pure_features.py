@@ -56,10 +56,21 @@ _STATIC_FEATURE_NAMES: Final = (
 )
 # Train-fitted categorical codes.  The aggregate columns above summarize an identity's history;
 # these carry the identity itself, so a candidate can learn a per-identity embedding the way the
-# organizer FM does instead of only reweighting summaries.  ``user_id`` is deliberately absent:
-# candidates already receive user identity through the trusted user_groups vector, and a
-# user-constant term cannot reorder a within-user ranking.
+# organizer FM does instead of only reweighting summaries.
+#
+# ``user_id`` leads the block.  It was previously omitted on the grounds that a user-constant term
+# cannot reorder a within-user ranking, and that candidates already hold user identity through the
+# trusted user_groups vector.  Both premises were too narrow.  The organizers measured that purely
+# user-side *first-order* terms contribute exactly zero; a user *embedding* is a second-order term,
+# and the user-by-video and user-by-author crosses it enables are where the organizer FM gets its
+# ordering power.  And user_groups is a training-only capability: the prediction request carries a
+# feature matrix and nothing else (candidate_api/runtime_contract.py prediction_request_fields), so
+# without this column a candidate cannot evaluate any user-conditioned term at prediction time.
+#
+# The four original codes remain the trailing four columns, so code that slices a fixed trailing
+# width is unaffected by this addition.
 ID_CODE_FEATURE_NAMES: Final = (
+    "user_id_code",
     "video_id_code",
     "author_id_code",
     "tab_code",
@@ -230,6 +241,7 @@ def _code_source_columns(inputs: CanonicalInputs) -> tuple[tuple[str, ...], ...]
     """Return the categorical source column for each ID-code feature, in declared order."""
 
     return (
+        tuple(str(value) for value in inputs.user_id),
         tuple(str(value) for value in inputs.video_id),
         tuple(str(value) for value in inputs.author_id),
         tuple(str(value) for value in inputs.tab),
