@@ -39,3 +39,10 @@ logs/
 
 # Generated ensemble submission (regenerate with build_ensemble_submission.py)
 ensemble-submission/
+
+# Local planning and handoff notes, kept out of the public repo
+NEXT-SESSION.md
+PROJECT-CONTEXT.md
+plan.md
+agent-mvp-brief.md
+agent-plan (1).html
