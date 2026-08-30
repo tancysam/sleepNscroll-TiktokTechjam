@@ -400,7 +400,8 @@ GPU-hours consumed: **0.00**. Every configuration is CPU-only.
 above ε = 0.002. Eight completed live campaigns all terminated at `baseline_reproduced`; the one
 promotion we observed was +0.00052 on Fold A, an order of magnitude too small to matter.
 Hidden-test performance is unknown and unclaimed. The search also did not meaningfully diversify —
-17 of 22 admissions across 8 campaigns were the same pairwise family — which is the subject of
+17 of 24 admissions across 8 campaigns were the same pairwise family, and deterministically
+blocking that family did not produce better proposals — which is the subject of
 [`docs/agent-memory-experiment.md`](docs/agent-memory-experiment.md).
 
 **The constraint-transmission asymmetry.** The most instructive defect we found was in our own

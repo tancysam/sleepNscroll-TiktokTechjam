@@ -2326,6 +2326,15 @@ def _run_autonomous_followups(
     proposal_breadth = max(1, request.config.research.proposal_breadth)
     round_attempt_count = 0
     pending_admitted_records: list[AggregateRecord] = []
+    # Follow-up rejections accumulate the same counters the initial-admission loop keeps. Without
+    # them every rejection record reported `attempt_count=1, proposal_family_blocked=False`, so the
+    # model was told each repeat was its first attempt, `_proposal_family_is_blocked` could never
+    # see an in-campaign block, and nothing ever stopped the loop: one observed campaign spent
+    # 349,550 tokens re-proposing a family the controller refused fourteen times.
+    followup_root_failures: dict[str, int] = {}
+    followup_family_attempts: dict[str, int] = {}
+    previous_root_fingerprint: str | None = None
+    consecutive_root_failures = 0
 
     while True:
         if result.convergence.should_stop:
@@ -2375,13 +2384,30 @@ def _run_autonomous_followups(
             )
         except LiveResearchBranchRejected as rejection:
             record_rejection_evidence(rejection)
+            root_fingerprint = rejection.root_failure.fingerprint
+            root_failure_total = followup_root_failures.get(root_fingerprint, 0) + 1
+            followup_root_failures[root_fingerprint] = root_failure_total
+            if root_fingerprint == previous_root_fingerprint:
+                consecutive_root_failures += 1
+            else:
+                previous_root_fingerprint = root_fingerprint
+                consecutive_root_failures = 1
+            family = rejection.proposal_family
+            family_attempt_count = followup_family_attempts.get(family, 0) + 1
+            followup_family_attempts[family] = family_attempt_count
             rejected_record = _rejected_lineage_record(
                 rejection,
                 scientific_iteration=iteration,
+                root_failure_total_count=root_failure_total,
+                root_failure_consecutive_count=consecutive_root_failures,
+                proposal_family_attempt_count=family_attempt_count,
+                proposal_family_blocked=family_attempt_count >= 2,
             )
             records.append(rejected_record)
             rejected_records.append(rejected_record)
             terminal = CampaignStopReason.CANDIDATES_EXHAUSTED
+            if root_failure_total >= 3:
+                break
             continue
         candidate_id = lineage.candidate_id
         parent_incumbent = result.incumbent
@@ -3709,9 +3735,7 @@ def run_provider_free_campaign(
                                 None if event.inner_fold_a is None else event.inner_fold_a.gauc
                             ),
                             "inner_fold_a_ndcg_at_5": (
-                                None
-                                if event.inner_fold_a is None
-                                else event.inner_fold_a.ndcg_at_5
+                                None if event.inner_fold_a is None else event.inner_fold_a.ndcg_at_5
                             ),
                             "inner_fold_a_primary": (
                                 None if event.inner_fold_a is None else event.inner_fold_a.primary
@@ -3720,9 +3744,7 @@ def run_provider_free_campaign(
                                 None if event.inner_fold_b is None else event.inner_fold_b.gauc
                             ),
                             "inner_fold_b_ndcg_at_5": (
-                                None
-                                if event.inner_fold_b is None
-                                else event.inner_fold_b.ndcg_at_5
+                                None if event.inner_fold_b is None else event.inner_fold_b.ndcg_at_5
                             ),
                             "inner_fold_b_primary": (
                                 None if event.inner_fold_b is None else event.inner_fold_b.primary

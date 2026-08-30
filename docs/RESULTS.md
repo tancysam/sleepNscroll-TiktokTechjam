@@ -100,12 +100,12 @@ scoreable; it is simply not trained, and it is not wired into the campaign portf
 
 ### 3.3 Live autonomous campaigns
 
-Ten live-provider campaigns were run against `openai/gpt-5.6-sol` via OpenRouter. **Eight
-completed end to end and emitted a full organizer-valid bundle**; two crashed on defects that were
-then root-caused and fixed (§3.5). Every completed campaign recorded **zero manual interventions**.
+Twelve live-provider campaigns were run against `openai/gpt-5.6-sol` via OpenRouter. **Nine
+completed end to end and emitted a full organizer-valid bundle**; three crashed on defects that
+were root-caused and fixed (§3.5). Every completed campaign recorded **zero manual interventions**.
 
-Reference campaign — `runs/postfix-20260830T105450Z` (`kuairand-1df0ab4d8d381a0535be`), the most
-recent and the one run after all three defect fixes:
+Reference campaign — `runs/postfix-20260830T105450Z` (`kuairand-1df0ab4d8d381a0535be`), run after
+the first three defect fixes:
 
 | Item | Value |
 |---|---|
@@ -148,7 +148,7 @@ rather than to the science.
 
 ### 3.5 Defects found by running live, and fixed
 
-Robustness is judged on how the agent handles difficulty, not on whether it meets any. All three
+Robustness is judged on how the agent handles difficulty, not on whether it meets any. All four
 of these were found by real live runs, root-caused from the actual failure, and fixed with a
 regression test that was confirmed to fail without the fix.
 
@@ -187,12 +187,14 @@ full six-launch qualification plus clean replay completed in **170.76 s**.
 | Run | Input | Output | Total | Cost |
 |---|---|---|---|---|
 | Scripted campaigns (all) | 0 | 0 | **0** | $0.00 |
-| Live campaigns that emitted a bundle (8) | 838,411 | 131,603 | **970,014** | $5.6837 |
-| Live campaigns that crashed before finalization (2) | 170,195 | 33,310 | **203,505** | ~$1.19 (est.) |
-| **Total live spend** | | | **1,173,519** | **~$6.87** |
+| Live campaigns that emitted a bundle (9) | | | **1,081,411** | $6.3349 |
+| Live campaigns that crashed before finalization (3) | | | **553,055** | ~$3.24 (est.) |
+| **Total live spend** | | | **1,634,466** | **~$9.57** |
 
-Per completed campaign the mean is 121,251 tokens and $0.71. The reference campaign
-(`runs/postfix-20260830T105450Z`) used 111,603 tokens for $0.65.
+Per completed campaign the mean is 120,157 tokens and $0.70. The reference campaign
+(`runs/postfix-20260830T105450Z`) used 111,603 tokens for $0.65. One outlier dominates the crashed
+subtotal: `runs/cb-b-112152Z` spent 349,550 tokens because the circuit breaker refused 14
+successive `pairwise` proposals and the model kept re-proposing the blocked family (§3.6).
 
 The two crashed campaigns produced no final report, so their figures are summed directly from the
 per-attempt provider journals under `runs/<run-id>/production/provider-attempt-journal/`; their
@@ -219,9 +221,9 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | Run | Interventions | Detail |
 |---|---|---|
 | `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
-| 8 completed live campaigns | **0 each** | No human acted between launch and bundle in any of them. Each campaign's own report independently records `Manual intervention count: 0`. |
+| 9 completed live campaigns | **0 each** | No human acted between launch and bundle in any of them. Each campaign's own report independently records `Manual intervention count: 0`. |
 | 5-campaign auto-retry batch | **0** | `scripts/auto_retry_campaigns.sh` launched five consecutive independent campaigns unattended. The script only launches and stops; it cannot alter a campaign's search, and the frozen organizer ε/N are enforced at config-parse time and are not reachable from it. |
-| 2 crashed live campaigns | n/a | Both were abandoned rather than hand-repaired mid-run. The defects were fixed in source and a fresh campaign launched, so no intervention altered a running campaign. |
+| 3 crashed live campaigns | n/a | Both were abandoned rather than hand-repaired mid-run. The defects were fixed in source and a fresh campaign launched, so no intervention altered a running campaign. |
 
 ## 5. Evaluation integrity
 
@@ -259,8 +261,10 @@ Stated plainly, because the gap matters more than the architecture:
    a validation-primary delta above ε = 0.002. The single promotion we observed (§3.4) was
    +0.00052 on Fold A — real, reproducible, and an order of magnitude too small to matter. Eight
    completed campaigns all terminated at `baseline_reproduced`.
-2. **The search has not meaningfully diversified.** Across 8 campaigns and 22 admission events,
-   17 were the same `pairwise` family, proposed as `candidate-01` in every campaign. See
+2. **The search has not meaningfully diversified, and enforcing diversity did not fix it.** Across
+   the 8 advisory-memory campaigns, 17 of 24 admissions were the same `pairwise` family. A
+   deterministic cross-run block then refused that family 14 times in a single campaign; the model
+   re-proposed it every time and its alternatives scored bit-identical to the parent. See
    [`agent-memory-experiment.md`](agent-memory-experiment.md) for the measurement and what we
    built in response.
 3. **The cross-run circuit breaker has not yet had a fair test.** It is implemented and unit

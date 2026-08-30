@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.message import Message
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -34,6 +34,7 @@ from kuairand_agent.research.provider import (
     TransportRequest,
     TransportResponse,
     UrllibResponsesTransport,
+    _role_scoped_request,
 )
 from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
@@ -46,6 +47,7 @@ from kuairand_agent.research.schemas import (
     Reflection,
     ReflectionRequest,
     RepairRequest,
+    ResearchOperation,
 )
 from kuairand_agent.research.source_policy import DEFAULT_CANDIDATE_SOURCE_POLICY
 
@@ -1358,3 +1360,69 @@ def test_opt_in_real_openai_provider_smoke() -> None:
     assert proposal.parent_candidate_id == _proposal_request().parent_candidate_id
     assert model.total_usage.total_tokens > 0
     assert len(model.transcripts) == 1
+
+
+def _context_with_raw_policy() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "field_policy": {
+            "fields": [{"column": f"c{index}"} for index in range(33)],
+            "disabled_columns_by_member": {"a.csv": ["x"], "b.csv": ["y"]},
+            "policy_semantics": "enabled means reviewed",
+        },
+        "field_policy_digest": "a" * 64,
+        "capabilities": [{"capability_name": "train"}, {"capability_name": "valid"}],
+        "method_cards": [{"name": "controller_causal_feature_bundle"}],
+        "train_eda": [{"name": "rows"}],
+        "campaign_records": [{"name": "prior_campaign_lesson_0001"}],
+        "benchmark": {"metrics": ["GAUC", "nDCG@5"]},
+    }
+
+
+def test_proposal_payload_summarizes_raw_column_context() -> None:
+    """A proposal cannot act on raw-column policy, so it is summarized rather than sent whole.
+
+    The candidate never receives dataset columns; the controller engineers them and hands over one
+    feature matrix described in `method_cards`. Measured on a real campaign, `field_policy` plus
+    `capabilities` were 63% of the hypothesis-generation prompt against 499 characters of EDA.
+    """
+
+    wire = {"safe_context": _context_with_raw_policy(), "request_id": "iteration-01-propose"}
+
+    scoped = _role_scoped_request(ResearchOperation.PROPOSE, wire)
+    context = cast(dict[str, object], scoped["safe_context"])
+
+    policy = cast(dict[str, object], context["field_policy"])
+    assert policy["omitted_from_this_operation"] == "field_policy"
+    assert policy["field_count"] == 33
+    assert policy["disabled_column_members"] == 2
+    assert policy["policy_semantics"] == "enabled means reviewed"
+    capabilities = cast(dict[str, object], context["capabilities"])
+    assert capabilities["entry_count"] == 2
+    # Everything the proposal actually reasons from is untouched.
+    for key in ("method_cards", "train_eda", "campaign_records", "benchmark"):
+        assert context[key] == _context_with_raw_policy()[key]
+    # Identity is never hidden: the digest of the omitted section still travels.
+    assert context["field_policy_digest"] == "a" * 64
+    # The caller's request object is not mutated.
+    assert wire["safe_context"] == _context_with_raw_policy()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR, ResearchOperation.REFLECT],
+)
+def test_non_proposal_payloads_are_passed_through_unchanged(
+    operation: ResearchOperation,
+) -> None:
+    """IMPLEMENT and REPAIR write code against the runtime contract and need the full policy."""
+
+    wire = {"safe_context": _context_with_raw_policy(), "request_id": "iteration-01"}
+
+    assert _role_scoped_request(operation, wire) is wire
+
+
+def test_role_scoping_tolerates_a_context_without_the_summarized_sections() -> None:
+    wire = {"safe_context": {"schema_version": 1, "benchmark": {}}, "request_id": "r"}
+
+    assert _role_scoped_request(ResearchOperation.PROPOSE, wire) is wire

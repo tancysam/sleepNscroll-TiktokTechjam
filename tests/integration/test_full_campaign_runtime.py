@@ -647,9 +647,9 @@ def _breadth_fixture(
     )
     opaque = cast(Any, object())
     runtime_template = runtime._ScientificRuntime(
-        engine=cast(Any, SimpleNamespace(status=lambda _run_dir: SimpleNamespace(
-            outer_queries_remaining=6
-        ))),
+        engine=cast(
+            Any, SimpleNamespace(status=lambda _run_dir: SimpleNamespace(outer_queries_remaining=6))
+        ),
         run_dir=tmp_path,
         campaign_store=cast(
             Any,
@@ -1119,3 +1119,85 @@ def test_provider_free_runtime_closes_fallback_and_exactly_retries_without_final
     }
     assert progress.checkpoints() == first_checkpoints
     assert tuple((request.run_dir / "controller" / "deadline").iterdir()) == first_deadlines
+
+
+def test_repeated_followup_rejections_count_and_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The follow-up loop must accumulate rejection counters and stop, like the admission loop.
+
+    Reproduces `runs/cb-b-112152Z`, which spent 349,550 tokens re-proposing one family the
+    controller refused fourteen times. Follow-up rejections passed no counters, so every record
+    claimed `attempt_count=1, proposal_family_blocked=False`; the model was told each repeat was
+    its first attempt, `_proposal_family_is_blocked` could never observe an in-campaign block, and
+    nothing ever ended the loop.
+    """
+
+    (
+        request,
+        _first_convergence,
+        first_result,
+        first_reflection,
+        transcript,
+        runtime_template,
+        first_lineage,
+    ) = _breadth_fixture(tmp_path, proposal_breadth=1)
+    config = runtime_template.config
+    fallback = first_result.fallback
+    attempts: list[int] = []
+    failure = ResearchFailureObservation.create(
+        stage="proposal_admission",
+        category="novelty_policy",
+        code="proposal_family_blocked",
+        subject="pairwise",
+        diagnostic="proposal family 'pairwise' is blocked by prior admission evidence",
+    )
+
+    def always_blocked(**kwargs: object) -> object:
+        iteration = cast(int, kwargs["scientific_iteration"])
+        attempts.append(iteration)
+        raise LiveResearchBranchRejected(
+            failed_candidate_id=f"candidate-{iteration:02d}",
+            repairs_attempted=0,
+            diagnostic="proposal family 'pairwise' is blocked by prior admission evidence",
+            root_failure=failure,
+            terminal_failure=failure,
+            proposal_family="pairwise",
+        )
+
+    monkeypatch.setattr(runtime, "_safe_context", lambda **_kwargs: object())
+    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", always_blocked)
+
+    result = runtime._run_autonomous_followups(
+        request=cast(Any, request),
+        data=cast(Any, object()),
+        runtime_template=runtime_template,
+        scientific_config=config,
+        fallback=fallback,
+        outer_ledger_path=tmp_path / "outer.sqlite3",
+        candidate_limits=cast(Any, object()),
+        dataset_digest="d" * 64,
+        context_evidence=cast(Any, object()),
+        validation_inputs=cast(Any, object()),
+        final_inputs=cast(Any, object()),
+        research_model=cast(Any, object()),
+        first_lineage=cast(Any, first_lineage),
+        first_result=first_result,
+        first_selection=None,
+        first_reflection=first_reflection,
+        first_reflection_evidence=("request-1", "response-1", transcript),
+        prior_records=(),
+    )
+
+    # Three identical root failures end the loop; it does not run to the iteration cap.
+    assert len(attempts) == 3
+    counters = [
+        (
+            item.values["proposal_family_attempt_count"],
+            item.values["proposal_family_blocked"],
+            item.values["root_failure_total_count"],
+        )
+        for item in result.rejected_records
+    ]
+    assert counters == [(1, False, 1), (2, True, 2), (3, True, 3)]

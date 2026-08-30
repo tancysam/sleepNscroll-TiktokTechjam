@@ -655,6 +655,70 @@ def _add_usage(left: ProviderUsage, right: ProviderUsage) -> ProviderUsage:
 Request = ProposalRequest | ImplementationRequest | RepairRequest | ReflectionRequest
 Response = Proposal | GeneratedPackage | Reflection
 
+# Raw-column context that a *proposal* provably cannot act on. A generated candidate never
+# receives dataset columns: the trusted controller engineers them and hands over one fixed feature
+# matrix, which the proposal addresses through `method_cards.controller_causal_feature_bundle` and
+# `runtime_contract.train_request.features_handle`. Measured on a real campaign these two sections
+# were 12,046 of 19,252 safe-context characters -- 63% of the hypothesis-generation prompt --
+# against 499 characters of training-data EDA. They stay in full for IMPLEMENT and REPAIR, which
+# do write code against the runtime contract.
+_PROPOSAL_SUMMARIZED_CONTEXT: Final = ("field_policy", "capabilities")
+
+
+def _summarize_section(name: str, value: object) -> dict[str, object]:
+    """Replace a bulky raw-data section with a counted, explicitly-labelled stand-in.
+
+    The section is summarized rather than dropped so the omission is visible both to the model and
+    to anyone reading the retained provider transcript; the corresponding `*_digest` keys stay in
+    the payload untouched, so nothing about the context's identity is hidden.
+    """
+
+    summary: dict[str, object] = {
+        "omitted_from_this_operation": name,
+        "reason": (
+            "raw-dataset policy detail is not actionable when proposing a hypothesis; the "
+            "candidate receives a controller-engineered feature matrix, described in "
+            "method_cards, rather than raw columns"
+        ),
+    }
+    if isinstance(value, list):
+        summary["entry_count"] = len(value)
+    elif isinstance(value, Mapping):
+        fields = value.get("fields")
+        if isinstance(fields, list):
+            summary["field_count"] = len(fields)
+        disabled = value.get("disabled_columns_by_member")
+        if isinstance(disabled, Mapping):
+            summary["disabled_column_members"] = len(disabled)
+        semantics = value.get("policy_semantics")
+        if semantics is not None:
+            summary["policy_semantics"] = semantics
+    return summary
+
+
+def _role_scoped_request(
+    operation: ResearchOperation, wire: dict[str, object]
+) -> dict[str, object]:
+    """Send each research operation the context it can actually act on.
+
+    Only PROPOSE is narrowed, and only by summarizing raw-column sections it cannot use. Every
+    other operation, and every other key, is passed through byte-identically. This runs at the
+    provider boundary, so the stored request, its digest, and campaign replay are untouched.
+    """
+
+    if operation is not ResearchOperation.PROPOSE:
+        return wire
+    context = wire.get("safe_context")
+    if not isinstance(context, dict):
+        return wire
+    if not any(name in context for name in _PROPOSAL_SUMMARIZED_CONTEXT):
+        return wire
+    scoped_context = {
+        key: (_summarize_section(key, value) if key in _PROPOSAL_SUMMARIZED_CONTEXT else value)
+        for key, value in context.items()
+    }
+    return {**wire, "safe_context": scoped_context}
+
 
 class OpenAIChatCompletionsModel:
     """Chat Completions implementation of the existing four-operation protocol."""
@@ -736,7 +800,10 @@ class OpenAIChatCompletionsModel:
         context_limits: ModelContextLimits | None = None,
     ) -> dict[str, object]:
         request_text = canonical_json_bytes(
-            {"operation": operation.value, "request": request.to_wire()}
+            {
+                "operation": operation.value,
+                "request": _role_scoped_request(operation, request.to_wire()),
+            }
         ).decode("ascii")
         source_policy = (
             request.source_policy
