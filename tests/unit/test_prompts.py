@@ -62,25 +62,40 @@ def test_briefing_carries_the_organizers_measured_dead_ends(
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
-def test_source_operations_state_the_pinned_output_paths(
+def test_source_operations_disclaim_the_work_the_wrapper_owns(
     operation: ResearchOperation,
 ) -> None:
-    """A candidate that writes the wrong checkpoint path fails after training completes."""
+    """The model must not be told to do the protected wrapper's job.
 
-    rendered = instructions_for(operation)
-    assert "checkpoint/model.txt" in rendered
-    assert "scores.npy" in rendered
+    This previously asserted the opposite: that the prompt names ``checkpoint/model.txt``,
+    ``scores.npy`` and the training request keys. Those instructions predate the split of
+    ``candidate.py`` into a protected wrapper plus a mutable ``model_impl.py``, and they
+    contradicted the runtime-contract section of the same message, which forbids implementing
+    protocol parsing, capability loading or checkpoint I/O. Every token spent teaching the model
+    to duplicate the wrapper also comes out of the output budget the generated code needs.
+    """
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "You write no files and parse no requests" in rendered
+    assert "the wrapper serializes both" in rendered
+    assert "checkpoint/model.txt" not in rendered
+    assert "scores.npy" not in rendered
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
-def test_source_operations_state_the_full_training_request_keys(
+def test_source_operations_teach_an_import_form_that_survives_the_gates(
     operation: ResearchOperation,
 ) -> None:
-    """The executor always sends these; a parser that omits either one fails closed."""
+    """Relative imports fail twice over, so the prompt must not offer them.
 
-    rendered = instructions_for(operation)
-    assert "user_groups_handle" in rendered
-    assert "seed" in rendered
+    ``materialize._reachable_python_files`` skips ``ImportFrom`` nodes with ``level > 0``, so a
+    relatively imported helper is invisible to the material-change gate; and the candidate is
+    launched as a script, so the import raises at execution as well.
+    """
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "never relatively" in rendered
+    assert "from . import helper` are permitted" not in rendered
 
 
 @pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
@@ -161,7 +176,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 
 
 def test_prompt_version_matches_the_response_schema_name() -> None:
-    """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v3``."""
+    """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
     assert PROMPT_VERSION == 10
 
@@ -255,10 +270,12 @@ def test_briefing_rules_out_the_avenues_the_runtime_cannot_express(
     """Multi-task and censored watch-time are organizer priorities this runtime cannot reach."""
 
     rendered = instructions_for(operation)
-    assert "DO NOT\nPROPOSE EITHER" in rendered or "DO NOT PROPOSE EITHER" in rendered
+    assert "NOT reachable from your interface" in rendered
+    assert "Do not propose these" in rendered
     for absent_field in ("is_follow", "is_comment", "is_forward", "play_time_ms"):
         assert absent_field in rendered, f"{absent_field} must be named as unavailable"
-    assert "exactly one binary `targets` vector" in rendered
+    assert "exactly one binary target vector" in rendered
+    assert "DIN/SIM" in rendered, "sequence modelling is unreachable and must be named"
 
 
 def test_lightgbm_guidance_pins_the_objective_cutoff() -> None:
@@ -281,3 +298,60 @@ def test_feature_authority_states_the_measured_cost_of_an_embedding_table() -> N
 def test_instructions_reject_a_foreign_source_policy() -> None:
     with pytest.raises(ValueError, match="source_policy must be CandidateSourcePolicy"):
         instructions_for(ResearchOperation.IMPLEMENT, source_policy=object())  # type: ignore[arg-type]
+
+
+def test_propose_manifest_and_implement_overlay_stay_distinguishable() -> None:
+    """PROPOSE and IMPLEMENT talk about two different things; say which is which.
+
+    A live campaign lost its first branch to exactly this. PROPOSE said files_expected "must
+    include candidate.py"; IMPLEMENT forbids returning any protected path, and candidate.py is
+    one. The model obeyed PROPOSE, implemented the manifest it had just proposed, and was
+    rejected at materialization after burning both repair attempts:
+
+        "generated package cannot replace protected runtime file(s): candidate.py"
+
+    Nothing validates files_expected, so only this test stops the wording drifting back.
+    """
+
+    rendered = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
+    assert "must include candidate.py" in rendered
+    assert "not the list of files the implementation will return" in rendered
+    assert "never returns candidate.py itself" in rendered
+
+
+@pytest.mark.parametrize("operation", _SOURCE_OPERATIONS)
+def test_source_operations_state_the_schema_rules_that_cost_an_attempt(
+    operation: ResearchOperation,
+) -> None:
+    """Both rules below are enforced by the strict schema and were previously unstated.
+
+    A repair returned model_impl.py twice and was rejected as malformed, consuming one of only
+    two attempts, because nothing told the model paths must be unique.
+    """
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "must be unique" in rendered
+    assert "Never return candidate.py" in rendered
+
+
+def test_implement_briefing_points_at_the_provided_helpers_and_their_shapes() -> None:
+    """Prose about shapes did not stop the defect; the provided helpers and their shapes must.
+
+    Runs 11 and 12 lost six branches between hand-rolled FM interaction maths and within-user
+    pair-sampling index arithmetic, so the briefing names the tested helpers explicitly.
+    """
+
+    rendered = instructions_for(ResearchOperation.IMPLEMENT)
+
+    for helper in (
+        "categorical_codes",
+        "embedding_table_size",
+        "fm_interaction_scores",
+        "within_user_pairs",
+    ):
+        assert helper in rendered, helper
+    # The two accumulators that must not be mixed.
+    assert "(N, rank)" in rendered
+    assert "(N,)" in rendered
+    # The measured size finding.
+    assert "260 lines" in rendered

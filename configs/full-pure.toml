@@ -29,16 +29,12 @@ provider = "openai"
 max_repairs_per_experiment = 2
 run_kind = "autonomous"
 allow_scripted_demo = false
-# Up to 2 independently proposed candidates per scientific iteration: try a second idea against
-# the same parent only when the first was not promoted, so a losing branch never wastes a launch
-# against an already-superseded incumbent.
-proposal_breadth = 2
 
 [research.openai]
-reasoning_effort = "low"
-timeout_seconds = 420.0
+reasoning_effort = "high"
+timeout_seconds = 600.0
 max_response_bytes = 8388608
-max_output_tokens = 32768
+max_output_tokens = 65536
 max_malformed_retries = 1
 max_transport_retries = 1
 

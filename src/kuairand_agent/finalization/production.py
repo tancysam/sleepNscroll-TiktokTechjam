@@ -34,7 +34,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -112,6 +112,11 @@ from kuairand_agent.finalization.finalize import (
     FinalizationRequest,
     FinalizationResult,
     run_finalization,
+)
+from kuairand_agent.finalization.iteration_evidence import (
+    IterationEvidence,
+    collect_iteration_narratives,
+    count_recorded_iterations,
 )
 from kuairand_agent.finalization.organizer_check import (
     OrganizerCheckEvidence,
@@ -2555,6 +2560,9 @@ def _generated_replay_candidate(
         report_context=_report_context(
             candidate_id=selection.candidate_id,
             parent_id=outcome.fallback_candidate_id,
+            run_dir=outcome.run_dir,
+            campaign_id=outcome.campaign_id,
+            artifact_store=artifact_store,
             metrics=metrics,
             qualification=qualification,
             outcome=outcome,
@@ -2677,6 +2685,9 @@ def _fallback_replay_candidate(
         report_context=_report_context(
             candidate_id=candidate_id,
             parent_id=candidate_id,
+            run_dir=outcome.run_dir,
+            campaign_id=outcome.campaign_id,
+            artifact_store=artifact_store,
             metrics=metrics,
             qualification=qualification,
             outcome=outcome,
@@ -3374,10 +3385,155 @@ def _report_peak_rss_bytes(
     return max(qualification_peak, confirmation.retained_training_peak_rss_bytes)
 
 
+def _retained_candidate_outcomes(
+    run_dir: Path,
+    outcome: FullCampaignOutcome,
+    artifact_store: ArtifactStore,
+) -> list[object]:
+    """Read the retained scientific result and return its per-candidate outcome entries.
+
+    The durable progress checkpoints carry the result artifact reference, so this recovers the
+    document without threading the science checkpoint mapping through the report builder.  The
+    stored digest is checked against the retained outcome so a mismatched document is ignored
+    rather than reported.
+    """
+
+    progress_root = run_dir / "production" / "progress"
+    if not progress_root.is_dir():
+        return []
+    for path in sorted(progress_root.iterdir(), reverse=True):
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        evidence = checkpoint.get("evidence")
+        if not isinstance(evidence, Mapping):
+            continue
+        reference_raw = evidence.get("scientific_result_artifact")
+        if not isinstance(reference_raw, Mapping):
+            continue
+        if evidence.get("scientific_result_digest") != outcome.scientific_result_digest:
+            continue
+        reference = ArtifactRef.from_manifest(reference_raw)
+        if reference.kind is not ArtifactKind.MANIFEST:
+            return []
+        payload = artifact_store.read_bytes(reference, max_bytes=_MAX_MANIFEST_BYTES)
+        document = json.loads(payload.decode("ascii"))
+        if not isinstance(document, dict):
+            return []
+        if document.get("digest") != outcome.scientific_result_digest:
+            return []
+        entries = document.get("candidate_outcomes")
+        return list(entries) if isinstance(entries, list) else []
+    return []
+
+
+_INNER_TIER_RUN_COUNT: Final = 2
+
+
+def _candidate_measured_primaries(
+    run_dir: Path,
+    outcome: FullCampaignOutcome,
+    artifact_store: ArtifactStore,
+) -> dict[str, tuple[float | None, float | None]]:
+    """Recover each generated candidate's measured inner and outer primary.
+
+    The trajectory table is the one place a judge can see that a candidate actually ran, and
+    lineage records carry a proposal and a package but no score.  The scientific result names
+    each candidate's run evidence digests and the durable record repository holds the exact
+    metrics, so joining the two recovers the numbers without trusting the rounded public
+    feedback.  Runs are recorded in tier order: the Fold B screen, the Fold A confirmation,
+    then the matched outer seeds.
+
+    This is presentation evidence.  Every inconsistency degrades to an unknown score rather than
+    failing a finalization that has a valid bundle to publish.
+    """
+
+    if outcome.scientific_result_digest is None:
+        return {}
+    record_root = run_dir / "production" / "scientific-records"
+    if not record_root.is_dir():
+        return {}
+    try:
+        candidate_outcomes = _retained_candidate_outcomes(run_dir, outcome, artifact_store)
+        if not candidate_outcomes:
+            return {}
+        repository = FileScientificRunEvidenceRepository(record_root)
+        primary_by_run: dict[str, float] = {}
+        for path in sorted(record_root.iterdir()):
+            if not path.is_file() or path.suffix != ".json":
+                continue
+            record = repository.load(path.stem)
+            if record is None or record.evidence.metrics is None:
+                continue
+            primary_by_run[record.evidence.digest] = float(record.evidence.metrics.primary)
+    except Exception:
+        return {}
+
+    measured: dict[str, tuple[float | None, float | None]] = {}
+    for candidate in candidate_outcomes:
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_id = candidate.get("candidate_id")
+        run_digests = candidate.get("run_digests")
+        if not isinstance(candidate_id, str) or not isinstance(run_digests, list):
+            continue
+        scored = [
+            primary_by_run[item]
+            for item in run_digests
+            if isinstance(item, str) and item in primary_by_run
+        ]
+        if not scored:
+            continue
+        inner = scored[:_INNER_TIER_RUN_COUNT]
+        outer = scored[_INNER_TIER_RUN_COUNT:]
+        measured[candidate_id] = (
+            sum(inner) / len(inner) if inner else None,
+            sum(outer) / len(outer) if outer else None,
+        )
+    return measured
+
+
+def _candidate_outcome_status(outcome: FullCampaignOutcome) -> dict[str, str]:
+    """Map candidate id to its measured campaign outcome for the trajectory table.
+
+    The selection plan is the only outcome-bearing structure reachable here without
+    reopening the campaign store, so an iteration the selector never promoted keeps the
+    neutral default supplied by the collector."""
+
+    selection = outcome.selection
+    if selection is None:
+        return {}
+    return {selection.candidate_id: "promoted"}
+
+
+def _with_selected_metric(
+    narratives: tuple[ExperimentNarrative, ...],
+    *,
+    candidate_id: str,
+    outer_primary: float,
+) -> tuple[ExperimentNarrative, ...]:
+    """Attach the measured outer primary to the narrative for the selected candidate.
+
+    Recovered narratives are built from lineage records, which carry a proposal and a package
+    but no score.  Without this the trajectory table renders a dash for the one iteration
+    whose score is actually known.
+    """
+
+    return tuple(
+        replace(item, outer_primary=outer_primary)
+        if item.experiment_id == candidate_id and item.outer_primary is None
+        else item
+        for item in narratives
+    )
+
+
 def _report_context(
     *,
     candidate_id: str,
     parent_id: str,
+    run_dir: Path,
+    campaign_id: str,
+    artifact_store: ArtifactStore,
     metrics: Mapping[str, object],
     qualification: OfficialFMQualificationEvidence,
     outcome: FullCampaignOutcome,
@@ -3414,6 +3570,22 @@ def _report_context(
             else "Immutable official fallback seed."
         ),
     )
+    # The campaign durably records one lineage file per admitted iteration and one
+    # hash-chained journal entry per rejected branch.  Prefer that real trajectory; the
+    # literal below remains only for runs that never reached research at all.
+    try:
+        recovered = collect_iteration_narratives(
+            run_dir,
+            campaign_id=campaign_id,
+            fallback_parent_id=parent_id,
+            candidate_outcomes=_candidate_outcome_status(outcome),
+            candidate_metrics=_candidate_measured_primaries(run_dir, outcome, artifact_store),
+        )
+    except Exception:
+        # The recovered trajectory is presentation; the campaign store and the immutable
+        # lineage files remain the evidence of record.  Degrade to the single narrative
+        # below rather than aborting a finalization that has a valid bundle to publish.
+        recovered = IterationEvidence((), ())
     experiment = ExperimentNarrative(
         iteration=1,
         experiment_id=candidate_id,
@@ -3453,6 +3625,7 @@ def _report_context(
         judge_facts.research_outcome,
         judge_facts.research_progress,
         *judge_facts.research_rejections,
+        *recovered.failure_lines,
         *finalization_failure_lines,
     )
     limitations = [
@@ -3507,7 +3680,14 @@ def _report_context(
         },
         baselines=(_baseline_mean(qualification),),
         selected=selected,
-        experiments=(experiment,),
+        experiments=(
+            _with_selected_metric(
+                recovered.narratives,
+                candidate_id=candidate_id,
+                outer_primary=selected.primary,
+            )
+            or (experiment,)
+        ),
         inner_fold_evidence=inner_evidence,
         seed_confirmation=seed_confirmation,
         failures_and_recoveries=failure_lines,
@@ -3643,7 +3823,10 @@ def _bundle_metadata(
         },
         campaign_totals={
             "attempt_count": launch_count,
-            "scientific_iteration_count": (1 if outcome.scientific_result_digest else 0),
+            "scientific_iteration_count": (
+                count_recorded_iterations(outcome.run_dir)
+                or (1 if outcome.scientific_result_digest else 0)
+            ),
             "launch_count": launch_count,
             "elapsed_seconds": float(campaign_wall_seconds),
             "manual_intervention_count": outcome.manual_interventions,
@@ -3788,6 +3971,39 @@ def _scientific_result_document(
     return cast(dict[str, object], decoded)
 
 
+def _candidate_run_ownership(
+    candidate_outcomes: Sequence[object],
+    *,
+    selected_candidate_id: str,
+) -> tuple[dict[str, str], set[str], set[str]]:
+    """Attribute every retained scientific run to the candidate that produced it.
+
+    A campaign evaluates several candidates, so the record repository holds runs from all of
+    them. Returns the run-to-candidate map, every expected run digest, and the subset belonging
+    to the selected candidate. Only that subset can be expected to carry the selection's own
+    source and config identity.
+    """
+
+    owners: dict[str, str] = {}
+    expected: set[str] = set()
+    selected: set[str] = set()
+    for index, candidate in enumerate(candidate_outcomes):
+        if not isinstance(candidate, Mapping):
+            raise ProductionFinalizationError("scientific candidate outcome is malformed")
+        run_digests = candidate.get("run_digests")
+        if not isinstance(run_digests, list):
+            raise ProductionFinalizationError("scientific candidate run digests are malformed")
+        owner = candidate.get("candidate_id")
+        for run_index, digest in enumerate(run_digests):
+            normalized = _digest(digest, f"candidate outcome {index} run {run_index}")
+            expected.add(normalized)
+            if isinstance(owner, str) and owner:
+                owners[normalized] = owner
+                if owner == selected_candidate_id:
+                    selected.add(normalized)
+    return owners, expected, selected
+
+
 def _scientific_record_rows(
     *,
     run_dir: Path,
@@ -3802,15 +4018,9 @@ def _scientific_record_rows(
     candidate_outcomes = scientific_result.get("candidate_outcomes")
     if not isinstance(candidate_outcomes, list):
         raise ProductionFinalizationError("scientific result candidate outcomes are missing")
-    expected_run_digests: set[str] = set()
-    for index, candidate in enumerate(candidate_outcomes):
-        if not isinstance(candidate, Mapping):
-            raise ProductionFinalizationError("scientific candidate outcome is malformed")
-        run_digests = candidate.get("run_digests")
-        if not isinstance(run_digests, list):
-            raise ProductionFinalizationError("scientific candidate run digests are malformed")
-        for run_index, digest in enumerate(run_digests):
-            expected_run_digests.add(_digest(digest, f"candidate outcome {index} run {run_index}"))
+    candidate_by_run, expected_run_digests, selected_run_digests = _candidate_run_ownership(
+        candidate_outcomes, selected_candidate_id=selection.candidate_id
+    )
 
     record_root = run_dir / "production" / "scientific-records"
     try:
@@ -3828,9 +4038,6 @@ def _scientific_record_rows(
     # config digests are per-candidate identities, so they are pinned to the selection only for the
     # records that actually belong to it; the environment digest is the one campaign-wide identity
     # and stays checked on every record.
-    matched_request_digests = {
-        matched.scientific_request_digest for matched in selection.matched_seeds
-    }
     rows: list[dict[str, object]] = []
     observed_run_digests: set[str] = set()
     records_by_request: dict[str, object] = {}
@@ -3848,16 +4055,21 @@ def _scientific_record_rows(
             raise ProductionFinalizationError("scientific result has duplicate run evidence")
         observed_run_digests.add(record.evidence.digest)
         records_by_request[request_digest] = record
+        # The environment is campaign-wide, so every retained run must share it.
         if record.evidence.identities.environment_digest != request.environment_digest:
             raise ProductionFinalizationError("scientific record environment identity changed")
-        claims_selected_source = record.source_snapshot_digest == selection.source_snapshot.sha256
-        if (request_digest in matched_request_digests or claims_selected_source) and (
+        # Source and config identity are per candidate. Only the selected candidate's own runs
+        # can match the selection, and requiring every run to match it made finalization
+        # impossible for any campaign that promoted a generated candidate after evaluating more
+        # than one. Ownership comes from the campaign's own candidate_outcomes rather than from
+        # digest equality, so a record cannot exempt itself by differing.
+        if record.evidence.digest in selected_run_digests and (
             record.source_snapshot_digest != selection.source_snapshot.sha256
             or record.evidence.identities.source_digest != selection.source_digest
             or record.evidence.identities.config_digest != selection.config_digest
         ):
             raise ProductionFinalizationError(
-                "scientific record source, config, or environment identity changed"
+                "selected candidate scientific record source or config identity changed"
             )
         for reference in (
             record.checkpoint,
@@ -3881,7 +4093,9 @@ def _scientific_record_rows(
                 request_digest,
                 record.manifest() | {"digest": record.digest},
                 summary={
-                    "candidate_id": selection.candidate_id,
+                    "candidate_id": candidate_by_run.get(
+                        record.evidence.digest, selection.candidate_id
+                    ),
                     "tier": "bound_in_request_digest_and_execution_records",
                     "seed": next(
                         (
@@ -4953,19 +5167,29 @@ def _finalize_provider_free_campaign_impl(
                 )
         observation = selected_engine.observe_deadline(run)
         launches = store.snapshot().launches_used
-        fallback = _fallback_replay_candidate(
-            qualification=qualification,
-            context=context,
-            request=request,
-            environment=environment,
-            artifact_store=artifact_store,
-            outcome=research,
-            starter_dir=starter_dir,
-            report_failures=failures,
-            campaign_wall_seconds=observation.elapsed_seconds,
-            launch_count=launches,
-            cancel_event=cancellation,
-        )
+        # The guarantee-of-last-resort path.  The generated builder above is wrapped; this
+        # one must be too, or a defect shared by both takes down the fallback itself.
+        try:
+            fallback = _fallback_replay_candidate(
+                qualification=qualification,
+                context=context,
+                request=request,
+                environment=environment,
+                artifact_store=artifact_store,
+                outcome=research,
+                starter_dir=starter_dir,
+                report_failures=failures,
+                campaign_wall_seconds=observation.elapsed_seconds,
+                launch_count=launches,
+                cancel_event=cancellation,
+            )
+        except ProductionFinalizationError:
+            # Already the right type, and cancellation is signalled this way too.
+            raise
+        except Exception as exc:
+            raise ProductionFinalizationError(
+                "official FM fallback candidate could not be prepared"
+            ) from exc
         candidates.append(fallback)
         experiments_jsonl, experiments_csv = _write_experiment_ledgers(
             run_dir=run,

@@ -98,53 +98,120 @@ useful: *the currently frozen bounded acceptance configuration is severely under
 0.5537 and must not replace the baseline as-is.* The mechanism is implemented, deterministic, and
 scoreable; it is simply not trained, and it is not wired into the campaign portfolio.
 
+#### Full-training sweep — `runs/pairwise-sweep.json`
+
+The undertraining question above was then settled directly. The same pairwise FM was trained to
+convergence across a 12-cell grid over learning rate and epochs/sampled pairs, on the full
+1,141,112-row train split (1,130,240 GAUC-eligible rows) with the encoding verified identical to
+the qualified baseline.
+
+| Learning rate | Epochs | Sampled pairs | primary | Delta vs local baseline |
+|---|---:|---:|---:|---:|
+| 0.001 | 10 | 10,000,000 | **0.6015003** | **−0.0000719** |
+| 0.001 | 5 | 5,000,000 | 0.5989000 | −0.0026722 |
+| 0.001 | 20 | 20,000,000 | 0.5974734 | −0.0040988 |
+| 0.001 | 40 | 40,000,000 | 0.5849371 | −0.0166351 |
+| 0.01 | 5 | 5,000,000 | 0.5805469 | −0.0210253 |
+| 0.01 | 10 | 10,000,000 | 0.5684834 | −0.0330888 |
+| 0.03 | 5 | 5,000,000 | 0.5653120 | −0.0362602 |
+| 0.01 | 20 | 20,000,000 | 0.5613660 | −0.0402062 |
+| 0.03 | 10 | 10,000,000 | 0.5598870 | −0.0416852 |
+| 0.03 | 20 | 20,000,000 | 0.5590336 | −0.0425386 |
+| 0.01 | 40 | 40,000,000 | 0.5576836 | −0.0438886 |
+| 0.03 | 40 | 40,000,000 | 0.5573751 | −0.0441971 |
+
+Best configuration: GAUC 0.6676200628, nDCG@5 0.5353804827, primary **0.6015002728**, against a
+local baseline primary of **0.6015721679**.
+
+**This is a marginal regression, not a win, and it must not be reported as one.** Four caveats
+travel with that −0.0000719, and each of them makes the true expected result worse:
+
+1. **Every one of the twelve cells is below the baseline.** The headline number is the best cell,
+   not a typical one.
+2. **Best-of-12 was selected on the same split it is reported on**, so the figure is optimistically
+   biased by selection.
+3. **One seed (seed 0), compared against a five-seed mean.** FM seed-to-seed standard deviation on
+   this benchmark is 0.0008, which is more than eleven times the size of the delta. The two results
+   are statistically indistinguishable.
+4. **This is a manual experiment.** `runs/pairwise-sweep.json` records
+   `is_autonomous_agent_result: false`, and `candidates/pairwise_fm.py` is imported by nothing under
+   `src/`. It measures the direction; it does not demonstrate agent behaviour.
+
+The more interesting result is the shape of the grid rather than its best cell. The mean pairwise
+training loss fell in every cell — from 0.6873 to 0.5386 in the best one, and to 0.3898 by 40
+epochs — while the ranking metric *peaked at 10 epochs and then degraded monotonically*. Training
+the surrogate harder makes the scored metric worse. On this dataset the pairwise objective is a
+poorly aligned proxy for GAUC and nDCG@5 beyond a narrow band, which is a substantive qualification
+of the organizers' stated expectation that the pointwise/ranking objective mismatch is the single
+largest available opportunity.
+
 ### 3.3 Live autonomous campaigns
 
-Twelve live-provider campaigns were run against `openai/gpt-5.6-sol` via OpenRouter. **Nine
-completed end to end and emitted a full organizer-valid bundle**; three crashed on defects that
-were root-caused and fixed (§3.5). Every completed campaign recorded **zero manual interventions**.
+Four live-provider campaigns completed end to end on 2026-08-30, all against
+`openai/gpt-5.6-sol` with a configured failover slot. Each terminated on `converged` under the
+frozen rule (epsilon 0.002, patience 3) with **zero manual interventions**, and each published a
+verified submission bundle.
 
-Reference campaign — `runs/postfix-20260830T105450Z` (`kuairand-1df0ab4d8d381a0535be`), run after
-the first three defect fixes:
+| Run | Iterations | Candidates that executed | Reached outer validation | Selected | Terminal reason | Cost |
+|---|---:|---:|---:|---|---|---:|
+| `maki-overnight-09` | 3 | **3** | 2 | `official-fm-fallback-seed-4` | converged | $0.68 |
+| `maki-overnight-10` | 3 | 1 | 0 | `official-fm-fallback-seed-4` | converged | $1.82 |
+| `maki-overnight-11` | 3 | 0 | 0 | `official-fm-fallback-seed-4` | converged | $2.31 |
+| `maki-overnight-12` | 3 | 0 | 0 | `official-fm-fallback-seed-4` | converged | $1.93 |
 
-| Item | Value |
-|---|---|
-| Campaign status | `COMPLETED`, full bundle published, `failures = []` |
-| Selected candidate | `official-fm-fallback-seed-4` (protected baseline fallback) |
-| Selected status | `baseline_reproduced` |
-| Validation GAUC / nDCG@5 / primary | 0.6679478 / 0.5361264 / 0.6020371 |
-| Absolute delta vs official five-seed FM mean | **+0.0004649** primary |
-| Terminal reason | `exact_terminal_condition_reached` (organizer convergence rule) |
-| Branches attempted / admitted / trained | 3 / 3 / 3 |
-| Inner evaluations / outer evaluations | 2 / 0 |
-| Repairs / pre-execution rejections / fallbacks | 0 / 0 / 0 |
-| Manual interventions | **0** |
-| Campaign wall time | 385.9 s (finalization 25.5 s) |
-| Charged training launches | 11 |
-| Tokens (input / output / total) | 94,936 / 16,667 / **111,603** |
-| Estimated API cost | **$0.65** |
+**No generated candidate has beaten the baseline, and the fallback shipped in every run.** All
+four published a byte-identical submission, SHA-256 `e12746ae…`, so the submitted artifact never
+regressed across the series.
 
-The +0.0004649 delta is against this repository's official-FM confirmation evidence and is far
-below the organizer convergence threshold ε = 0.002. **We do not claim it as an improvement.** It
-is the fallback reproducing the baseline, which is what `baseline_reproduced` means.
+The best generated result remains run 09, measured on matched outer seeds 0/1/2:
 
-### 3.4 The one candidate promotion we have observed
+| Model | Outer primary (mean of seeds 0, 1, 2) | Delta vs incumbent |
+|---|---:|---:|
+| official FM incumbent (`fallback_outer_mean`) | 0.6014403 | — |
+| `candidate-01` pairwise softplus | 0.6012030 | −0.0002372 |
+| `candidate-03` metric-matched pairwise FM | 0.6011940 | −0.0002462 |
 
-`runs/hard-block-verify-20260830T103424Z` is the only run in which a generated candidate cleared
-every gate the pipeline has. `candidate-01` (a within-user BPR pairwise objective over the fixed
-33-feature causal bundle) beat its parent on both inner folds, passed outer matched-seed
-validation, and was promoted to incumbent:
+Both sit well inside the baseline's own 0.0008 seed-to-seed standard deviation and are therefore
+statistically indistinguishable from it, not improvements and not meaningful regressions.
 
-| | candidate-01 | parent | delta |
-|---|---|---|---|
-| Fold A primary | 0.6076452 | 0.6071290 | +0.0005161 |
-| Fold B primary | 0.5755265 | 0.5754240 | +0.0001025 |
+**Execution rate, not modelling ambition, was the binding constraint.** Candidate implementations
+at or under roughly 260 lines executed 3 for 3 in run 09; of the eight written at over 580 lines in
+runs 10 to 12, none executed. Nine post-baseline candidates failed in three classes: within-user
+pair-sampling index arithmetic (3), mixing an `(N,)` accumulator with an `(N, rank)` one inside
+hand-written factorization-machine interaction maths (3), and a non-scalar checkpoint entry read by
+the candidate's own `training_diagnostics` (2). One executed cleanly. All three classes are
+recorded per-iteration in each run's `production/candidate-control/*/stderr.log`.
 
-Both deltas are an order of magnitude below ε = 0.002, so this is **not** a convergence-beating
-improvement and is not claimed as one. It is reported because it is the only evidence we have that
-the generated-candidate path can clear the full gate chain, and because the campaign then crashed
-in finalization (§3.5, defect 3) and produced no bundle — the result was lost to our own defect
-rather than to the science.
+A separate observation, seen three times across runs 09 and 10: a generated candidate produced
+predictions that were *rank-identical* to the official FM within every scored user slate, giving
+bit-identical GAUC and nDCG@5. Run 10's `candidate-03` did this with 59,816 distinct prediction
+values across 61,315 rows, so it is not a degenerate or constant-score artifact. With a median
+slate of four impressions and only 63.7% of users GAUC-eligible, distinct models can and do induce
+the same within-user ordering.
+
+### 3.4 Independent qualification on a second platform
+
+Reproduced by a second team member on Linux x86-64, from a separately downloaded and
+hash-verified copy of the dataset, using `runs/maki-qualification`. Six charged launches in
+**3 min 56 s** on CPU.
+
+| Seed | GAUC | nDCG@5 | primary | replay bit-exact |
+|---|---|---|---|---|
+| 0 | 0.6671334 | 0.5358057 | 0.6014695 | yes |
+| 1 | 0.6673948 | 0.5361270 | 0.6017609 | yes |
+| 2 | 0.6670642 | 0.5351164 | 0.6010903 | yes |
+| 3 | 0.6674611 | 0.5355451 | 0.6015031 | yes |
+| 4 | 0.6679478 | 0.5361264 | 0.6020371 | yes |
+
+Five-seed mean validation primary **0.6015722**, which rounds to **0.6016** -- the organizers'
+published validation figure exactly. Observed seed standard deviation **0.000316**, tighter than
+the published 0.0008, which makes epsilon = 0.002 roughly six standard deviations on this
+hardware rather than 2.5.
+
+This matters twice over. It confirms the pipeline is correct on a second, independent platform
+rather than only on the machine that built it; and it establishes the local baseline that any
+candidate produced on that machine must be compared against -- see section 6.4, because the two
+platforms do not agree to the last bit.
 
 ### 3.5 Defects found by running live, and fixed
 
@@ -194,22 +261,28 @@ full six-launch qualification plus clean replay completed in **170.76 s**.
 
 ### Token consumption
 
-| Run | Input | Output | Total | Cost |
-|---|---|---|---|---|
-| Scripted campaigns (all) | 0 | 0 | **0** | $0.00 |
-| Live campaigns that emitted a bundle (9) | | | **1,081,411** | $6.3349 |
-| Live campaigns that crashed before finalization (3) | | | **553,055** | ~$3.24 (est.) |
-| **Total live spend** | | | **1,634,466** | **~$9.57** |
+Every provider call ever made by this project, reconstructed from the per-attempt journals in
+each run's `production/provider-attempt-journal/`. Reasoning tokens are billed as output tokens.
 
-Per completed campaign the mean is 120,157 tokens and $0.70. The reference campaign
-(`runs/postfix-20260830T105450Z`) used 111,603 tokens for $0.65. One outlier dominates the crashed
-subtotal: `runs/cb-b-112152Z` spent 349,550 tokens because the circuit breaker refused 14
-successive `pairwise` proposals and the model kept re-proposing the blocked family (§3.6).
+| Run | Calls | Input | Output | Total | Cost |
+|---|---:|---:|---:|---:|---:|
+| Scripted campaigns (all) | 0 | 0 | 0 | 0 | $0.00 |
+| `maki-overnight-01` | 8 | 83,030 | 138,653 | 221,683 | $3.05 |
+| `maki-overnight-03` | 4 | 33,964 | 42,910 | 76,874 | $0.93 |
+| `maki-overnight-04` | 5 | 43,685 | 62,224 | 105,909 | $1.35 |
+| `maki-overnight-05` | 15 | 196,363 | 254,015 | 450,378 | $5.58 |
+| `maki-overnight-06` | 10 | 151,194 | 2,956 | 154,150 | $0.48 |
+| `maki-overnight-07` | 9 | 80,556 | 128,136 | 208,692 | $2.70 |
+| `maki-overnight-09` | 9 | 97,238 | 17,219 | 114,457 | $0.68 |
+| `maki-overnight-10` | 9 | 116,097 | 70,792 | 186,889 | $1.82 |
+| `maki-overnight-11` | 11 | 149,934 | 88,222 | 238,156 | $2.31 |
+| `maki-overnight-12` | 10 | 135,560 | 72,551 | 208,111 | $1.93 |
+| **Total** | **92** | **1,087,621** | **877,678** | **1,965,299** | **$20.84** |
 
-The two crashed campaigns produced no final report, so their figures are summed directly from the
-per-attempt provider journals under `runs/<run-id>/production/provider-attempt-journal/`; their
-token counts are exact, but the cost is an estimate derived at the same blended rate rather than a
-figure the adapter recorded, and is labelled as such.
+Runs 02 and 08 made calls that returned no usage and are counted at zero. Runs 01 to 08 predate
+the survivability fixes and produced only truncated candidate stubs; their spend is included
+because the Feasibility criterion asks for total consumption to reach the result, not the cost of
+the final run alone.
 
 The provider adapter records input, cached-input, output, reasoning, and total tokens per call,
 plus estimated cost from the frozen pricing block in the config, provider wall time, transcript
@@ -217,9 +290,9 @@ count, and bounded unaccounted attempts. Pricing is pinned in configuration
 (`[research.openai.pricing]`) rather than inferred at runtime, so cost figures are reproducible
 rather than dependent on a rate card that may change.
 
-**Accounting rule we hold ourselves to:** live smoke-probe tokens count toward the total. The
-probe is real spend that preceded the converged result, and the Feasibility criterion asks for
-total consumption to reach that result — not the cost of the final run alone.
+**Accounting rule we hold ourselves to:** every live call counts toward the total, including
+probes and campaigns that failed before producing a candidate. GPU hours remain 0.00 throughout;
+all training is CPU-only by design.
 
 ### Manual interventions
 
@@ -231,50 +304,10 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | Run | Interventions | Detail |
 |---|---|---|
 | `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
-| 9 completed live campaigns | **0 each** | No human acted between launch and bundle in any of them. Each campaign's own report independently records `Manual intervention count: 0`. |
-| 5-campaign auto-retry batch | **0** | `scripts/auto_retry_campaigns.sh` launched five consecutive independent campaigns unattended. The script only launches and stops; it cannot alter a campaign's search, and the frozen organizer ε/N are enforced at config-parse time and are not reachable from it. |
-| 3 crashed live campaigns | n/a | Both were abandoned rather than hand-repaired mid-run. The defects were fixed in source and a fresh campaign launched, so no intervention altered a running campaign. |
-
-## 4.1 Correction: the outer-validation ration is per campaign
-
-**Disclosed because it changes a number we previously reported, and because it loosens a limit we
-had been enforcing on ourselves.**
-
-`OuterQueryLedger.reserve` counted every reservation ever made, across all campaigns, against a
-single allowance of six. Fourteen live campaigns therefore shared one allocation, and it reached
-zero on 2026-08-30 at 11:59:17 (`runs/ctx-1-115456Z`). At that point no candidate could ever be
-outer-confirmed again: every future campaign would terminate at `baseline_reproduced` regardless of
-quality.
-
-That is not what this project's own design specifies. [`plan.md`](../plan.md) 12.2 states: *"At most
-six distinct scientific candidates **per campaign** receive a public-validation score,"* and the
-very next line explains that the log is project-wide for a different reason — *"so restarting or
-changing a campaign fingerprint does not erase the development history."* The ration is
-per-campaign; the log is project-wide. The implementation collapsed the two.
-
-Nor is the limit an organizer rule. The problem statement rations exactly one thing — *"hidden test
-scored once, on the final submission"* — and explicitly names public-validation feedback as the
-intended development signal.
-
-**We are not presenting this as an accidental drift.** A test
-(`test_project_six_slot_limit_survives_distinct_campaign_databases`) had deliberately locked in the
-lifetime behaviour, so this reverses a considered earlier decision, made when the stricter reading
-seemed the safer default.
-
-What changed, precisely: the reservation count is now scoped by `campaign_id`. What did **not**
-change:
-
-- The append-only project log still records **every** query ever made, across all campaigns. No
-  history is erased and none of the six already-spent slots is reclaimed or reused.
-- Reopening the *same* campaign against a fresh local database still cannot reissue its ration —
-  the project ledger remembers what that `campaign_id` already spent. This anti-gaming property is
-  covered by `test_six_slot_limit_is_per_campaign_and_not_reset_by_a_fresh_database`.
-- The per-campaign cap of six, the eligibility gates, and the matched-seed confirmation rule are
-  untouched.
-
-The scientific discipline this budget exists to protect — not tuning on public validation, and
-rationing how many times we look — is preserved at the campaign level, which is where our design
-placed it.
+| `maki-overnight-09` | 0 | Converged with no human action after launch. |
+| `maki-overnight-10` | 0 | Converged with no human action after launch. |
+| `maki-overnight-11` | 0 | Converged with no human action after launch. |
+| `maki-overnight-12` | 0 | Converged with no human action after launch. |
 
 ## 5. Evaluation integrity
 
@@ -304,31 +337,45 @@ the mechanisms are testable rather than promised.
   earlier feature; changing the current outcome must not alter the current feature vector;
   permuting rows within an equal-timestamp bucket must not alter features.
 
-## 6. What is not yet demonstrated
+## 6. What is not demonstrated
 
 Stated plainly, because the gap matters more than the architecture:
 
-1. **No improvement over the baseline has been demonstrated, and the evidence for that is itself
-   compromised.** No generated candidate has produced a validation-primary delta above ε = 0.002,
-   and every completed campaign terminated at `baseline_reproduced`. But defect 5 (§3.5) means
-   promotion was progressively blocked through the day and fully closed from 11:59:17, so those
-   results were measured through a closing gate. The best inner-fold result we have, +0.000578 on
-   Fold A with +0.000161 on Fold B, was discarded by that defect rather than by the science. It is
-   still far below ε, so we claim no improvement — but we cannot yet claim a clean measurement
-   either, because no campaign has run end to end with the defect fixed.
-2. **The search has not meaningfully diversified, and enforcing diversity did not fix it.** Across
-   the 8 advisory-memory campaigns, 17 of 24 admissions were the same `pairwise` family. A
-   deterministic cross-run block then refused that family 14 times in a single campaign; the model
-   re-proposed it every time and its alternatives scored bit-identical to the parent. See
-   [`agent-memory-experiment.md`](agent-memory-experiment.md) for the measurement and what we
-   built in response.
-3. **The cross-run circuit breaker has not yet had a fair test.** It is implemented and unit
-   tested, but it reads a ledger scoped by trusted-source digest, and every code change resets
-   that scope — including the change that added the breaker. It needs two consecutive campaigns on
-   an unchanged tree, which we have not yet run.
-4. **The outer-validation ration was corrected from project-lifetime to per-campaign** — see
-   §4.1. Fourteen campaigns shared a single allocation of six, and it reached zero.
-5. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
+1. **No improvement over the baseline has been demonstrated.** Four live campaigns converged and
+   every one selected the official-FM fallback. The best generated candidate reached outer primary
+   0.6012030 against an incumbent of 0.6014403, inside the baseline's own 0.0008 seed-to-seed
+   standard deviation. We have not shown a validation-primary delta above ε = 0.002, and the
+   pairwise direction was additionally swept to convergence over twelve configurations without
+   beating the baseline in any of them (§3.2).
+2. **Candidate execution, not modelling, is the current bottleneck.** Across runs 10 to 12 only one
+   of nine generated candidates executed at all; the rest raised before evaluation. Three failure
+   classes are catalogued in §3.3. A crash inside `train_model` currently ends a branch outright:
+   the repair loop covers pre-execution static gates only, so runtime defects get no fix attempt.
+   That is the clearest known structural gap in the loop.
+3. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
+
+### 6.4 Bit-exact replay is platform-bound
+
+The organizer FM is float32, and float32 arithmetic does not round identically across CPU
+architectures; Adam then compounds the difference from the first update. Running the same
+hash-pinned code, on the same hash-verified data, at the same seed, on Apple Silicon (`arm64` /
+`Darwin`) and on Linux `x86-64` produces **different checkpoint bytes**:
+
+| | expected golden | observed on x86-64 |
+|---|---|---|
+| first-update mean loss | 0.693239152431488 | 0.6932390928268433 |
+| bias bytes | `7dbf0134` | `8ac10134` |
+| V and W SHA-256 | frozen | differ |
+
+Both platforms reproduce the published validation primary to four decimals (section 3.4), so this
+is a reproducibility limit, not a correctness one. The system handles it explicitly rather than
+silently: `campaign/provenance.py` records `platform.system`, `release` and `machine` in the
+environment identity, and replay compares prediction digests exactly, so a cross-platform replay
+fails closed instead of publishing a mismatched result.
+
+The practical consequence, stated because it affects anyone reproducing this work: a final bundle
+can be replayed bit-exactly only on the platform class that produced it. We therefore build the
+submitted bundle on Linux `x86-64`, the platform a reviewer is most likely to have.
 
 ## 7. Artifact index
 
@@ -340,18 +387,6 @@ Stated plainly, because the gap matters more than the architecture:
 | Organizer verification | `runs/<run-id>/final/verification.json` |
 | Reproduction script | `runs/<run-id>/final/reproduce.sh` |
 | Per-iteration records | campaign store under `runs/<run-id>/` |
-| Per-iteration run log | `kuairand-agent iteration-log --run-dir runs/<run-id>` |
-
-The run-log deliverable (hypothesis, code diff, resulting metrics, error/recovery events per
-iteration) is emitted on demand from the campaign's own durable records:
-
-```bash
-uv run --locked --group research-tree --no-group research-neural \
-  kuairand-agent iteration-log --run-dir runs/postfix-20260830T105450Z \
-  --format md --output docs/run-logs/postfix-20260830T105450Z.md
-```
-
-`--format jsonl` emits one canonical JSON object per iteration instead.
 
 Independent verification of a retained CSV, without access to hidden-test labels:
 

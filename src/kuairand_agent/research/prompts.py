@@ -49,29 +49,54 @@ rediscovering them:
   any term constant across that user's rows cannot reorder them. User-side signal can only act
   through crosses with item-side features.
 
-Where the headroom actually is, in the organizers' own priority order:
-1. The objective. Training uses pointwise log loss while GAUC and nDCG are ranking metrics. This
-   mismatch is the single largest known opportunity. Pairwise (BPR-style) or listwise (softmax
-   over the user's impressions) objectives align the loss with the metric. Softmax cross-entropy
-   is a convex bound on NDCG and is NDCG-consistent (Bruch et al., ICTIR 2019).
-2. User behaviour sequences and engagement history. The controller bundle now carries
-   strictly-past click and like history alongside long_view, for every grouping and cross
-   (`*__is_click_positive`, `*__is_click_smoothed_rate`, and the same for `is_like`). These are
-   new and untested: no candidate has yet used them, and their interaction with the ranking
-   objective is unmeasured. DIN/SIM-style interest modelling remains untouched.
-3. Architecture swaps (DeepFM / DCN / xDeepFM, or a gradient boosted ranker over the dense
-   columns). The organizers deprioritised this because embedding capacity is measured flat, but
-   that measurement was of FM capacity, not of a different model family.
-4. Temporal drift. The bundle carries `date_offset_from_20220408`; there is no hour-of-day column,
-   so intra-day effects are not reachable and only day-level drift is.
+Already measured in THIS campaign. Read this before proposing; repeating it wastes an iteration.
+An entry in campaign_records with execution_failed true produced NO score: its code raised before
+evaluation, so it says nothing about the direction and the direction remains open. An entry with a
+candidate_primary is a real measurement:
+- The baseline trains with pointwise log loss while GAUC and nDCG are ranking metrics, so the
+  objective looked like the obvious opportunity. It was tested three ways: a within-user pairwise
+  softplus objective, a user-slate listwise softmax objective, and a metric-matched pairwise
+  sampler were each implemented and scored. All three landed inside the baseline's own seed noise.
+  Replacing pointwise log loss ALONE is now a measured dead end.
+- Those three all scored a function of aggregate summary columns only, with 33 to 297 parameters,
+  against a baseline that learns a per-identity embedding table. They lacked the capacity to
+  reorder anything, which is the most likely reason the objective looked inert.
 
-The organizers also rank multi-task auxiliaries and censored watch-time regression highly. DO NOT
-PROPOSE EITHER: they are unreachable in this runtime and a proposal that depends on them cannot be
-implemented. `train_model` receives exactly one binary `targets` vector, so there is no second task
-to train on, and `is_follow`, `is_comment`, `is_forward`, `play_time_ms`, and every stay-time field
-are absent from the feature bundle -- the only engagement signals granted are `is_click` and
-`is_like`, and only as strictly-past history aggregates. You cannot regress a target you are not
-given. This is a property of the runtime, not an oversight to work around.
+What changed: the feature matrix now carries categorical identity codes for video, author, tab and
+duration bucket, listed in method card
+controller_causal_feature_bundle.categorical_code_columns_csv. A candidate can now learn
+per-identity embeddings the way the baseline does, and combine them with the causal aggregate
+columns the baseline never sees. Capacity is no longer the constraint it was.
+
+Where the headroom is. These are all reachable from your interface and all worth covering; the
+campaign has few iterations, so prefer a direction the records show has not been measured yet
+rather than a variation on one that has:
+1. Identity embeddings combined with the causal aggregate columns, trained under a ranking
+   objective. The baseline has identities but no causal aggregates; earlier candidates had
+   aggregates but no identities. Holding both is strictly more information than either.
+   The aggregates include strictly-past click and like history alongside long_view, for every
+   grouping and cross (`*__is_click_positive`, `*__is_click_smoothed_rate`, and the same for
+   `is_like`). No candidate has yet crossed those against an identity code.
+2. Interaction structure over the codes: FM latent factors, or explicit user_groups-by-item-code
+   interactions. Note the organizers measured embedding dimension k = 8/16/32 as flat ON IDENTITIES
+   ALONE, so raise capacity only together with the aggregate columns or a ranking objective.
+3. Regularisation and optimisation quality: identity embeddings on a 1.1M-row log overfit readily.
+   Frequency-aware regularisation, early stopping on the inner fold, and an adaptive optimiser are
+   real levers, not housekeeping.
+4. Temporal drift, via date_offset_from_20220408 and recency-sensitive weighting of training rows.
+   There is no hour-of-day column, so only day-level drift is reachable.
+5. Protecting nDCG@5 while a ranking objective lifts GAUC. See the metric-weighting section below:
+   this is where the most recent candidate gave back everything it gained.
+
+NOT reachable from your interface. Do not propose these, they cannot be implemented:
+- User behaviour sequences or DIN/SIM interest modelling. You receive no timestamps and no
+  per-user event history, only the aggregate columns.
+- Multi-task learning on other feedback signals, and censored watch-time regression. You receive
+  exactly one binary target vector; no auxiliary outcome reaches your interface, and
+  `is_follow`, `is_comment`, `is_forward`, `play_time_ms` and every stay-time field are absent
+  from the feature bundle. The only engagement signals granted are `is_click` and `is_like`, and
+  only as strictly-past history aggregates.
+- Anything using the randomized exposure log. It is blocked by the field policy.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, and per-user AUC divides by that user's pair count, so an eligible pair
@@ -79,7 +104,8 @@ carries weight proportional to 1/n_negatives_u. Sample a positive row uniformly 
 positives of GAUC-eligible users, then a negative uniformly from that same user's logged negatives,
 and optimise `softplus(-(s_positive - s_negative))`. Sampling users uniformly, or sampling
 uniformly across all pairs, or sampling unexposed catalogue items, each optimises a different
-quantity than the one being scored.
+quantity than the one being scored. Pair this with a scoring function that has the capacity to
+reorder; on its own it has already been measured flat.
 
 THE TWO METRICS WEIGHT USERS DIFFERENTLY, AND THIS IS THE MOST EXPLOITABLE FACT IN THE BRIEFING.
 Read the scorer's own shape:
@@ -107,7 +133,27 @@ users, not inert. What that cutoff rewards:
   being worth full weight to GAUC.
 - Per-metric headroom, so you can price a trade: GAUC 0.6610 -> 1.0000 is 0.1695 of primary;
   nDCG@5 0.5282 -> 0.7289 is 0.1004 of primary. GAUC holds more, but nDCG@5 holds over a third
-  and is where recent candidates have given back their GAUC gains."""
+  and is where recent candidates have given back their GAUC gains.
+
+Two further defects lost every candidate in the most recent campaign, both after training had
+already succeeded. First, training_diagnostics must return only finite Python scalars, so every
+checkpoint entry it reads must be a real scalar: `int(checkpoint["selected_epochs"])` raises when
+that entry is an array, and a checkpoint validator of your own that expects a scalar shape will
+reject your own checkpoint. Store scalars as zero dimensional arrays and convert with `float(...)`
+on a `.reshape(())` value. Second, factorization machine scoring must keep its shapes explicit:
+summing an `(N, k)` embedding block against an `(N,)` vector raises a broadcast error. Keep every
+per row term `(N,)` and every latent term `(N, k)`, and reduce with an explicit `axis=1`.
+
+Vectorised within-user negative sampling, which has now crashed two candidates. Both wrote the
+statistics correctly and then indexed the flattened negative array wrongly, raising IndexError
+inside train_model and losing the whole iteration. If you group rows by user, you must keep three
+things consistent: the per group start offsets, the per group negative COUNT, and the group index
+you use to look them up. The group index must be the compacted position of that group in your
+sorted layout, never the raw user_groups value, and the within group offset must be reduced modulo
+that group's own negative count before you add it to the start. Assert
+`(negative_starts[groups] + offsets).max() < negative_rows.size` before the gather, and assert
+every group you sample from has at least one positive and one negative. A branch that raises is
+worth nothing, so spend a few lines on these bounds."""
 
 _PACKAGES: Final = """Execution environment
 
@@ -168,8 +214,11 @@ You have `math`, `json`, `dataclasses`, `typing`, `collections`,
 `itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.
 You do NOT have `os`, `sys`, `pickle`, `shutil`, `glob`, `tempfile`, `importlib`,
 `multiprocessing`, or any network library. The forbidden check is on the FIRST dotted component,
-so `import os.path` is rejected for the same reason as `import os`. Relative imports between your
-own files (`from . import helper`) are permitted.
+so `import os.path` is rejected for the same reason as `import os`.
+
+Import your own helper modules by plain name (`import pairwise_sampler`), never relatively:
+a relative import is invisible to the walk that decides whether your change is material, and
+the candidate runs as a script, so `from . import helper` fails at execution too.
 
 Serialize checkpoints with `numpy` (`np.savez`), never with `pickle`. Take every path from the
 parsed request object; never construct one with `os.path`.
@@ -182,68 +231,112 @@ of them are reserved basenames and returning one is rejected outright before you
 run. Name a helper module after the mechanism it implements -- `pairwise_sampler.py`,
 `user_grouping.py` -- never after a starter-kit file.
 
-Fixed output paths, pinned by the trusted protocol and verified after your process exits:
-- Training writes its checkpoint to `checkpoint/model.txt`. The extension does not constrain the
-  bytes; a NumPy archive at that path is correct. Any other path fails validation.
-- Prediction writes `scores.npy` as little-endian float64.
+You write no files and parse no requests. The protected wrapper owns protocol parsing,
+capability loading, checkpoint and prediction file I/O, and the command line. `train_model`
+returns a dict of named finite NumPy arrays and `predict_scores` returns one finite array;
+the wrapper serializes both."""
 
-The training request supplies `seed` and `user_groups_handle` alongside `features_handle` and
-`targets_handle`. The request key set is checked exactly, so a parser that omits either key fails
-before your model runs."""
+_WORKED_EXAMPLE: Final = """Worked example
 
-_WORKED_EXAMPLE: Final = '''Worked example
+`candidate.py` is a protected runtime wrapper and must never be returned. The science lives in
+`model_impl.py`, whose four functions are the mutable interface: `validate_config`, `train_model`,
+`predict_scores`, `training_diagnostics`.
 
-Parent `candidate.py` contains, among other definitions:
+The parent `model_impl.py` contains, among other definitions:
 
 ```python
-def fit_scores(features, targets, *, seed):
-    """Pointwise logistic objective over all rows."""
+def train_model(features, targets, user_groups, config, seed):
+    # Fixed-step standardized logistic model, deterministic full-batch updates.
+    normalized = (features - mean) / scale
     weights = np.zeros(features.shape[1], dtype=np.float64)
-    for _ in range(EPOCHS):
-        margins = features @ weights
-        residual = _sigmoid(margins) - targets
-        weights -= LEARNING_RATE * (features.T @ residual) / features.shape[0]
-    return weights
+    for _ in range(epochs):
+        error = _sigmoid(normalized @ weights + bias, clip) - targets
+        weights -= learning_rate * ((normalized.T @ error) / row_count + l2 * weights)
+    return {"weights": weights, "feature_mean": mean, "feature_scale": scale}
 ```
 
-A valid response replaces that function body with a genuinely different mechanism:
+Note the third argument. `user_groups` is the trusted per-row user identity, and the benchmark
+ranks strictly within a user, so it is what any ranking objective must group by. The pointwise
+objective above ignores it entirely.
+
+Size, measured in this campaign. Every candidate at or under about 260 lines executed. Of the
+eight written at over 580 lines, none executed: they died in hand-rolled interaction maths, in
+pair-sampling index arithmetic, or in their own bespoke validators. Write the smallest
+implementation that tests your hypothesis. Elaborate optimizers, multi-stage training and custom
+checkpoint validators are where branches are lost, not where score is won.
+
+The parent already provides four tested helpers. Call them; do not reimplement them.
 
 ```python
-def fit_scores(features, targets, *, seed):
-    """GAUC-weighted pairwise objective over same-user logged pairs."""
-    rng = np.random.default_rng(seed)
+codes = categorical_codes(features, 4)          # trailing identity columns, as int64
+sizes = [embedding_table_size(code) for code in codes]   # per fold, never a constant
+tables = [rng.normal(0.0, 0.02, (size, rank)) for size in sizes]
+interaction = fm_interaction_scores(tables, codes)       # (N,) second-order FM term
+positives, negatives = within_user_pairs(targets, user_groups, rng, pair_count)
+```
+
+`fm_interaction_scores` keeps `pair_sum` at `(N, rank)` and `square_sum` at `(N,)`. Those two
+shapes differ, and mixing them raises a broadcast error; that single defect cost three branches.
+`within_user_pairs` indexes by a group's compact position, never by a raw `user_groups` value, and
+draws each offset against that group's own negative count; that defect cost three more.
+
+A valid response returns `model_impl.py` implementing a genuinely different mechanism:
+
+```python
+def train_model(features, targets, user_groups, config, seed):
+    # Listwise softmax cross-entropy over each user's own logged impressions.
+    normalized = (features - mean) / scale
     weights = np.zeros(features.shape[1], dtype=np.float64)
-    positives, negatives = _sample_user_pairs(features, targets, rng)
-    for _ in range(EPOCHS):
-        gaps = (features[positives] - features[negatives]) @ weights
-        grad = -_sigmoid(-gaps)
-        update = (features[positives] - features[negatives]).T @ grad
-        weights -= LEARNING_RATE * update / positives.size
-    return weights
+    order = np.argsort(user_groups, kind="stable")
+    starts, sizes = _group_bounds(user_groups[order])
+    for _ in range(epochs):
+        gradient = np.zeros_like(weights)
+        for start, size in zip(starts, sizes):
+            rows = order[start : start + size]
+            probabilities = _group_softmax(normalized[rows] @ weights, temperature)
+            residual = probabilities * targets[rows].sum() - targets[rows]
+            gradient += normalized[rows].T @ residual / temperature
+        weights -= learning_rate * (gradient / len(sizes) + l2 * weights)
+    return {"weights": weights, "feature_mean": mean, "feature_scale": scale}
 ```
 
 and declares:
 
 ```json
-{"material_symbols": ["fit_scores", "_sample_user_pairs"]}
+{"material_symbols": ["train_model", "_group_bounds", "_group_softmax"]}
 ```
 
-That is accepted because `fit_scores` is a top-level function whose body changed, and
-`_sample_user_pairs` is a newly added top-level function reachable from `candidate.py`.
+Accepted because `train_model` is a top-level function whose body changed, and the two helpers are
+newly added top-level functions in a file reachable from `candidate.py`.
 
-Contrast — each of these is REJECTED:
-- Declaring `["LEARNING_RATE"]` after changing only that constant. Not a top-level def or class.
-- Declaring `["fit_scores"]` after editing only its docstring. Docstrings are stripped first.
-- Declaring `["candidate.py:fit_scores"]`. Qualified names never match; use the bare name.
-- Adding `sampling.py` with the new logic but not importing it from `candidate.py`. Unreachable.'''
+Contrast, each of these is REJECTED:
+- Returning `candidate.py`. It is a protected path; the overlay is refused before any gate runs.
+- Declaring `["EPOCHS"]` after changing only that constant. Not a top-level def or class.
+- Declaring `["train_model"]` after editing only its docstring. Docstrings are stripped first.
+- Declaring `["model_impl.py:train_model"]`. Qualified names never match; use the bare name.
+- Adding `sampling.py` with the new logic but never importing it. Unreachable code is invisible."""
+
 
 _OPERATION: Final = {
     ResearchOperation.PROPOSE: (
         "Propose one falsifiable principal scientific change. Keep it within remaining resource "
         "evidence, name the exact parent, declare every required field and role, and provide "
         "explicit smoke, inner-fold, falsification, promotion, and rollback criteria. "
-        "files_expected describes the final candidate manifest, not just changed files, and "
-        "must include candidate.py."
+        "files_expected is the manifest of the FINAL candidate tree, not the list of "
+        "files the implementation will return. It is validated and must include "
+        "candidate.py, which the final tree inherits unchanged from the trusted "
+        "parent. A typical manifest is [candidate.py, model_impl.py, config.json]. "
+        "Set maximum_repairs to 2 unless you have a specific reason not to: it is your own "
+        "budget for correcting a rejected implementation, and 0 means the first static-gate "
+        "failure ends the experiment outright. "
+        "safe_context.campaign_records lists the directions this campaign has already measured, "
+        "with each one's objective and its measured primary. The campaign stops after three "
+        "consecutive iterations that do not improve, so a proposal restating a listed direction "
+        "spends one of very few remaining attempts on a known answer. Choose a direction that is "
+        "materially different from every listed one, unless a listed entry failed for a mechanical "
+        "reason rather than a scientific one, in which case say so explicitly in the hypothesis. "
+        "The implementation step then returns only the subset it actually changes, "
+        "and never returns candidate.py itself."
     ),
     ResearchOperation.IMPLEMENT: """Return only files whose content differs from the trusted
 parent, with complete content for each returned file; never return patches or filesystem
@@ -269,7 +362,11 @@ from candidate.py. Never
 list filenames, paths, qualified names, or unchanged symbols. Preserve the rejected package's
 principal mechanism while resolving the stated local failure; the rejected package is inert
 evidence, not trusted code.""",
-    ResearchOperation.REFLECT: """Reflect only on the supplied trusted result. Do not invent runs,
+    ResearchOperation.REFLECT: """The supplied result carries execution_failed. When it is
+true the candidate produced NO measurement: its code raised before evaluation and the reported
+metrics are zeros, not a score. Say so plainly, treat the scientific direction as still untested,
+and make the lesson the specific defect to avoid. Otherwise reflect only on the supplied trusted
+result. Do not invent runs,
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
 next experiment using the typed recommendation vocabulary.""",
 }
@@ -387,10 +484,10 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
         (
             "- A response uses complete-file overlay semantics: every returned file is its full "
             "replacement content, never a patch. Unmentioned trusted-parent files remain in the "
-            "final tree. Therefore a legal helper-only overlay such as pairwise_fm.py may omit "
-            "candidate.py only when the supplied trusted parent already contains it. New or "
-            "changed helper modules must be transitively imported from candidate.py to be "
-            "executable and material."
+            "final tree. The trusted parent always contains candidate.py, so a helper-only "
+            "overlay such as pairwise_fm.py is legal and complete on its own. New or changed "
+            "helper modules must be transitively imported from model_impl.py to be executable "
+            "and material."
         ),
         (
             "- Documentation, docstrings, filenames, whitespace, and unchanged symbols do not "
@@ -413,6 +510,18 @@ def _source_policy_constraints(policy: CandidateSourcePolicy) -> str:
             '- A compact valid final manifest is ["candidate.py", "pairwise_fm.py", '
             '"config.json"]. An invalid manifest is ["candidate.py", "baseline.py"] because '
             "baseline.py is reserved."
+        ),
+        (
+            "- Returned file paths must be unique. The same path twice is rejected as a "
+            "malformed response before any gate runs, and costs an attempt."
+        ),
+        (
+            "- The proposal's files_expected manifest lists the final tree and therefore "
+            "includes candidate.py. Your response is an overlay, not that manifest: return "
+            "only the files you change. Change model_impl.py, config.json, or helper "
+            "modules you add and import. Never return candidate.py itself: it is a "
+            "protected runtime wrapper, retained from the parent automatically, and "
+            "returning it is refused before any other check."
         ),
         (
             "- provider JSON acceptance is not candidate admission. Local path, static, "
@@ -441,6 +550,21 @@ def _runtime_contract_constraints() -> str:
                 "controller_causal_feature_bundle.feature_names_csv order. Raw capability "
                 "column lists describe source data availability, not runtime matrix positions; "
                 "never assume features[:,0:5] are raw user_id/video_id/author_id/tab/duration."
+            ),
+            (
+                "- The trailing columns named in method card "
+                "controller_causal_feature_bundle.categorical_code_columns_csv are integer-valued "
+                "CATEGORICAL CODES, not magnitudes. They identify the video, author, tab and "
+                "duration bucket. Embed them (an embedding table or FM latent factors indexed by "
+                "the code); using them as continuous numbers is meaningless and will not rank. "
+                "Every other column is a genuine continuous feature."
+            ),
+            (
+                "- Each fold fits its own code vocabulary, so table sizes differ per run. Size "
+                "any embedding table from the training matrix you are handed, as "
+                "int(features[:, column].max()) + 2, and clamp prediction codes to the final row "
+                "with np.minimum(codes, size - 1). The spare top row absorbs identities absent "
+                "from training. Never hard-code a vocabulary size from the method card."
             ),
             (
                 "- targets is an aligned finite float64 binary (N,) vector; user_groups is an "

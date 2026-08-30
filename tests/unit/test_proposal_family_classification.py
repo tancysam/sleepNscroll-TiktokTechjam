@@ -12,7 +12,7 @@ while a missed block spends one training run that then gets measured on its meri
 
 from __future__ import annotations
 
-from kuairand_agent.research.production import _proposal_family
+from kuairand_agent.research.production import proposal_family_of
 from kuairand_agent.research.schemas import Proposal
 
 
@@ -21,7 +21,7 @@ def _family(objective: str, mechanism: str, principal_change: str) -> str:
     object.__setattr__(proposal, "objective", objective)
     object.__setattr__(proposal, "mechanism", mechanism)
     object.__setattr__(proposal, "principal_change", principal_change)
-    return _proposal_family(proposal)
+    return proposal_family_of(proposal)
 
 
 def test_listwise_proposal_disclaiming_pairwise_is_classified_listwise() -> None:

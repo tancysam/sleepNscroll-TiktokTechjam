@@ -38,10 +38,13 @@ def test_source_generation_prompts_define_overlay_and_material_symbol_semantics(
     instructions = instructions_for(operation)
 
     assert "Unmentioned trusted-parent files remain in the final tree" in instructions
-    assert (
-        "may omit candidate.py only when the supplied trusted parent already contains it"
-        in instructions
+    # The parent always contains candidate.py, so the old conditional wording ("may omit it only
+    # when the parent already contains it") was vacuous and reintroduced the doubt that cost a
+    # live campaign its first branch. The overlay is unconditionally legal without it.
+    assert "a helper-only overlay such as pairwise_fm.py is legal and complete on its own" in (
+        instructions
     )
+    assert "only when the supplied trusted parent already contains it" not in instructions
     assert "reachable top-level Python identifiers actually changed" in instructions
     assert (
         "Documentation, docstrings, filenames, whitespace, and unchanged symbols do not count"
@@ -72,10 +75,23 @@ def test_model_generation_prompt_defines_one_general_model_interface() -> None:
 
 
 def test_proposal_prompt_requires_a_legal_final_manifest() -> None:
-    instructions = instructions_for(ResearchOperation.PROPOSE)
+    """files_expected is the FINAL TREE manifest, and the entrypoint is validated.
 
-    assert "files_expected describes the final candidate manifest" in instructions
+    provider._parse calls source_policy.validate_manifest(proposal.files_expected,
+    require_final_entrypoint=True) with no parent_paths, so files_expected IS the final tree and
+    omitting candidate.py fails validation on every proposal.
+
+    The failure that made this look like a contradiction was at the other end: the model treated
+    files_expected as the list of files to return, returned candidate.py, and was refused at
+    materialization because it is a protected path. Both statements are true and they describe
+    different things -- the manifest is the resulting tree, the response is an overlay over it.
+    """
+
+    instructions = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
+
+    assert "files_expected is the manifest of the FINAL candidate tree" in instructions
     assert "must include candidate.py" in instructions
+    assert "never returns candidate.py itself" in instructions
 
 
 def test_delivered_prompt_uses_the_exact_request_policy_digest() -> None:

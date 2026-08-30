@@ -33,7 +33,7 @@ from kuairand_agent.finalization.production import (
     ProductionFinalizationOutcome,
 )
 from kuairand_agent.finalization.recipe import GeneratedLambdaRankReplayRecipe
-from kuairand_agent.finalization.report import MetricEvidence
+from kuairand_agent.finalization.report import ExperimentNarrative, MetricEvidence
 from kuairand_agent.finalization.submission_bundle import (
     FINAL_BUNDLE_SCHEMA_VERSION,
     REQUIRED_DIRECTORY_PATHS,
@@ -336,6 +336,7 @@ def test_generated_bundle_rejects_tampered_protected_bootstrap_point() -> None:
 
 def test_generated_resource_provenance_separates_selected_training_from_report_envelope(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     candidate_peaks = (948_830_208, 941_211_648, 948_617_216)
     fm_peaks = (1_843_101_696, 1_700_000_000, 1_650_000_000)
@@ -432,6 +433,7 @@ def test_generated_resource_provenance_separates_selected_training_from_report_e
         environment_digest=environment_digest,
     )
     outcome = SimpleNamespace(
+        run_dir=tmp_path,
         selection=SimpleNamespace(representative_seed=0),
         scientific_result_digest=_digest("a"),
         manual_interventions=0,
@@ -1725,6 +1727,9 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
         f"forbidden_basename/baseline.py [{_digest('1')}] x2.",
         "Research rejection terminals: repair/materiality/declared_symbol_unchanged/"
         f"main [{_digest('2')}] x2.",
+        # The iteration and candidate are rendered because the circuit breaker refuses the same
+        # family with an identical stage/category/code/diagnostic every time, and a report whose
+        # failure lines collide is rejected as non-unique -- which killed a live campaign.
         f"Research rejection example (root) at iteration 2 for candidate-02: {_digest('1')}; "
         "reserved candidate filename is forbidden: baseline.py",
         f"Research rejection example (terminal) at iteration 2 for candidate-02: {_digest('2')}; "
@@ -2037,6 +2042,7 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
 
 def test_fallback_report_includes_research_admission_and_rejection_evidence(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     facts = production._JudgeProgressFacts(
         provider_usage="Research-model attempts=6; replay provider calls=0.",
@@ -2078,6 +2084,9 @@ def test_fallback_report_includes_research_admission_and_rejection_evidence(
     context = production._report_context(
         candidate_id="official-fm-fallback-seed-4",
         parent_id="official-fm-fallback-seed-4",
+        run_dir=tmp_path,
+        campaign_id="campaign-report-context",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
         metrics=_metrics(0.6, 0.4),
         qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
         outcome=cast(
@@ -2101,6 +2110,140 @@ def test_fallback_report_includes_research_admission_and_rejection_evidence(
         *facts.research_rejections,
     )
     assert "not agent-generated" in context.selection_rationale
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("durable per-iteration research evidence is unreadable"),
+        ValueError("experiment hypothesis must not contain a newline"),
+        OSError("lineage directory disappeared under the reader"),
+    ],
+)
+def test_report_context_degrades_when_the_trajectory_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    """Recovering the trajectory is presentation; failing to recover it must not abort finalization.
+
+    ``collect_iteration_narratives`` can raise three unrelated exception types -- the evidence
+    error, a ``RuntimeError`` from the journal reader, and a ``ValueError`` from the report text
+    validator.  Only the first was caught, and it was re-raised rather than degraded, so a
+    campaign holding a valid bundle could still finish with nothing published.  The campaign store
+    and the immutable lineage files remain the evidence of record either way.
+    """
+
+    def explode(*_args: object, **_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(production, "collect_iteration_narratives", explode)
+    monkeypatch.setattr(production, "_report_peak_rss_bytes", lambda *_args: 1024)
+    monkeypatch.setattr(
+        production,
+        "_judge_progress_facts",
+        lambda _outcome: production._JudgeProgressFacts(
+            provider_usage="Research-model attempts=1; replay provider calls=0.",
+            portfolio_count=0,
+            portfolio_cap=50,
+            portfolio_cap_reason="repeated_pre_admission_failure",
+            advanced_branch_disposition="Advanced branches were not entered.",
+            research_progress="Research admission: branches attempted=1.",
+            research_outcome="Research admission closed before a candidate was admitted.",
+            research_rejections=(),
+        ),
+    )
+    monkeypatch.setattr(
+        production,
+        "_baseline_mean",
+        lambda _qualification: MetricEvidence(
+            label="official-fm",
+            tier="qualified baseline",
+            gauc=0.6,
+            ndcg_at_5=0.4,
+            primary=0.5,
+            seeds=(0, 1, 2, 3, 4),
+            note="Official fallback.",
+        ),
+    )
+
+    context = production._report_context(
+        candidate_id="official-fm-fallback-seed-4",
+        parent_id="official-fm-fallback-seed-4",
+        run_dir=tmp_path,
+        campaign_id="campaign-degraded-trajectory",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        metrics=_metrics(0.6, 0.4),
+        qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
+        outcome=cast(
+            Any,
+            SimpleNamespace(
+                selection=None,
+                manual_interventions=0,
+                fallback_receipt_digest=_digest("b"),
+            ),
+        ),
+        generated=False,
+        failures=(),
+        confirmation=None,
+        campaign_wall_seconds=10.0,
+        launch_count=0,
+    )
+
+    assert context.experiments
+
+
+def test_selected_candidate_keeps_its_measured_primary_in_the_trajectory() -> None:
+    """Recovered narratives carry no score, so the promoted row rendered a dash.
+
+    Lineage records hold a proposal and a package but no metric, so replacing the literal
+    narrative with the recovered ones dropped the one number in the table that is actually known.
+    """
+
+    def narrative(iteration: int, experiment_id: str) -> ExperimentNarrative:
+        return ExperimentNarrative(
+            iteration=iteration,
+            experiment_id=experiment_id,
+            parent_id="official-fm-fallback-seed-4",
+            hypothesis="Replace the pointwise objective with a pairwise one.",
+            mechanism="Sample same-user pairs and optimise softplus over the margin.",
+            material_changes=("Changed top-level symbol: fit_scores",),
+            attributions=("Organizer briefing.",),
+            status="promoted",
+        )
+
+    carried = production._with_selected_metric(
+        (narrative(1, "candidate-01"), narrative(2, "candidate-02")),
+        candidate_id="candidate-02",
+        outer_primary=0.6042,
+    )
+
+    assert carried[0].outer_primary is None
+    assert carried[1].outer_primary == 0.6042
+
+
+def test_with_selected_metric_never_overwrites_a_measured_score() -> None:
+    """A score already on the narrative is the measured one and must win."""
+
+    measured = ExperimentNarrative(
+        iteration=1,
+        experiment_id="candidate-01",
+        parent_id="official-fm-fallback-seed-4",
+        hypothesis="Replace the pointwise objective with a pairwise one.",
+        mechanism="Sample same-user pairs and optimise softplus over the margin.",
+        material_changes=("Changed top-level symbol: fit_scores",),
+        attributions=("Organizer briefing.",),
+        status="promoted",
+        outer_primary=0.6001,
+    )
+
+    carried = production._with_selected_metric(
+        (measured,),
+        candidate_id="candidate-01",
+        outer_primary=0.9999,
+    )
+
+    assert carried[0].outer_primary == 0.6001
 
 
 def test_current_runtime_reproof_rejects_source_or_lock_drift_and_is_path_independent(
@@ -2719,316 +2862,55 @@ def test_judge_ledger_exports_exact_lineage_commands_resources_and_portfolio_clo
     assert first_csv.startswith(b"record_type,record_id,candidate_id,parent_id,tier,seed,status")
 
 
-def _fake_scientific_record(
-    *,
-    request_digest: str,
-    source_snapshot_digest: str,
-    source_digest: str,
-    config_digest: str,
-    environment_digest: str,
-    primary: float,
-) -> SimpleNamespace:
-    """A scientific run record reduced to exactly the fields the exporter reads."""
+def test_scientific_runs_are_attributed_to_the_candidate_that_produced_them() -> None:
+    """A promoted campaign holds runs from every candidate, not only the winner.
 
-    empty_artifacts = SimpleNamespace(entries=())
-    return SimpleNamespace(
-        digest=request_digest,
-        request_digest=request_digest,
-        source_snapshot_digest=source_snapshot_digest,
-        checkpoint=None,
-        raw_prediction=None,
-        replay_prediction=None,
-        scored_prediction=None,
-        train_artifacts=empty_artifacts,
-        prediction_artifacts=empty_artifacts,
-        replay_artifacts=empty_artifacts,
-        manifest=lambda: {"request_digest": request_digest},
-        evidence=SimpleNamespace(
-            digest=request_digest,
-            replay_verified=True,
-            metrics=SimpleNamespace(primary=primary),
-            resources=SimpleNamespace(wall_seconds=4.0, peak_rss_bytes=4096),
-            identities=SimpleNamespace(
-                source_digest=source_digest,
-                config_digest=config_digest,
-                environment_digest=environment_digest,
-            ),
-        ),
-    )
-
-
-def _scientific_record_rows_harness(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    records: dict[str, SimpleNamespace],
-    *,
-    selected_request_digest: str,
-    selection_snapshot: str,
-    selection_source: str,
-    selection_config: str,
-    environment_digest: str,
-) -> list[dict[str, object]]:
-    record_root = tmp_path / "production" / "scientific-records"
-    record_root.mkdir(parents=True)
-    for request_digest in records:
-        (record_root / f"{request_digest}.json").write_text("{}", encoding="utf-8")
-
-    monkeypatch.setattr(
-        production,
-        "FileScientificRunEvidenceRepository",
-        lambda _root: SimpleNamespace(load=records.get),
-    )
-    selection = SimpleNamespace(
-        candidate_id="generated-candidate",
-        source_snapshot=SimpleNamespace(sha256=selection_snapshot),
-        source_digest=selection_source,
-        config_digest=selection_config,
-        matched_seeds=(
-            SimpleNamespace(
-                seed=0,
-                scientific_request_digest=selected_request_digest,
-                scientific_record_digest=selected_request_digest,
-            ),
-        ),
-    )
-    return production._scientific_record_rows(
-        run_dir=tmp_path,
-        request=cast(CampaignCreateRequest, SimpleNamespace(environment_digest=environment_digest)),
-        outcome=cast(Any, SimpleNamespace(selection=selection)),
-        artifact_store=cast(ArtifactStore, SimpleNamespace(verify=lambda _reference: None)),
-        scientific_result={"candidate_outcomes": [{"run_digests": [selected_request_digest]}]},
-    )
-
-
-def test_scientific_record_export_keeps_other_candidates_own_source_identity(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A campaign that evaluates several generated candidates still exports.
-
-    Reproduces the live `hard-block-verify-20260830T103424Z` failure: once the campaign promoted
-    one candidate, the repository held records from three distinct generated candidates (three
-    distinct source-snapshot/source/config triples). The exporter required *every* record to carry
-    the selected candidate's triple, so a campaign crashed in finalization precisely when it
-    succeeded. Only the environment digest is campaign-wide.
+    `maki-overnight-13` promoted a generated candidate for the first time and finalization died
+    with "scientific record source, config, or environment identity changed", because the export
+    required every retained run to carry the selected candidate's own source and config identity.
+    Three candidates produced three distinct source digests, so that check could never pass. The
+    same bug also labelled every exported row with the winner's id, misattributing other
+    candidates' runs in the judge ledger.
     """
 
-    selected = _digest("a")
-    other = _digest("b")
-    records = {
-        selected: _fake_scientific_record(
-            request_digest=selected,
-            source_snapshot_digest=_digest("1"),
-            source_digest=_digest("2"),
-            config_digest=_digest("3"),
-            environment_digest=_digest("9"),
-            primary=0.61,
-        ),
-        other: _fake_scientific_record(
-            request_digest=other,
-            source_snapshot_digest=_digest("4"),
-            source_digest=_digest("5"),
-            config_digest=_digest("6"),
-            environment_digest=_digest("9"),
-            primary=0.58,
-        ),
-    }
+    outcomes = [
+        {"candidate_id": "candidate-01-winner", "run_digests": [_digest("a"), _digest("b")]},
+        {"candidate_id": "candidate-02-other", "run_digests": [_digest("c")]},
+        {"candidate_id": "candidate-03-other", "run_digests": [_digest("d")]},
+    ]
 
-    rows = _scientific_record_rows_harness(
-        monkeypatch,
-        tmp_path,
-        records,
-        selected_request_digest=selected,
-        selection_snapshot=_digest("1"),
-        selection_source=_digest("2"),
-        selection_config=_digest("3"),
-        environment_digest=_digest("9"),
+    owners, expected, selected = production._candidate_run_ownership(
+        outcomes, selected_candidate_id="candidate-01-winner"
     )
 
-    assert len(rows) == 2
-    decisions = {
-        row["record_id"]: cast(dict[str, object], row["summary"])["decision"] for row in rows
-    }
-    assert decisions[selected] == "replay_verified_scientific_result_run"
-    assert decisions[other] == "retained_unreferenced_scientific_run"
+    assert expected == {_digest("a"), _digest("b"), _digest("c"), _digest("d")}
+    # Only the winner's own runs may be held to the selection's source and config identity.
+    assert selected == {_digest("a"), _digest("b")}
+    # Every run keeps its real owner, so the ledger cannot misattribute a losing candidate's run.
+    assert owners[_digest("c")] == "candidate-02-other"
+    assert owners[_digest("d")] == "candidate-03-other"
+    assert owners[_digest("a")] == "candidate-01-winner"
 
 
-def test_scientific_record_export_rejects_a_forged_source_identity_mix(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Claiming the selected snapshot while carrying a different source digest still fails."""
+def test_candidate_run_ownership_rejects_malformed_outcomes() -> None:
+    with pytest.raises(ProductionFinalizationError, match="candidate outcome is malformed"):
+        production._candidate_run_ownership(["not a mapping"], selected_candidate_id="x")
 
-    selected = _digest("a")
-    forged = _digest("b")
-    records = {
-        selected: _fake_scientific_record(
-            request_digest=selected,
-            source_snapshot_digest=_digest("1"),
-            source_digest=_digest("2"),
-            config_digest=_digest("3"),
-            environment_digest=_digest("9"),
-            primary=0.61,
-        ),
-        forged: _fake_scientific_record(
-            request_digest=forged,
-            source_snapshot_digest=_digest("1"),
-            source_digest=_digest("5"),
-            config_digest=_digest("3"),
-            environment_digest=_digest("9"),
-            primary=0.58,
-        ),
-    }
-
-    with pytest.raises(ProductionFinalizationError, match="source, config, or environment"):
-        _scientific_record_rows_harness(
-            monkeypatch,
-            tmp_path,
-            records,
-            selected_request_digest=selected,
-            selection_snapshot=_digest("1"),
-            selection_source=_digest("2"),
-            selection_config=_digest("3"),
-            environment_digest=_digest("9"),
+    with pytest.raises(ProductionFinalizationError, match="run digests are malformed"):
+        production._candidate_run_ownership(
+            [{"candidate_id": "x", "run_digests": "not a list"}], selected_candidate_id="x"
         )
 
 
-def test_scientific_record_export_rejects_a_changed_environment_on_any_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The environment digest is campaign-wide, so it is still enforced on every record."""
+def test_candidate_run_ownership_handles_a_fallback_selection_owning_no_runs() -> None:
+    """Every previous campaign selected the fallback, which owns no scientific runs."""
 
-    selected = _digest("a")
-    other = _digest("b")
-    records = {
-        selected: _fake_scientific_record(
-            request_digest=selected,
-            source_snapshot_digest=_digest("1"),
-            source_digest=_digest("2"),
-            config_digest=_digest("3"),
-            environment_digest=_digest("9"),
-            primary=0.61,
-        ),
-        other: _fake_scientific_record(
-            request_digest=other,
-            source_snapshot_digest=_digest("4"),
-            source_digest=_digest("5"),
-            config_digest=_digest("6"),
-            environment_digest=_digest("8"),
-            primary=0.58,
-        ),
-    }
+    outcomes = [{"candidate_id": "candidate-01", "run_digests": [_digest("a")]}]
 
-    with pytest.raises(ProductionFinalizationError, match="environment identity changed"):
-        _scientific_record_rows_harness(
-            monkeypatch,
-            tmp_path,
-            records,
-            selected_request_digest=selected,
-            selection_snapshot=_digest("1"),
-            selection_source=_digest("2"),
-            selection_config=_digest("3"),
-            environment_digest=_digest("9"),
-        )
-
-
-def test_repeated_family_blocks_render_as_distinct_failure_lines() -> None:
-    """Two identical circuit-breaker refusals must not collapse into one duplicated line.
-
-    Reproduces the `runs/cb-b-112152Z` finalization crash. The deterministic proposal-family
-    circuit breaker refuses the same family with the same stage, category, code, subject and
-    diagnostic every time it fires, so two blocked proposals differ only by iteration and
-    candidate. Those two fields were validated but not rendered, the two lines came out
-    byte-identical, and `FinalReportContext` rejected them with "failures_and_recoveries entries
-    must be unique" -- losing the whole campaign at finalization.
-    """
-
-    fingerprint = _digest("1")
-    diagnostic = "proposal family 'pairwise' is blocked by prior admission evidence"
-    science = {
-        "research_stage_counts": {"branches_rejected_pre_execution": 2},
-        "research_rejection_summary": {
-            "branches_rejected_pre_execution": 2,
-            "root_counts": [
-                {
-                    "fingerprint": fingerprint,
-                    "stage": "proposal_admission",
-                    "category": "novelty_policy",
-                    "code": "proposal_family_blocked",
-                    "subject": "pairwise",
-                    "count": 2,
-                }
-            ],
-            "terminal_counts": [],
-            "examples": [
-                {
-                    "scientific_iteration": iteration,
-                    "candidate_id": candidate,
-                    "proposal_family": "pairwise",
-                    "proposal_signature": None,
-                    "role": "root",
-                    "fingerprint": fingerprint,
-                    "diagnostic": diagnostic,
-                }
-                for iteration, candidate in (
-                    (1, "candidate-01-1f5ee2a5"),
-                    (2, "candidate-02-0f3a5300"),
-                )
-            ],
-            "counts_truncated": False,
-            "examples_truncated": False,
-        },
-    }
-
-    lines = production._research_rejection_lines(science)
-
-    example_lines = [item for item in lines if "example" in item]
-    assert len(example_lines) == 2
-    assert len(set(example_lines)) == 2, "identical blocks must still render distinctly"
-    assert "iteration 1" in example_lines[0] and "candidate-01-1f5ee2a5" in example_lines[0]
-    assert "iteration 2" in example_lines[1] and "candidate-02-0f3a5300" in example_lines[1]
-    # The whole point: these must survive the report's uniqueness invariant.
-    assert _unique_lines_ok(tuple(lines))
-
-
-def _unique_lines_ok(values: tuple[str, ...]) -> bool:
-    from kuairand_agent.finalization.report import _unique_lines
-
-    _unique_lines(values, "failures_and_recoveries")
-    return True
-
-
-def test_recorded_metric_copies_may_differ_by_float32_rounding() -> None:
-    """Two recorded copies of one measurement must not be compared at float64 exactness.
-
-    Reproduces the `runs/batch-20260830T135900Z` finalization failure. The first generated
-    candidate ever promoted -- an interaction block over strictly-past click and like history --
-    reached bundle verification and was rejected with "representative primary differs from
-    reconstructed evidence". Its GAUC and nDCG@5 were byte-identical between the bundle headline
-    and the representative seed row; only `primary` differed, by 3e-8, because one copy had
-    crossed the scorer's float32 boundary. `_manifest_metrics` already tolerates exactly that when
-    checking primary against its own components.
-    """
-
-    headline = 0.601422905921936
-    representative = 0.6014229357242584
-    assert abs(headline - representative) > 1e-15
-    assert abs(headline - representative) < production._RECORDED_METRIC_TOLERANCE
-
-    production._require_close(
-        headline,
-        representative,
-        "representative primary",
-        abs_tol=production._RECORDED_METRIC_TOLERANCE,
+    owners, expected, selected = production._candidate_run_ownership(
+        outcomes, selected_candidate_id="official-fm-fallback-seed-4"
     )
 
-    # A genuinely different measurement is still caught.
-    with pytest.raises(ProductionFinalizationError, match="differs from reconstructed evidence"):
-        production._require_close(
-            headline,
-            headline + 1e-5,
-            "representative primary",
-            abs_tol=production._RECORDED_METRIC_TOLERANCE,
-        )
-
-    # Reconstructed values, compared by identical float64 arithmetic, stay exact by default.
-    with pytest.raises(ProductionFinalizationError, match="differs from reconstructed evidence"):
-        production._require_close(headline, representative, "seed 0 primary")
+    assert expected == {_digest("a")}
+    assert selected == set()
+    assert owners[_digest("a")] == "candidate-01"

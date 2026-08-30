@@ -221,6 +221,7 @@ def _observe_candidate_failure(
     )
 
 
+
 # A proposal that names a family only to disclaim it is not a proposal in that family. Once the
 # propose instructions list the closed families, the model states which one it is avoiding, and a
 # bare substring match then blocks exactly the proposals that heeded the instruction. Observed in
@@ -262,7 +263,7 @@ def _affirmative_clauses(text: str) -> tuple[str, ...]:
     )
 
 
-def _proposal_family(proposal: Proposal) -> str:
+def proposal_family_of(proposal: Proposal) -> str:
     scientific_text = " ".join(
         (proposal.objective, proposal.mechanism, proposal.principal_change)
     ).lower()
@@ -1151,7 +1152,7 @@ def prepare_or_rehydrate_live_lineage(
         )
         proposal = model.propose(proposal_request)
         candidate_id = f"candidate-{scientific_iteration:02d}-{proposal.digest[:16]}"
-        proposal_family = _proposal_family(proposal)
+        proposal_family = proposal_family_of(proposal)
         try:
             proposal_request.source_policy.validate_manifest(
                 proposal.files_expected,
@@ -1281,7 +1282,7 @@ def prepare_or_rehydrate_live_lineage(
                         diagnostic=str(exc),
                         root_failure=root_failure,
                         terminal_failure=observed_failure,
-                        proposal_family=_proposal_family(proposal),
+                        proposal_family=proposal_family_of(proposal),
                         proposal_signature=_proposal_signature(proposal),
                     ) from exc
                 failed_child = (
@@ -1400,4 +1401,5 @@ __all__ = [
     "prepare_or_rehydrate_live_lineage",
     "prepare_or_rehydrate_scripted_lambdarank_lineage",
     "prepare_scripted_lambdarank_lineage",
+    "proposal_family_of",
 ]

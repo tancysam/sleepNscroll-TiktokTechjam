@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
-from typing import Literal, Protocol, cast
+from typing import Final, Literal, Protocol, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -86,10 +86,7 @@ from kuairand_agent.campaign.provenance import (
     capture_environment_identity,
     hash_source_tree,
 )
-from kuairand_agent.campaign.pure_features import (
-    identity_cardinalities,
-    identity_vocabularies,
-)
+from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.campaign.qualification_evidence import (
     OfficialFMQualificationEvidence,
     OfficialFMSeedEvidence,
@@ -98,6 +95,8 @@ from kuairand_agent.campaign.qualification_evidence import (
 )
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateCampaignResult,
+    CandidateOutcome,
     ExecutableChangeEvidence,
     OuterPromotionRequest,
     ScientificCampaignCancelled,
@@ -166,7 +165,7 @@ from kuairand_agent.research.factory import (
     ProviderUnavailableDiagnostic,
     select_research_provider,
 )
-from kuairand_agent.research.interface import ResearchModel
+from kuairand_agent.research.interface import ResearchModel, ResearchModelError
 from kuairand_agent.research.loop import CampaignStoreResearchLedger
 from kuairand_agent.research.materialize import snapshot_materialized_candidate
 from kuairand_agent.research.production import (
@@ -174,12 +173,13 @@ from kuairand_agent.research.production import (
     SCRIPTED_PARENT_ID,
     LiveResearchBranchRejected,
     LiveResearchLineage,
+    ProductionResearchError,
     ScriptedLambdaRankLineage,
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
     prepare_or_rehydrate_scripted_lambdarank_lineage,
+    proposal_family_of,
 )
-from kuairand_agent.research.production import _proposal_family as _lineage_proposal_family
 from kuairand_agent.research.production import _proposal_signature as _lineage_proposal_signature
 from kuairand_agent.research.provider import (
     OpenAIChatCompletionsConfig,
@@ -196,6 +196,7 @@ from kuairand_agent.research.provider import (
 from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
     ParentSnapshot,
+    Proposal,
     Reflection,
     ReflectionRequest,
     ResearchOperation,
@@ -726,11 +727,6 @@ def _research_context_evidence(
 ) -> _ResearchContextEvidence:
     train_positive_count = sum(data.outer_train_labels)
     train_count = len(data.outer_train_labels)
-    identity_vocabs = identity_vocabularies(data.outer_train_inputs)
-    identity_sizes = identity_cardinalities(identity_vocabs)
-    identity_columns = tuple(
-        name for name in features.final.feature_names if name.startswith("id__")
-    )
     return _ResearchContextEvidence(
         capability_manifests=(
             _input_capability_manifest(DataPhase.TRAIN, data.outer_train_inputs),
@@ -773,6 +769,14 @@ def _research_context_evidence(
                     "feature_count": features.final.feature_count,
                     "feature_names_csv": ",".join(features.final.feature_names),
                     "feature_bundle_digest": features.digest,
+                    "categorical_code_columns_csv": ",".join(ID_CODE_FEATURE_NAMES),
+                    # Each fold fits its own vocabulary on its own training rows, so these sizes
+                    # describe the outer build only.  A candidate must size any embedding table
+                    # from the training matrix it is handed, never from these numbers.
+                    "outer_code_cardinalities_csv": ",".join(
+                        str(value) for value in features.outer_and_final.code_cardinalities
+                    ),
+                    "code_cardinalities_vary_by_fold": True,
                     "fold_b_selected_fusion_only": True,
                     "uses_public_labels_for_features": False,
                     "uses_prediction_period_outcomes": False,
@@ -783,13 +787,18 @@ def _research_context_evidence(
             AggregateRecord(
                 "controller_identity_columns",
                 {
-                    "columns_csv": ",".join(identity_columns),
-                    "cardinalities_csv": ",".join(str(size) for size in identity_sizes),
+                    "columns_csv": ",".join(ID_CODE_FEATURE_NAMES),
+                    "outer_cardinalities_csv": ",".join(
+                        str(value) for value in features.outer_and_final.code_cardinalities
+                    ),
                     "encoding": (
                         "integer codes stored as float64 in the feature matrix; vocabularies are "
                         "fitted on training rows only and every value unseen in training resolves "
                         "to that field's final code, which is the UNK slot"
                     ),
+                    # Each fold refits its vocabulary on its own training rows, so the cardinality
+                    # above describes the outer build alone and is not a constant of the campaign.
+                    "size_embeddings_from_the_training_matrix_not_this_number": True,
                     "intended_use": (
                         "learn an embedding per identity and cross it with the causal aggregate "
                         "columns; a feature constant within a user cannot reorder that user's own "
@@ -1348,6 +1357,12 @@ def _reflect(
     if candidate_result is not None and candidate_result.runs:
         outer = [item for item in candidate_result.runs if item.metrics is not None]
         run = outer[-1] if outer else None
+    # A branch that produced no run has no metrics.  Substituting the fallback's numbers here
+    # told the model its crashed candidate had tied the baseline, and overnight-11's reflection
+    # duly concluded a candidate that never executed was "indistinguishable from the official FM
+    # reference".  Report zeros with the failure flag instead, so the summary cannot be read as a
+    # measurement.
+    execution_failed = run is None or run.metrics is None
     metrics = (
         _metrics(result.fallback.outer_by_seed[0].metrics)
         if run is None or run.metrics is None
@@ -1357,9 +1372,10 @@ def _reflect(
     summary = ExperimentResultSummary(
         tier="outer" if promoted else "inner",
         status="promoted" if promoted else "rejected",
-        gauc=metrics.gauc,
-        ndcg_at_5=metrics.ndcg_at_5,
-        primary=metrics.primary,
+        gauc=0.0 if execution_failed else metrics.gauc,
+        ndcg_at_5=0.0 if execution_failed else metrics.ndcg_at_5,
+        primary=0.0 if execution_failed else metrics.primary,
+        execution_failed=execution_failed,
         runtime_seconds=0.0 if run is None else run.resources.wall_seconds,
         peak_memory_mb=(0.0 if run is None else run.resources.peak_rss_bytes / float(1024**2)),
     )
@@ -1402,7 +1418,10 @@ def _reflect(
         reflection_model = research_model
         reflection_provider = lineage.provider
         reflection_live = lineage.live_provider_used
-    reflection = reflection_model.reflect(request)
+    try:
+        reflection = reflection_model.reflect(request)
+    except ResearchModelError as exc:
+        reflection = _unavailable_reflection(exc, scientific_iteration=scientific_iteration)
     transcript = artifacts.put_bytes(
         canonical_json_bytes(
             {
@@ -1466,13 +1485,54 @@ class _AutonomousFollowupResult:
     rejected_records: tuple[AggregateRecord, ...]
 
 
+_MEASURED_TIER_RUN_COUNT: Final = 3
+
+
+def _measured_primary(
+    candidate_result: CandidateCampaignResult | None,
+    incumbent: IncumbentEvidence,
+) -> tuple[float | None, float | None, str | None]:
+    """Return the candidate's measured primary, its delta, and the tier that produced it.
+
+    The proposer sees only the records built here, so without this a direction that ran and
+    scored is indistinguishable from one that was never tried.  Runs arrive in tier order:
+    the Fold B screen, then the Fold A confirmation, then the matched outer seeds.
+    """
+
+    if candidate_result is None or not candidate_result.runs:
+        return None, None, None
+    scored = [run for run in candidate_result.runs if run.metrics is not None]
+    if not scored:
+        return None, None, None
+    if len(scored) >= _MEASURED_TIER_RUN_COUNT:
+        outer = scored[_MEASURED_TIER_RUN_COUNT - 1 :]
+        primary = sum(float(run.metrics.primary) for run in outer if run.metrics) / len(outer)
+        reference = sum(float(item.metrics.primary) for item in incumbent.outer_by_seed) / len(
+            incumbent.outer_by_seed
+        )
+        return primary, primary - reference, "outer_matched_seed"
+    metrics = scored[-1].metrics
+    assert metrics is not None  # narrowed by the scored filter above
+    folds = dict(incumbent.inner_by_fold)
+    fold_b = folds.get("B")
+    primary = float(metrics.primary)
+    delta = None if fold_b is None else primary - float(fold_b.primary)
+    return primary, delta, "inner_fold"
+
+
 def _iteration_record(
     result: ScientificCampaignResult,
     reflection: Reflection,
     *,
     scientific_iteration: int,
+    proposal: Proposal | None = None,
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
+    primary, delta, tier = _measured_primary(candidate_result, result.incumbent)
+    execution_failed = (
+        candidate_result is not None
+        and candidate_result.outcome is CandidateOutcome.CALLBACK_FAILED
+    )
     return AggregateRecord(
         name=f"scientific_iteration_{scientific_iteration:02d}",
         values={
@@ -1484,12 +1544,36 @@ def _iteration_record(
                 None if candidate_result is None else candidate_result.outcome.value
             ),
             "candidate_reason": None if candidate_result is None else candidate_result.reason,
+            # A crashed candidate produced no score at all.  The reflection summary cannot say so,
+            # because its schema requires three finite metrics and substitutes the fallback's, so
+            # without this flag the next proposer reads a failed branch as one that tied the
+            # baseline and has no reason to avoid repeating the defect.
+            "execution_failed": execution_failed,
+            "execution_failure_note": (
+                None
+                if not execution_failed
+                else (
+                    "This iteration produced NO measured score. Its training or prediction code "
+                    "raised an exception before any evaluation. Treat it as a code defect to "
+                    "avoid, not as evidence about the scientific direction."
+                )
+            ),
+            # The direction this iteration actually tested.  A proposer that cannot see this
+            # cannot avoid restating it, and the convergence rule allows very few attempts.
+            "proposal_family": (None if proposal is None else proposal_family_of(proposal)),
+            "proposal_objective": None if proposal is None else proposal.objective,
+            "proposal_principal_change": None if proposal is None else proposal.principal_change,
+            "candidate_primary": None if primary is None else round(primary, 6),
+            "candidate_primary_tier": tier,
+            "delta_vs_incumbent": None if delta is None else round(delta, 6),
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
             "stop_reason": result.stop_reason.value,
             "reflection_recommendation": reflection.recommendation,
             "reflection_summary": reflection.summary,
+            # Lessons are the richest thing reflection produces and were previously dropped here.
+            "reflection_lessons": " | ".join(reflection.lessons),
         },
     )
 
@@ -2260,6 +2344,64 @@ def _provider_credential_envs(
     return tuple(endpoint.config.api_key_env for _, endpoint in model.provider_models)
 
 
+def _unavailable_reflection(
+    exc: BaseException,
+    *,
+    scientific_iteration: int,
+) -> Reflection:
+    """Stand in for a reflection the provider did not return.
+
+    Reflection is commentary on a result the controller already owns, so a provider failure here
+    must degrade rather than propagate out of the research loop.  The diagnostic is collapsed to
+    one line because ``report._text`` rejects newlines that ``schemas._text`` permits, and this
+    text is model- and transport-authored.
+    """
+
+    detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+    return Reflection(
+        response_id=f"reflection-unavailable-{scientific_iteration:02d}",
+        summary=("The research provider did not return a reflection for this iteration: " + detail),
+        recommendation="close_branch",
+        lessons=("Provider reflection was unavailable; the measured result stands.",),
+    )
+
+
+def _research_closure_record(
+    exc: BaseException,
+    *,
+    scientific_iteration: int,
+    operation: str,
+) -> AggregateRecord:
+    """Record a research-plane failure that closes research without ending the campaign."""
+
+    detail = " ".join(str(exc).split())[:2048] or exc.__class__.__name__
+    code = getattr(exc, "code", None)
+    return AggregateRecord(
+        name=f"research_closure_{scientific_iteration:02d}",
+        values={
+            "scientific_iteration": scientific_iteration,
+            "branch_outcome": "research_closed_by_provider_failure",
+            "operation": operation,
+            "failure_type": type(exc).__name__,
+            "failure_code": str(getattr(code, "value", code)) if code is not None else "",
+            "diagnostic": detail,
+        },
+    )
+
+
+def _research_closure_reason(exc: BaseException) -> CampaignStopReason:
+    """Map a research-plane failure onto the terminal condition it actually represents.
+
+    The provider raises a DEADLINE error by design once the finalization reserve opens; that is a
+    scheduled stop, not a fault.
+    """
+
+    code = getattr(exc, "code", None)
+    if getattr(code, "value", None) == "deadline":
+        return CampaignStopReason.FINALIZATION_RESERVE
+    return CampaignStopReason.CANDIDATES_EXHAUSTED
+
+
 def _run_autonomous_followups(
     *,
     request: CampaignCreateRequest,
@@ -2338,7 +2480,7 @@ def _run_autonomous_followups(
                 source_digest=request.source_digest,
                 evaluation_digest=evaluation_digest,
                 candidate_id=lineage.candidate_id,
-                proposal_family=_lineage_proposal_family(lineage.proposal),
+                proposal_family=proposal_family_of(lineage.proposal),
                 proposal_signature=_lineage_proposal_signature(lineage.proposal),
                 inner_fold_a=metrics.inner_fold_a,
                 inner_fold_b=metrics.inner_fold_b,
@@ -2369,6 +2511,7 @@ def _run_autonomous_followups(
             result,
             reflection,
             scientific_iteration=runtime_template.scientific_iteration,
+            proposal=lineage.proposal,
         ),
     ]
     rejected_records = list(prior_records)
@@ -2410,6 +2553,18 @@ def _run_autonomous_followups(
         status = runtime_template.engine.status(runtime_template.run_dir)
         if status.outer_queries_remaining <= 0:
             terminal = CampaignStopReason.OUTER_PROMOTION_LIMIT
+            break
+        # ``result.elapsed_seconds`` accumulates only candidate subprocess wall time, so
+        # provider latency, materialization and reflection are invisible to it.  Measured on
+        # this project's own runs the unaccounted provider time reached 4011s in a single
+        # partial campaign, larger than the whole finalization reserve.  Phase 1 consults the
+        # real clock; this loop must too, or research runs straight through the reserve.
+        observed_deadline = runtime_template.engine.inspect_deadline(runtime_template.run_dir)
+        if observed_deadline.hard_expired:
+            terminal = CampaignStopReason.HARD_DEADLINE
+            break
+        if observed_deadline.finalization_reserve_active:
+            terminal = CampaignStopReason.FINALIZATION_RESERVE
             break
 
         iteration += 1
@@ -2460,6 +2615,24 @@ def _run_autonomous_followups(
             if root_failure_total >= 3:
                 break
             continue
+        except (ResearchModelError, ProductionResearchError) as exc:
+            # A provider or lineage failure closes research; it must never end the campaign
+            # before finalization.  Breaking here returns normally, so the caller finalizes
+            # the retained incumbent exactly as it would on any other terminal condition.
+            #
+            # ``records`` is local and dies with this frame, so the closure also goes into
+            # ``rejected_records``, which is what reaches the durable rejection ledger.  Without
+            # that the report would show research simply stopping with no stated cause.  The
+            # branch genuinely was rejected before execution, so the count stays honest.
+            closure_record = _research_closure_record(
+                exc,
+                scientific_iteration=iteration,
+                operation="lineage",
+            )
+            records.append(closure_record)
+            rejected_records.append(closure_record)
+            terminal = _research_closure_reason(exc)
+            break
         candidate_id = lineage.candidate_id
         parent_incumbent = result.incumbent
         research_ledger, experiment_id = _ensure_lineage_ledger(
@@ -2547,7 +2720,12 @@ def _run_autonomous_followups(
             research_model=research_model,
         )
         pending_admitted_records.append(
-            _iteration_record(result, reflection, scientific_iteration=iteration)
+            _iteration_record(
+                result,
+                reflection,
+                scientific_iteration=iteration,
+                proposal=lineage.proposal,
+            )
         )
         round_attempt_count += 1
         promoted = result.incumbent.candidate_id == candidate_id
@@ -4221,7 +4399,7 @@ def run_provider_free_campaign(
                     source_digest=request.source_digest,
                     evaluation_digest=evaluation_scope,
                     candidate_id=lineage.candidate_id,
-                    proposal_family=_lineage_proposal_family(lineage.proposal),
+                    proposal_family=proposal_family_of(lineage.proposal),
                     proposal_signature=_lineage_proposal_signature(lineage.proposal),
                     inner_fold_a=metrics.inner_fold_a,
                     inner_fold_b=metrics.inner_fold_b,

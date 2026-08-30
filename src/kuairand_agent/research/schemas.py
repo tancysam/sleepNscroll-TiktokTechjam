@@ -1163,6 +1163,7 @@ class ExperimentResultSummary:
     primary: float
     runtime_seconds: float
     peak_memory_mb: float
+    execution_failed: bool = False
 
     def __post_init__(self) -> None:
         _text(self.tier, "experiment_result.tier", identifier=True)
@@ -1181,6 +1182,8 @@ class ExperimentResultSummary:
                 raise SchemaValidationError(f"experiment_result.{name} must be in [0, 1]")
         if abs(self.primary - (self.gauc + self.ndcg_at_5) / 2.0) > 1e-12:
             raise SchemaValidationError("experiment_result.primary must be the metric mean")
+        if type(self.execution_failed) is not bool:
+            raise SchemaValidationError("experiment_result.execution_failed must be boolean")
         for name, value in (
             ("runtime_seconds", self.runtime_seconds),
             ("peak_memory_mb", self.peak_memory_mb),
@@ -1197,6 +1200,7 @@ class ExperimentResultSummary:
             "primary": self.primary,
             "runtime_seconds": self.runtime_seconds,
             "peak_memory_mb": self.peak_memory_mb,
+            "execution_failed": self.execution_failed,
         }
 
 

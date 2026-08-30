@@ -4,13 +4,14 @@ import numpy as np
 import pytest
 
 from kuairand_agent.campaign.pure_features import (
+    ID_CODE_FEATURE_NAMES,
     PURE_AGGREGATE_SPECS,
     PureFeatureError,
     build_pure_feature_pair,
+    code_cardinalities,
     concat_canonical_inputs,
     estimated_matrix_bytes,
-    identity_cardinalities,
-    identity_vocabularies,
+    fit_code_vocabulary,
     split_feature_matrix,
     subset_canonical_inputs,
     subset_values,
@@ -30,6 +31,93 @@ def _inputs(*, times: tuple[int, ...], suffix: str = "") -> CanonicalInputs:
         author_id=tuple(("a1", "a1", "a2", "a2")[:count]),
         time_ms=times,
     )
+
+
+def test_id_codes_are_fitted_on_prefix_rows_and_send_unseen_identities_to_the_unknown_slot() -> (
+    None
+):
+    prefix = _inputs(times=(10, 20, 30, 40))
+    # Every query identity is unseen: distinct video ids via the suffix, and a distinct author.
+    query = CanonicalInputs(
+        user_id=("u1", "u2"),
+        video_id=("vq0", "vq1"),
+        date=(20220409, 20220409),
+        duration_ms=(4_000.0, 61_000.0),
+        tab=("0", "1"),
+        author_id=("a9", "a9"),
+        time_ms=(50, 60),
+    )
+    pair = build_pure_feature_pair(
+        prefix_inputs=prefix,
+        prefix_labels=(1, 0, 1, 0),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+
+    names = pair.prefix.feature_names
+    assert names[-5:] == (
+        "user_id_code",
+        "video_id_code",
+        "author_id_code",
+        "tab_code",
+        "duration_bucket_code",
+    )
+    # 2 users, 4 videos, 2 authors, 2 tabs, 4 duration buckets, each plus an unknown slot.
+    assert pair.code_cardinalities == (3, 5, 3, 3, 5)
+
+    video, author = names.index("video_id_code"), names.index("author_id_code")
+    prefix_codes = pair.prefix.values[:, [video, author]]
+    query_codes = pair.query.values[:, [video, author]]
+    # Prefix identities occupy real slots; unseen query identities land on the unknown slot.
+    assert set(prefix_codes[:, 0].tolist()) == {0.0, 1.0, 2.0, 3.0}
+    assert query_codes[:, 0].tolist() == [4.0, 4.0]
+    assert query_codes[:, 1].tolist() == [2.0, 2.0]
+    for column, cardinality in zip(range(2), pair.code_cardinalities[1:3], strict=True):
+        assert (query_codes[:, column] < cardinality).all()
+
+
+def test_id_code_vocabulary_is_order_independent_for_simultaneous_events() -> None:
+    first = CanonicalInputs(
+        user_id=("u", "v"),
+        video_id=("b", "a"),
+        date=(20220408, 20220408),
+        duration_ms=(10_000.0, 20_000.0),
+        tab=("0", "1"),
+        author_id=("y", "x"),
+        time_ms=(10, 10),
+    )
+    second = CanonicalInputs(
+        user_id=("v", "u"),
+        video_id=("a", "b"),
+        date=(20220408, 20220408),
+        duration_ms=(20_000.0, 10_000.0),
+        tab=("1", "0"),
+        author_id=("x", "y"),
+        time_ms=(10, 10),
+    )
+    query = _inputs(times=(30, 40), suffix="-q")
+    left = build_pure_feature_pair(
+        prefix_inputs=first,
+        prefix_labels=(1, 0),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+    right = build_pure_feature_pair(
+        prefix_inputs=second,
+        prefix_labels=(0, 1),
+        query_inputs=query,
+        dataset_digest="a" * 64,
+        split_role="fold-a",
+        builder_source_digest="b" * 64,
+    )
+
+    assert left.code_cardinalities == right.code_cardinalities
+    np.testing.assert_array_equal(left.query.values, right.query.values)
+    np.testing.assert_array_equal(left.prefix.values, right.prefix.values[[1, 0]])
 
 
 def test_subset_is_positional_and_never_introduces_row_identity() -> None:
@@ -114,15 +202,9 @@ def test_feature_pair_has_frozen_schema_and_strict_past_query_state() -> None:
 
     assert pair.prefix.row_count == 2
     assert pair.query.row_count == 2
-    # 1 global prior + 3 per aggregate spec + 5 static + 5 entity identity codes.
+    # 1 global prior + 3 per aggregate spec + 5 static + 5 identity codes.
     assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + 5
-    assert pair.prefix.feature_names[-5:] == (
-        "id__user",
-        "id__video",
-        "id__author",
-        "id__tab",
-        "id__duration_bucket",
-    )
+    assert pair.prefix.feature_names[-5:] == ID_CODE_FEATURE_NAMES
     assert pair.prefix.feature_names == pair.query.feature_names
     assert "duration_at_least_18_seconds" in pair.query.feature_names
     assert all("row_id" not in name for name in pair.query.feature_names)
@@ -245,39 +327,6 @@ def test_matrix_size_admission_is_exact_and_validated() -> None:
         estimated_matrix_bytes(0, 33)
 
 
-def test_identity_codes_are_fitted_on_training_rows_and_unseen_values_fall_to_unk() -> None:
-    """The vocabulary must come from the prefix alone, exactly as the organizer's encode() does.
-
-    Query rows are validation or final-period impressions. Fitting a vocabulary over them would
-    let the query split influence the encoding the model was trained under, so anything the
-    training rows never contained has to resolve to a per-field UNK slot instead.
-    """
-
-    prefix = _inputs(times=(10, 20, 30, 40))
-    query = _inputs(times=(50, 60), suffix="-unseen")
-
-    pair = build_pure_feature_pair(
-        prefix_inputs=prefix,
-        prefix_labels=(1, 0, 1, 0),
-        query_inputs=query,
-        dataset_digest="a" * 64,
-        split_role="fold-a",
-        builder_source_digest="b" * 64,
-    )
-
-    names = pair.prefix.feature_names
-    video_column = names.index("id__video")
-    train_videos = {value for value in prefix.video_id}
-    unknown_code = float(len(train_videos))
-
-    # Every training video has its own code, all strictly below the UNK slot.
-    train_codes = pair.prefix.values[:, video_column]
-    assert sorted(train_codes) == [0.0, 1.0, 2.0, 3.0]
-    # The query's videos never appeared in training, so all of them land on UNK.
-    query_codes = pair.query.values[:, video_column]
-    assert list(query_codes) == [unknown_code, unknown_code]
-
-
 def test_identity_codes_do_not_depend_on_row_order() -> None:
     """Codes must be a pure function of the value set, or exact replay breaks.
 
@@ -296,18 +345,18 @@ def test_identity_codes_do_not_depend_on_row_order() -> None:
         time_ms=tuple(reversed(forward.time_ms)),
     )
 
-    left = identity_vocabularies(forward)
-    right = identity_vocabularies(reversed_rows)
+    left = fit_code_vocabulary(forward)
+    right = fit_code_vocabulary(reversed_rows)
 
     assert left == right
-    assert identity_cardinalities(left) == identity_cardinalities(right)
+    assert code_cardinalities(left) == code_cardinalities(right)
 
 
 def test_identity_cardinalities_reserve_one_unk_slot_per_field() -> None:
     inputs = _inputs(times=(10, 20, 30, 40))
 
-    vocabularies = identity_vocabularies(inputs)
-    cardinalities = identity_cardinalities(vocabularies)
+    vocabularies = fit_code_vocabulary(inputs)
+    cardinalities = code_cardinalities(vocabularies)
 
     # user, video, author, tab, duration_bucket -- each +1 for UNK.
     assert len(cardinalities) == 5

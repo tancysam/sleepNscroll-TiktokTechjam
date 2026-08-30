@@ -4,7 +4,6 @@ import hashlib
 import inspect
 import json
 from contextlib import nullcontext
-from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -29,6 +28,7 @@ from kuairand_agent.campaign.full_campaign import (
 )
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateOutcome,
     ScientificCampaignConfig,
     ScientificCampaignResult,
 )
@@ -37,6 +37,7 @@ from kuairand_agent.campaign.store import CampaignStore
 from kuairand_agent.contract import STARTER_FILE_SHA256
 from kuairand_agent.execution.artifacts import ArtifactKind, ArtifactRef, ArtifactStore
 from kuairand_agent.research.context import AggregateRecord
+from kuairand_agent.research.interface import ResearchModelError
 from kuairand_agent.research.production import (
     LiveResearchBranchRejected,
     ResearchFailureObservation,
@@ -393,11 +394,20 @@ def test_initial_live_lineage_portfolio_rejects_tampered_rejection_journal(
         )
 
 
-def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
+def _drive_autonomous_followups(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exercise the live outer loop with provider/model seams replaced by typed fakes."""
+    *,
+    prepare_lineage_hook: Any = None,
+    reflect_hook: Any = None,
+    deadline: Any = None,
+) -> SimpleNamespace:
+    """Exercise the live outer loop with provider/model seams replaced by typed fakes.
+
+    ``prepare_lineage_hook`` and ``reflect_hook`` are called with the scientific iteration
+    before the corresponding fake returns, so a test can make either seam raise.
+    ``deadline`` replaces what the engine reports for the real clock.
+    """
 
     config = _config()
     fallback = _fallback()
@@ -444,10 +454,23 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     class FakeEngine:
         def __init__(self) -> None:
             self.status_calls = 0
+            self.deadline_calls = 0
 
         def status(self, _run_dir: Path) -> SimpleNamespace:
             self.status_calls += 1
             return SimpleNamespace(outer_queries_remaining=6)
+
+        def inspect_deadline(self, _run_dir: Path) -> SimpleNamespace:
+            # The loop now stops on the real clock rather than a counter that cannot see
+            # provider latency, so the fake must answer that question too.
+            self.deadline_calls += 1
+            if deadline is not None:
+                observed: SimpleNamespace = deadline(self.deadline_calls)
+                return observed
+            return SimpleNamespace(
+                finalization_reserve_active=False,
+                hard_expired=False,
+            )
 
     store = FakeStore()
     engine = FakeEngine()
@@ -458,6 +481,11 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
         candidate_id="live-candidate-1",
         parent=parent,
         materialized=object(),
+        proposal=SimpleNamespace(
+            objective="stub ranking objective",
+            mechanism="stub mechanism",
+            principal_change="stub principal change",
+        ),
     )
     opaque = cast(Any, object())
     runtime_template = runtime._ScientificRuntime(
@@ -503,16 +531,17 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     def prepare_lineage(**kwargs: object) -> SimpleNamespace:
         iteration = cast(int, kwargs["scientific_iteration"])
         prepared_iterations.append(iteration)
-        if iteration == 2:
-            raise LiveResearchBranchRejected(
-                failed_candidate_id="live-candidate-2-repair-1",
-                repairs_attempted=1,
-                diagnostic="declared material symbols did not change executable source",
-            )
+        if prepare_lineage_hook is not None:
+            prepare_lineage_hook(iteration)
         return SimpleNamespace(
             candidate_id=f"live-candidate-{iteration}",
             parent=kwargs["parent"],
             materialized=object(),
+            proposal=SimpleNamespace(
+                objective="stub ranking objective",
+                mechanism="stub mechanism",
+                principal_change="stub principal change",
+            ),
         )
 
     def continue_campaign(**kwargs: object) -> ScientificCampaignResult:
@@ -534,6 +563,8 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
 
     def reflect(**kwargs: object) -> tuple[str, str, ArtifactRef, Reflection]:
         iteration = cast(int, kwargs["scientific_iteration"])
+        if reflect_hook is not None:
+            reflect_hook(iteration)
         return (
             f"reflection-request-{iteration}",
             f"reflection-response-{iteration}",
@@ -589,9 +620,40 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
         prior_records=(),
     )
 
-    assert prepared_iterations == [2, 3, 4]
-    assert cursor_history == [(1, 7), (2, 8)]
-    assert context_record_counts == [1, 2, 3]
+    return SimpleNamespace(
+        result=result,
+        prepared_iterations=prepared_iterations,
+        cursor_history=cursor_history,
+        context_record_counts=context_record_counts,
+        store=store,
+        engine=engine,
+    )
+
+
+def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected branch costs one iteration; the loop continues to exact convergence."""
+
+    def reject_the_second_branch(iteration: int) -> None:
+        if iteration == 2:
+            raise LiveResearchBranchRejected(
+                failed_candidate_id="live-candidate-2-repair-1",
+                repairs_attempted=1,
+                diagnostic="declared material symbols did not change executable source",
+            )
+
+    driven = _drive_autonomous_followups(
+        tmp_path,
+        monkeypatch,
+        prepare_lineage_hook=reject_the_second_branch,
+    )
+    result = driven.result
+
+    assert driven.prepared_iterations == [2, 3, 4]
+    assert driven.cursor_history == [(1, 7), (2, 8)]
+    assert driven.context_record_counts == [1, 2, 3]
     assert result.iterations_completed == 4
     assert result.result.convergence.completed_iterations == 3
     assert result.result.convergence.should_stop is True
@@ -599,332 +661,128 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     assert result.result.stop_reason is CampaignStopReason.CONVERGED
     assert len(result.rejected_records) == 1
     assert result.rejected_records[0].values["root_failure_code"] == "branch_rejected"
-    assert len(store.convergence_manifests) == 2
-    assert engine.status_calls == 3
+    assert len(driven.store.convergence_manifests) == 2
+    assert driven.engine.status_calls == 3
 
 
-def _breadth_fixture(
-    tmp_path: Path,
-    *,
-    proposal_breadth: int,
-) -> tuple[
-    SimpleNamespace,
-    ConvergenceState,
-    ScientificCampaignResult,
-    Reflection,
-    ArtifactRef,
-    runtime._ScientificRuntime,
-    SimpleNamespace,
-]:
-    config = _config()
-    fallback = _fallback()
-    first_convergence = ConvergenceState.initial(fallback.outer_by_seed[0].metrics.primary)
-    first_convergence = first_convergence.update_after_iteration(None)
-    first_result = ScientificCampaignResult(
-        config_digest=config.digest,
-        fallback=fallback,
-        incumbent=fallback,
-        candidates=(),
-        public_feedback=(),
-        convergence=first_convergence,
-        launches_used=config.launches_already_used + 1,
-        elapsed_seconds=1.0,
-        stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
-    )
-    first_reflection = Reflection(
-        response_id="reflection-1",
-        summary="The first branch did not materially improve the incumbent.",
-        recommendation="propose_next",
-        lessons=("Try another bounded hypothesis.",),
-    )
-    artifacts = ArtifactStore(tmp_path / "artifacts")
-    transcript = artifacts.put_bytes(b"{}", kind=ArtifactKind.LOG)
-    parent = SimpleNamespace(candidate_id="seed-parent")
-    first_lineage = SimpleNamespace(
-        candidate_id="live-candidate-1",
-        parent=parent,
-        materialized=object(),
-    )
-    opaque = cast(Any, object())
-    runtime_template = runtime._ScientificRuntime(
-        engine=cast(
-            Any, SimpleNamespace(status=lambda _run_dir: SimpleNamespace(outer_queries_remaining=6))
-        ),
-        run_dir=tmp_path,
-        campaign_store=cast(
-            Any,
-            SimpleNamespace(
-                snapshot=lambda: SimpleNamespace(revision=0),
-                set_convergence_state=lambda *_args, **_kwargs: None,
-            ),
-        ),
-        artifacts=artifacts,
-        executor=opaque,
-        lineage=cast(Any, first_lineage),
-        candidate=cast(Any, SimpleNamespace(candidate_id="live-candidate-1")),
-        experiment_id="iteration-01",
-        scientific_iteration=1,
-        config=config,
-        feature_artifacts=opaque,
-        features=opaque,
-        fold_a=opaque,
-        fold_b=opaque,
-        fold_a_query_inputs=opaque,
-        fold_b_query_inputs=opaque,
-        fold_a_scorer=opaque,
-        fold_b_scorer=opaque,
-        outer_scorer=cast(Any, SimpleNamespace(scorer=SimpleNamespace(scorer_digest="a" * 64))),
-        qualification=opaque,
-        repository=opaque,
-        evidence_registry={},
-        cancel_event=None,
-        records={},
-    )
-    request = SimpleNamespace(
-        campaign_id="autonomous-breadth",
-        benchmark_digest="b" * 64,
-        starter_manifest_digest="c" * 64,
-        source_digest="d" * 64,
-        config=SimpleNamespace(
-            validation=SimpleNamespace(outer_promotion_limit=6),
-            research=SimpleNamespace(provider="openai", proposal_breadth=proposal_breadth),
-        ),
-    )
-    return (
-        request,
-        first_convergence,
-        first_result,
-        first_reflection,
-        transcript,
-        runtime_template,
-        first_lineage,
-    )
-
-
-def test_proposal_breadth_defers_a_same_round_attempts_own_reflection(
+@pytest.mark.parametrize(
+    ("code", "expected_reason"),
+    [
+        ("deadline", CampaignStopReason.FINALIZATION_RESERVE),
+        ("http", CampaignStopReason.CANDIDATES_EXHAUSTED),
+        (None, CampaignStopReason.CANDIDATES_EXHAUSTED),
+    ],
+)
+def test_autonomous_followup_driver_closes_research_when_the_provider_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    code: str | None,
+    expected_reason: CampaignStopReason,
 ) -> None:
-    """Width 2: a non-promoted attempt's reflection must not reach the very next attempt.
+    """A provider failure must cost the branch, not the campaign.
 
-    Both attempts in the same round must see the same ``campaign_records`` — proving the second
-    idea is proposed from the round's starting evidence, not anchored to a critique of the first.
+    Only ``LiveResearchBranchRejected`` used to be caught here, so the deadline error the provider
+    raises by design once the finalization reserve opens escaped this loop, escaped the single try
+    block in the CLI, and left five hours of research with no bundle written.  The loop must now
+    return normally with a terminal reason, and a scheduled deadline must be reported as the
+    reserve rather than as candidate exhaustion.
     """
 
-    (
-        request,
-        _first_convergence,
-        first_result,
-        first_reflection,
-        transcript,
-        runtime_template,
-        first_lineage,
-    ) = _breadth_fixture(tmp_path, proposal_breadth=2)
-    config = runtime_template.config
-    fallback = first_result.fallback
-    prepared_iterations: list[int] = []
-    context_record_counts: list[int] = []
+    failure = ResearchModelError("provider refused the implementation request")
+    if code is not None:
+        failure.code = SimpleNamespace(value=code)  # type: ignore[attr-defined]
 
-    def prepare_lineage(**kwargs: object) -> SimpleNamespace:
-        iteration = cast(int, kwargs["scientific_iteration"])
-        prepared_iterations.append(iteration)
-        return SimpleNamespace(
-            candidate_id=f"live-candidate-{iteration}",
-            parent=kwargs["parent"],
-            materialized=object(),
-        )
+    def fail_the_second_branch(iteration: int) -> None:
+        if iteration == 2:
+            raise failure
 
-    def never_promoted(**kwargs: object) -> ScientificCampaignResult:
-        prior = cast(ConvergenceState, kwargs["initial_convergence"])
-        launches = cast(int, kwargs["initial_launches_used"])
-        return ScientificCampaignResult(
-            config_digest=config.digest,
-            fallback=fallback,
-            incumbent=fallback,  # never promoted: the incumbent id never matches a candidate id
-            candidates=(),
-            public_feedback=(),
-            convergence=prior.update_after_iteration(None),
-            launches_used=launches + 1,
-            elapsed_seconds=float(cast(float, kwargs["initial_elapsed_seconds"])) + 1.0,
-            stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
-        )
-
-    def reflect(**kwargs: object) -> tuple[str, str, ArtifactRef, Reflection]:
-        iteration = cast(int, kwargs["scientific_iteration"])
-        return (
-            f"reflection-request-{iteration}",
-            f"reflection-response-{iteration}",
-            transcript,
-            Reflection(
-                response_id=f"reflection-{iteration}",
-                summary="No material gain.",
-                recommendation="propose_next",
-                lessons=("Try something different.",),
-            ),
-        )
-
-    def safe_context(**kwargs: object) -> object:
-        context_record_counts.append(len(cast(tuple[object, ...], kwargs["campaign_records"])))
-        return object()
-
-    monkeypatch.setattr(runtime, "_safe_context", safe_context)
-    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare_lineage)
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_lineage_ledger",
-        lambda **kwargs: (object(), f"iteration-{kwargs['scientific_iteration']:02d}"),
+    driven = _drive_autonomous_followups(
+        tmp_path,
+        monkeypatch,
+        prepare_lineage_hook=fail_the_second_branch,
     )
-    monkeypatch.setattr(
-        runtime,
-        "_generated_scientific_candidate",
-        lambda **kwargs: SimpleNamespace(candidate_id=kwargs["candidate_id"]),
-    )
-    monkeypatch.setattr(runtime, "_open_outer_ledger", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(
-        runtime, "DurableScientificLedgerAdapter", lambda *_args, **_kwargs: object()
-    )
-    monkeypatch.setattr(runtime, "run_scientific_campaign", never_promoted)
-    monkeypatch.setattr(runtime, "_candidate_selection", lambda **_kwargs: None)
-    monkeypatch.setattr(runtime, "_reflect", reflect)
+    result = driven.result
 
-    result = runtime._run_autonomous_followups(
-        request=cast(Any, request),
-        data=cast(Any, object()),
-        runtime_template=runtime_template,
-        scientific_config=config,
-        fallback=fallback,
-        outer_ledger_path=tmp_path / "outer.sqlite3",
-        candidate_limits=cast(Any, object()),
-        dataset_digest="d" * 64,
-        context_evidence=cast(Any, object()),
-        validation_inputs=cast(Any, object()),
-        final_inputs=cast(Any, object()),
-        research_model=cast(Any, object()),
-        first_lineage=cast(Any, first_lineage),
-        first_result=first_result,
-        first_selection=None,
-        first_reflection=first_reflection,
-        first_reflection_evidence=("request-1", "response-1", transcript),
-        prior_records=(),
-    )
-
-    # Both attempts in the one round see the same pre-round evidence: 1 entry (the function's own
-    # already-flushed first-iteration record), not 2 — proving attempt 2 was not anchored to
-    # attempt 1's own reflection.
-    assert prepared_iterations == [2, 3]
-    assert context_record_counts == [1, 1]
-    assert result.result.launches_used == first_result.launches_used + 2
+    assert driven.prepared_iterations == [2]
+    assert result.result.stop_reason is expected_reason
+    closures = [
+        record
+        for record in result.rejected_records
+        if record.values["branch_outcome"] == "research_closed_by_provider_failure"
+    ]
+    assert len(closures) == 1
+    assert closures[0].values["operation"] == "lineage"
+    assert closures[0].values["failure_type"] == "ResearchModelError"
+    assert closures[0].values["failure_code"] == (code or "")
 
 
-def test_proposal_breadth_stops_a_round_early_once_promoted(
+def test_reflection_degrades_to_a_single_line_when_the_provider_fails() -> None:
+    """Reflection is commentary, so losing it must not lose the campaign.
+
+    The call into ``reflection_model.reflect`` was the one provider seam in the research loop with
+    no guard at all.  The substitute must also survive the report writer: ``schemas._text`` permits
+    newlines that ``report._text`` rejects, and a transport error message is a plausible source of
+    one, so the diagnostic is collapsed here rather than at the point of rendering.
+    """
+
+    failure = ResearchModelError("provider returned\n  a multi-line\ttransport diagnostic")
+    reflection = runtime._unavailable_reflection(failure, scientific_iteration=3)
+
+    assert reflection.response_id == "reflection-unavailable-03"
+    assert reflection.recommendation == "close_branch"
+    assert "\n" not in reflection.summary
+    assert "provider returned a multi-line transport diagnostic" in reflection.summary
+    assert reflection.lessons
+
+
+def test_reflection_degradation_never_produces_an_empty_summary() -> None:
+    """An exception can stringify to nothing, which would render as an unexplained blank."""
+
+    reflection = runtime._unavailable_reflection(ResearchModelError(), scientific_iteration=1)
+
+    assert reflection.summary.endswith("ResearchModelError")
+
+
+def test_reflection_seam_uses_the_degrading_helper() -> None:
+    """Guard the wiring, since the helper above is only useful if the seam actually calls it."""
+
+    source = inspect.getsource(runtime._reflect)
+
+    assert "except ResearchModelError as exc:" in source
+    assert "_unavailable_reflection(exc, scientific_iteration=scientific_iteration)" in source
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_reason"),
+    [
+        ("finalization_reserve_active", CampaignStopReason.FINALIZATION_RESERVE),
+        ("hard_expired", CampaignStopReason.HARD_DEADLINE),
+    ],
+)
+def test_autonomous_followup_driver_stops_on_the_real_clock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    expected_reason: CampaignStopReason,
 ) -> None:
-    """Width 2: a promoted first attempt must not trigger a wasted second attempt."""
+    """The scientific counter cannot see provider time, so the engine clock must be consulted.
 
-    (
-        request,
-        _first_convergence,
-        first_result,
-        first_reflection,
-        transcript,
-        runtime_template,
-        first_lineage,
-    ) = _breadth_fixture(tmp_path, proposal_breadth=2)
-    # Cap iterations so only one round can be attempted: proves the second attempt was skipped
-    # because the first was promoted, not merely because the campaign ran out of budget.
-    config = dataclass_replace(runtime_template.config, max_scientific_iterations=2)
-    fallback = first_result.fallback
-    prepared_iterations: list[int] = []
+    ``scientific.py`` advances ``elapsed_seconds`` only by candidate subprocess wall time.  Summing
+    the provider journals of one real overnight run gives 4011 s of latency the counter never saw,
+    which is more than the entire finalization reserve.
+    """
 
-    def prepare_lineage(**kwargs: object) -> SimpleNamespace:
-        iteration = cast(int, kwargs["scientific_iteration"])
-        prepared_iterations.append(iteration)
+    def clock(call: int) -> SimpleNamespace:
+        expired = call >= 2
         return SimpleNamespace(
-            candidate_id=f"live-candidate-{iteration}",
-            parent=kwargs["parent"],
-            materialized=object(),
+            finalization_reserve_active=expired and field == "finalization_reserve_active",
+            hard_expired=expired and field == "hard_expired",
         )
 
-    def promote_first_attempt(**kwargs: object) -> ScientificCampaignResult:
-        prior = cast(ConvergenceState, kwargs["initial_convergence"])
-        launches = cast(int, kwargs["initial_launches_used"])
-        candidates = cast(tuple[Any, ...], kwargs["candidates"])
-        candidate_id = cast(str, candidates[0].candidate_id)
-        return ScientificCampaignResult(
-            config_digest=config.digest,
-            fallback=fallback,
-            incumbent=dataclass_replace(fallback, candidate_id=candidate_id),  # promoted
-            candidates=(),
-            public_feedback=(),
-            convergence=prior.update_after_iteration(0.7),
-            launches_used=launches + 1,
-            elapsed_seconds=float(cast(float, kwargs["initial_elapsed_seconds"])) + 1.0,
-            stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
-        )
+    driven = _drive_autonomous_followups(tmp_path, monkeypatch, deadline=clock)
 
-    def reflect(**kwargs: object) -> tuple[str, str, ArtifactRef, Reflection]:
-        iteration = cast(int, kwargs["scientific_iteration"])
-        return (
-            f"reflection-request-{iteration}",
-            f"reflection-response-{iteration}",
-            transcript,
-            Reflection(
-                response_id=f"reflection-{iteration}",
-                summary="Promoted.",
-                recommendation="propose_next",
-                lessons=("Build on the promoted candidate.",),
-            ),
-        )
-
-    monkeypatch.setattr(runtime, "_safe_context", lambda **_kwargs: object())
-    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", prepare_lineage)
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_lineage_ledger",
-        lambda **kwargs: (object(), f"iteration-{kwargs['scientific_iteration']:02d}"),
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_generated_scientific_candidate",
-        lambda **kwargs: SimpleNamespace(candidate_id=kwargs["candidate_id"]),
-    )
-    monkeypatch.setattr(runtime, "_open_outer_ledger", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(
-        runtime, "DurableScientificLedgerAdapter", lambda *_args, **_kwargs: object()
-    )
-    monkeypatch.setattr(runtime, "run_scientific_campaign", promote_first_attempt)
-    monkeypatch.setattr(runtime, "_candidate_selection", lambda **_kwargs: None)
-    monkeypatch.setattr(runtime, "_reflect", reflect)
-    monkeypatch.setattr(
-        runtime,
-        "snapshot_materialized_candidate",
-        lambda materialized, *, candidate_id: SimpleNamespace(candidate_id=candidate_id),
-    )
-
-    runtime._run_autonomous_followups(
-        request=cast(Any, request),
-        data=cast(Any, object()),
-        runtime_template=runtime_template,
-        scientific_config=config,
-        fallback=fallback,
-        outer_ledger_path=tmp_path / "outer.sqlite3",
-        candidate_limits=cast(Any, object()),
-        dataset_digest="d" * 64,
-        context_evidence=cast(Any, object()),
-        validation_inputs=cast(Any, object()),
-        final_inputs=cast(Any, object()),
-        research_model=cast(Any, object()),
-        first_lineage=cast(Any, first_lineage),
-        first_result=first_result,
-        first_selection=None,
-        first_reflection=first_reflection,
-        first_reflection_evidence=("request-1", "response-1", transcript),
-        prior_records=(),
-    )
-
-    # A round of width 2 must not attempt a second candidate once the first was promoted.
-    assert prepared_iterations == [2]
+    assert driven.result.result.stop_reason is expected_reason
+    assert driven.prepared_iterations == [2]
 
 
 def test_production_runtime_preserves_active_interpreter_at_both_child_seams() -> None:
@@ -1121,83 +979,250 @@ def test_provider_free_runtime_closes_fallback_and_exactly_retries_without_final
     assert tuple((request.run_dir / "controller" / "deadline").iterdir()) == first_deadlines
 
 
-def test_repeated_followup_rejections_count_and_stop(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The follow-up loop must accumulate rejection counters and stop, like the admission loop.
+def _runs(primaries: tuple[float, ...]) -> SimpleNamespace:
+    """A candidate result carrying `primaries` in the tier order the campaign produces."""
 
-    Reproduces `runs/cb-b-112152Z`, which spent 349,550 tokens re-proposing one family the
-    controller refused fourteen times. Follow-up rejections passed no counters, so every record
-    claimed `attempt_count=1, proposal_family_blocked=False`; the model was told each repeat was
-    its first attempt, `_proposal_family_is_blocked` could never observe an in-campaign block, and
-    nothing ever ended the loop.
+    return SimpleNamespace(
+        runs=tuple(
+            SimpleNamespace(metrics=OrganizerMetrics(gauc=primary, ndcg_at_5=primary))
+            for primary in primaries
+        )
+    )
+
+
+def test_measured_primary_reports_the_outer_seed_mean_and_its_delta() -> None:
+    """Runs arrive as Fold B screen, Fold A confirmation, then the matched outer seeds."""
+
+    incumbent = _fallback(0.61)
+
+    primary, delta, tier = runtime._measured_primary(
+        cast(Any, _runs((0.57, 0.60, 0.601, 0.602, 0.603))),
+        incumbent,
+    )
+
+    assert tier == "outer_matched_seed"
+    assert primary == pytest.approx(0.602, abs=1e-9)
+    assert delta == pytest.approx(-0.008, abs=1e-9)
+
+
+def test_measured_primary_falls_back_to_the_inner_tier_before_outer_promotion() -> None:
+    incumbent = _fallback(0.61)
+
+    primary, delta, tier = runtime._measured_primary(cast(Any, _runs((0.58,))), incumbent)
+
+    assert tier == "inner_fold"
+    assert primary == pytest.approx(0.58, abs=1e-9)
+    assert delta == pytest.approx(-0.03, abs=1e-9)
+
+
+def test_measured_primary_claims_nothing_when_no_run_produced_metrics() -> None:
+    incumbent = _fallback(0.61)
+
+    assert runtime._measured_primary(None, incumbent) == (None, None, None)
+    assert runtime._measured_primary(
+        cast(Any, SimpleNamespace(runs=(SimpleNamespace(metrics=None),))),
+        incumbent,
+    ) == (None, None, None)
+
+
+def test_iteration_record_carries_the_tested_direction_and_the_reflection_lessons() -> None:
+    """The proposer sees only these records, so a tested direction must be legible in them."""
+
+    config = _config()
+    fallback = _fallback(0.61)
+    result = ScientificCampaignResult(
+        config_digest=config.digest,
+        fallback=fallback,
+        incumbent=fallback,
+        candidates=(),
+        public_feedback=(),
+        convergence=ConvergenceState.initial(0.61),
+        launches_used=config.launches_already_used + 1,
+        elapsed_seconds=1.0,
+        stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
+    )
+    reflection = Reflection(
+        response_id="reflection-1",
+        summary="The pairwise branch did not beat the incumbent.",
+        recommendation="propose_next",
+        lessons=("Objective alone is inert.", "Capacity is the binding constraint."),
+    )
+    proposal = SimpleNamespace(
+        objective="within-user pairwise softplus ranking objective",
+        mechanism="sample a positive then a negative from the same user",
+        principal_change="replace pointwise log loss",
+    )
+
+    record = runtime._iteration_record(
+        result,
+        reflection,
+        scientific_iteration=2,
+        proposal=cast(Any, proposal),
+    )
+
+    values = record.values
+    assert values["proposal_family"] == "pairwise"
+    assert values["proposal_objective"] == proposal.objective
+    assert values["proposal_principal_change"] == proposal.principal_change
+    assert "Capacity is the binding constraint." in cast(str, values["reflection_lessons"])
+    # Without a proposal the record claims no direction rather than fabricating one.
+    bare = runtime._iteration_record(result, reflection, scientific_iteration=2)
+    assert bare.values["proposal_family"] is None
+    # A branch that ran is never flagged as an execution failure.
+    assert values["execution_failed"] is False
+    assert values["execution_failure_note"] is None
+
+
+def test_a_crashed_candidate_is_recorded_as_scoreless_rather_than_as_a_baseline_tie() -> None:
+    """A crash must not read to the next proposer as a result.
+
+    ``_reflect`` substitutes the fallback's seed-0 metrics when a run produced none, because
+    ``ExperimentResultSummary`` requires three finite metrics. In run 10 that made two candidates
+    that raised IndexError inside train_model look like they had tied the baseline, so nothing in
+    the loop had any reason to avoid repeating the defect.
     """
 
-    (
+    config = _config()
+    fallback = _fallback(0.61)
+    crashed = SimpleNamespace(
+        candidate=SimpleNamespace(candidate_id="candidate-01-crashed"),
+        outcome=CandidateOutcome.CALLBACK_FAILED,
+        runs=(),
+        reason="callback_failed:CandidateExecutionError",
+    )
+    result = ScientificCampaignResult(
+        config_digest=config.digest,
+        fallback=fallback,
+        incumbent=fallback,
+        candidates=(cast(Any, crashed),),
+        public_feedback=(),
+        convergence=ConvergenceState.initial(0.61),
+        launches_used=config.launches_already_used + 1,
+        elapsed_seconds=1.0,
+        stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
+    )
+    reflection = Reflection(
+        response_id="reflection-1",
+        summary="Reported metrics matched the official FM seed 0 reference.",
+        recommendation="propose_next",
+        lessons=("Numbers matched the reference exactly.",),
+    )
+
+    values = runtime._iteration_record(result, reflection, scientific_iteration=1).values
+
+    assert values["execution_failed"] is True
+    assert values["candidate_primary"] is None
+    assert values["delta_vs_incumbent"] is None
+    assert "NO measured score" in cast(str, values["execution_failure_note"])
+
+
+def _breadth_fixture(
+    tmp_path: Path,
+    *,
+    proposal_breadth: int,
+) -> tuple[
+    SimpleNamespace,
+    ConvergenceState,
+    ScientificCampaignResult,
+    Reflection,
+    ArtifactRef,
+    runtime._ScientificRuntime,
+    SimpleNamespace,
+]:
+    config = _config()
+    fallback = _fallback()
+    first_convergence = ConvergenceState.initial(fallback.outer_by_seed[0].metrics.primary)
+    first_convergence = first_convergence.update_after_iteration(None)
+    first_result = ScientificCampaignResult(
+        config_digest=config.digest,
+        fallback=fallback,
+        incumbent=fallback,
+        candidates=(),
+        public_feedback=(),
+        convergence=first_convergence,
+        launches_used=config.launches_already_used + 1,
+        elapsed_seconds=1.0,
+        stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
+    )
+    first_reflection = Reflection(
+        response_id="reflection-1",
+        summary="The first branch did not materially improve the incumbent.",
+        recommendation="propose_next",
+        lessons=("Try another bounded hypothesis.",),
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    transcript = artifacts.put_bytes(b"{}", kind=ArtifactKind.LOG)
+    parent = SimpleNamespace(candidate_id="seed-parent")
+    first_lineage = SimpleNamespace(
+        candidate_id="live-candidate-1",
+        parent=parent,
+        materialized=object(),
+        # The iteration record attributes each run to the proposal that produced it.
+        proposal=SimpleNamespace(
+            objective="within-user pairwise objective",
+            mechanism="sample same-user pairs",
+            principal_change="replace pointwise log loss",
+        ),
+    )
+    opaque = cast(Any, object())
+    runtime_template = runtime._ScientificRuntime(
+        engine=cast(
+            Any,
+            SimpleNamespace(
+                status=lambda _run_dir: SimpleNamespace(outer_queries_remaining=6),
+                # The loop stops on the real clock, so the fake must answer that too.
+                inspect_deadline=lambda _run_dir: SimpleNamespace(
+                    finalization_reserve_active=False,
+                    hard_expired=False,
+                ),
+            ),
+        ),
+        run_dir=tmp_path,
+        campaign_store=cast(
+            Any,
+            SimpleNamespace(
+                snapshot=lambda: SimpleNamespace(revision=0),
+                set_convergence_state=lambda *_args, **_kwargs: None,
+            ),
+        ),
+        artifacts=artifacts,
+        executor=opaque,
+        lineage=cast(Any, first_lineage),
+        candidate=cast(Any, SimpleNamespace(candidate_id="live-candidate-1")),
+        experiment_id="iteration-01",
+        scientific_iteration=1,
+        config=config,
+        feature_artifacts=opaque,
+        features=opaque,
+        fold_a=opaque,
+        fold_b=opaque,
+        fold_a_query_inputs=opaque,
+        fold_b_query_inputs=opaque,
+        fold_a_scorer=opaque,
+        fold_b_scorer=opaque,
+        outer_scorer=cast(Any, SimpleNamespace(scorer=SimpleNamespace(scorer_digest="a" * 64))),
+        qualification=opaque,
+        repository=opaque,
+        evidence_registry={},
+        cancel_event=None,
+        records={},
+    )
+    request = SimpleNamespace(
+        campaign_id="autonomous-breadth",
+        benchmark_digest="b" * 64,
+        starter_manifest_digest="c" * 64,
+        source_digest="d" * 64,
+        config=SimpleNamespace(
+            validation=SimpleNamespace(outer_promotion_limit=6),
+            research=SimpleNamespace(provider="openai", proposal_breadth=proposal_breadth),
+        ),
+    )
+    return (
         request,
-        _first_convergence,
+        first_convergence,
         first_result,
         first_reflection,
         transcript,
         runtime_template,
         first_lineage,
-    ) = _breadth_fixture(tmp_path, proposal_breadth=1)
-    config = runtime_template.config
-    fallback = first_result.fallback
-    attempts: list[int] = []
-    failure = ResearchFailureObservation.create(
-        stage="proposal_admission",
-        category="novelty_policy",
-        code="proposal_family_blocked",
-        subject="pairwise",
-        diagnostic="proposal family 'pairwise' is blocked by prior admission evidence",
     )
-
-    def always_blocked(**kwargs: object) -> object:
-        iteration = cast(int, kwargs["scientific_iteration"])
-        attempts.append(iteration)
-        raise LiveResearchBranchRejected(
-            failed_candidate_id=f"candidate-{iteration:02d}",
-            repairs_attempted=0,
-            diagnostic="proposal family 'pairwise' is blocked by prior admission evidence",
-            root_failure=failure,
-            terminal_failure=failure,
-            proposal_family="pairwise",
-        )
-
-    monkeypatch.setattr(runtime, "_safe_context", lambda **_kwargs: object())
-    monkeypatch.setattr(runtime, "prepare_or_rehydrate_live_lineage", always_blocked)
-
-    result = runtime._run_autonomous_followups(
-        request=cast(Any, request),
-        data=cast(Any, object()),
-        runtime_template=runtime_template,
-        scientific_config=config,
-        fallback=fallback,
-        outer_ledger_path=tmp_path / "outer.sqlite3",
-        candidate_limits=cast(Any, object()),
-        dataset_digest="d" * 64,
-        context_evidence=cast(Any, object()),
-        validation_inputs=cast(Any, object()),
-        final_inputs=cast(Any, object()),
-        research_model=cast(Any, object()),
-        first_lineage=cast(Any, first_lineage),
-        first_result=first_result,
-        first_selection=None,
-        first_reflection=first_reflection,
-        first_reflection_evidence=("request-1", "response-1", transcript),
-        prior_records=(),
-    )
-
-    # Three identical root failures end the loop; it does not run to the iteration cap.
-    assert len(attempts) == 3
-    counters = [
-        (
-            item.values["proposal_family_attempt_count"],
-            item.values["proposal_family_blocked"],
-            item.values["root_failure_total_count"],
-        )
-        for item in result.rejected_records
-    ]
-    assert counters == [(1, False, 1), (2, True, 2), (3, True, 3)]

@@ -54,20 +54,26 @@ _STATIC_FEATURE_NAMES: Final = (
     "date_offset_from_20220408",
     "tab_numeric",
 )
-# Entity identity columns, appended after the static ones. The organizer baseline is itself an FM
-# over exactly these fields encoded to integer ids, so withholding them meant a generated candidate
-# could not express the architecture it is asked to beat, and in particular could not learn an
-# identity embedding to cross with the causal aggregates.
+# Train-fitted categorical codes.  The aggregate columns above summarize an identity's history;
+# these carry the identity itself, so a candidate can learn a per-identity embedding the way the
+# organizer FM does instead of only reweighting summaries.
 #
-# Vocabularies are fitted on the prefix (training) rows only and every unseen value falls into a
-# per-field UNK slot, mirroring the organizer's own `encode()`. Codes carry no outcome information:
-# they are dense relabelings of values the field policy already marks enabled inference inputs.
-_IDENTITY_FIELD_NAMES: Final = (
-    "id__user",
-    "id__video",
-    "id__author",
-    "id__tab",
-    "id__duration_bucket",
+# ``user_id_code`` is included deliberately, and the argument for excluding it is worth recording
+# because it is half right.  A user-constant FIRST-ORDER term cannot reorder a within-user ranking,
+# which is the organizers' own measured result.  But the organizer baseline is an FM, and its
+# dominant term is the interaction <v_user, v_video>, which varies across a user's slate and does
+# reorder it.  Dropping the user code would therefore remove the ability to express the very
+# architecture a candidate is asked to beat.  The trusted ``user_groups`` vector is not a
+# substitute: the runtime contract directs candidates to use it for grouping "without treating it
+# as a feature", so it cannot legitimately index an embedding table.  Carrying the column is
+# permissive -- a candidate that does not want 26k embedding rows simply ignores it -- whereas
+# withholding it is a capability the candidate cannot opt into.
+ID_CODE_FEATURE_NAMES: Final = (
+    "user_id_code",
+    "video_id_code",
+    "author_id_code",
+    "tab_code",
+    "duration_bucket_code",
 )
 _DATE_CHRONOLOGY_STRIDE: Final = 10_000_000_000_000
 
@@ -230,59 +236,79 @@ def _static_matrix(inputs: CanonicalInputs) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.float64)
 
 
-def _identity_values(inputs: CanonicalInputs) -> tuple[tuple[object, ...], ...]:
+def _code_source_columns(inputs: CanonicalInputs) -> tuple[tuple[str, ...], ...]:
+    """Return the categorical source column for each ID-code feature, in declared order."""
+
     return (
-        tuple(inputs.user_id),
-        tuple(inputs.video_id),
-        tuple(inputs.author_id),
-        tuple(inputs.tab),
+        tuple(str(value) for value in inputs.user_id),
+        tuple(str(value) for value in inputs.video_id),
+        tuple(str(value) for value in inputs.author_id),
+        tuple(str(value) for value in inputs.tab),
         tuple(_duration_bucket(value) for value in inputs.duration_ms),
     )
 
 
-def identity_vocabularies(inputs: CanonicalInputs) -> tuple[dict[object, int], ...]:
-    """Fit one integer vocabulary per identity field from training rows alone."""
+def fit_code_vocabulary(inputs: CanonicalInputs) -> tuple[dict[str, int], ...]:
+    """Fit one sorted categorical vocabulary per ID-code field.
 
-    # Codes are assigned in sorted value order, never first-appearance order: the vocabulary must
-    # be a pure function of the set of values so that permuting equal-timestamp rows permutes the
-    # features identically, which the builder's invariance tests and exact replay both require.
+    Codes are assigned in sorted value order rather than first-seen order.  Simultaneous events
+    may arrive in either permutation, and this module guarantees path-independent features, so a
+    first-seen assignment would make the matrix depend on input ordering.
+
+    This must only ever see prefix rows.  Fitting on query rows would let a validation or final
+    identity claim its own code, which is exactly the leak the frozen-query contract exists to
+    prevent.  Values absent from the fitted vocabulary encode to the trailing unknown slot, so
+    every code stays inside ``[0, cardinality)`` for both matrices.
+    """
+
+    if not isinstance(inputs, CanonicalInputs):
+        raise PureFeatureError("inputs must be CanonicalInputs")
     return tuple(
-        {value: code for code, value in enumerate(sorted(set(column), key=str))}
-        for column in _identity_values(inputs)
+        {value: index for index, value in enumerate(sorted(set(column)))}
+        for column in _code_source_columns(inputs)
     )
 
 
-def identity_cardinalities(vocabularies: Sequence[dict[object, int]]) -> tuple[int, ...]:
-    """Embedding sizes per identity field, including the trailing UNK slot."""
+def code_cardinalities(vocabulary: Sequence[dict[str, int]]) -> tuple[int, ...]:
+    """Return each field's code count, including its trailing unknown slot."""
 
-    return tuple(len(vocabulary) + 1 for vocabulary in vocabularies)
+    return tuple(len(table) + 1 for table in vocabulary)
 
 
-def _identity_matrix(
-    inputs: CanonicalInputs, vocabularies: Sequence[dict[object, int]]
+def _code_matrix(
+    inputs: CanonicalInputs,
+    vocabulary: Sequence[dict[str, int]],
 ) -> np.ndarray:
-    columns = _identity_values(inputs)
-    if len(columns) != len(vocabularies):
-        raise PureFeatureError("identity vocabularies and columns disagree")
-    encoded = np.empty((len(inputs), len(columns)), dtype=np.float64)
-    for index, (column, vocabulary) in enumerate(zip(columns, vocabularies, strict=True)):
-        unknown = len(vocabulary)
-        encoded[:, index] = [float(vocabulary.get(value, unknown)) for value in column]
-    return np.ascontiguousarray(encoded, dtype=np.float64)
+    columns = _code_source_columns(inputs)
+    if len(vocabulary) != len(columns):
+        raise PureFeatureError("code vocabulary does not match the declared categorical fields")
+    encoded = tuple(
+        np.asarray(
+            [table.get(value, len(table)) for value in column],
+            dtype=np.float64,
+        )
+        for column, table in zip(columns, vocabulary, strict=True)
+    )
+    values = np.column_stack(encoded)
+    if not np.isfinite(values).all():
+        raise PureFeatureError("categorical code transform produced a non-finite value")
+    return np.ascontiguousarray(values, dtype=np.float64)
 
 
 def _augment(
     causal: FeatureMatrix,
     inputs: CanonicalInputs,
-    vocabularies: Sequence[dict[object, int]],
+    vocabulary: Sequence[dict[str, int]],
 ) -> FeatureMatrix:
     if causal.row_count != len(inputs):
         raise PureFeatureError("causal and static feature rows differ")
     values = np.concatenate(
-        (causal.values, _static_matrix(inputs), _identity_matrix(inputs, vocabularies)), axis=1
+        (causal.values, _static_matrix(inputs), _code_matrix(inputs, vocabulary)),
+        axis=1,
     )
     return FeatureMatrix(
-        values, (*causal.feature_names, *_STATIC_FEATURE_NAMES, *_IDENTITY_FIELD_NAMES)
+        values,
+        (*causal.feature_names, *_STATIC_FEATURE_NAMES, *ID_CODE_FEATURE_NAMES),
     )
 
 
@@ -295,11 +321,16 @@ class PureFeaturePair:
     dataset_digest: str
     split_role: str
     causal_cache_key: str
+    code_cardinalities: tuple[int, ...] = ()
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         if self.prefix.feature_names != self.query.feature_names:
             raise PureFeatureError("prefix and query feature schemas differ")
+        if type(self.code_cardinalities) is not tuple or any(
+            type(value) is not int or value <= 0 for value in self.code_cardinalities
+        ):
+            raise PureFeatureError("code_cardinalities must be a tuple of positive integers")
         if (
             type(self.dataset_digest) is not str
             or len(self.dataset_digest) != 64
@@ -324,6 +355,8 @@ class PureFeaturePair:
             "split_role": self.split_role,
             "aggregate_specs": [spec.manifest() for spec in PURE_AGGREGATE_SPECS],
             "static_features": list(_STATIC_FEATURE_NAMES),
+            "id_code_features": list(ID_CODE_FEATURE_NAMES),
+            "code_cardinalities": list(self.code_cardinalities),
             "causal_cache_key": self.causal_cache_key,
             "prefix": self.prefix.manifest(),
             "query": self.query.manifest(),
@@ -373,14 +406,16 @@ def build_pure_feature_pair(
     )
     if causal.query is None:  # pragma: no cover - query input above makes this defensive.
         raise PureFeatureError("causal builder did not return query features")
-    # Fitted on training rows only; query rows resolve unseen values to each field's UNK slot.
-    vocabularies = identity_vocabularies(prefix_inputs)
+    # Fitted on prefix rows only, then applied unchanged to the query matrix, so a query-only
+    # identity encodes to its field's unknown slot rather than gaining a code of its own.
+    vocabulary = fit_code_vocabulary(prefix_inputs)
     return PureFeaturePair(
-        prefix=_augment(causal.prefix, prefix_inputs, vocabularies),
-        query=_augment(causal.query, query_inputs, vocabularies),
+        prefix=_augment(causal.prefix, prefix_inputs, vocabulary),
+        query=_augment(causal.query, query_inputs, vocabulary),
         dataset_digest=dataset_digest,
         split_role=split_role,
         causal_cache_key=causal.cache_key,
+        code_cardinalities=code_cardinalities(vocabulary),
     )
 
 

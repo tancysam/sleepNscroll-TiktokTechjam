@@ -283,10 +283,17 @@ def _train(request_path: Path, output: Path) -> None:
     targets = _load_numeric_array(target_path, "training targets")
     user_groups = _load_user_groups(user_group_path, features.shape[0])
     config = _load_config(config_digest)
-    checkpoint = _validate_checkpoint(
-        train_model(features, targets, user_groups, config, seed)
-    )
-    diagnostics = _validate_diagnostics(training_diagnostics(config, checkpoint))
+    checkpoint = _validate_checkpoint(train_model(features, targets, user_groups, config, seed))
+    # Diagnostics are informational only: nothing downstream scores them, and the checkpoint
+    # above is already validated.  Letting them abort a training run that has actually succeeded
+    # throws away real evaluation evidence, which is exactly what happened to two of three
+    # candidates in overnight-11, one of which had trained for over two minutes.
+    try:
+        diagnostics = _validate_diagnostics(training_diagnostics(config, checkpoint))
+    except Exception:  # Model authored code may raise anything.
+        # Diagnostics accept only finite numbers, so the failure is reported as a flag rather
+        # than as text.  It is retained in candidate_result.json for the campaign record.
+        diagnostics = {"diagnostics_failed": 1.0}
 
     _prepare_output(output)
     checkpoint_dir = output / "checkpoint"
