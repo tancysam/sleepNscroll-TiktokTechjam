@@ -2717,3 +2717,214 @@ def test_judge_ledger_exports_exact_lineage_commands_resources_and_portfolio_clo
     assert portfolio["advanced_wp7_branches_entered"] is False
     assert portfolio["advanced_wp7_disposition"].startswith("not_entered")
     assert first_csv.startswith(b"record_type,record_id,candidate_id,parent_id,tier,seed,status")
+
+
+def _fake_scientific_record(
+    *,
+    request_digest: str,
+    source_snapshot_digest: str,
+    source_digest: str,
+    config_digest: str,
+    environment_digest: str,
+    primary: float,
+) -> SimpleNamespace:
+    """A scientific run record reduced to exactly the fields the exporter reads."""
+
+    empty_artifacts = SimpleNamespace(entries=())
+    return SimpleNamespace(
+        digest=request_digest,
+        request_digest=request_digest,
+        source_snapshot_digest=source_snapshot_digest,
+        checkpoint=None,
+        raw_prediction=None,
+        replay_prediction=None,
+        scored_prediction=None,
+        train_artifacts=empty_artifacts,
+        prediction_artifacts=empty_artifacts,
+        replay_artifacts=empty_artifacts,
+        manifest=lambda: {"request_digest": request_digest},
+        evidence=SimpleNamespace(
+            digest=request_digest,
+            replay_verified=True,
+            metrics=SimpleNamespace(primary=primary),
+            resources=SimpleNamespace(wall_seconds=4.0, peak_rss_bytes=4096),
+            identities=SimpleNamespace(
+                source_digest=source_digest,
+                config_digest=config_digest,
+                environment_digest=environment_digest,
+            ),
+        ),
+    )
+
+
+def _scientific_record_rows_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    records: dict[str, SimpleNamespace],
+    *,
+    selected_request_digest: str,
+    selection_snapshot: str,
+    selection_source: str,
+    selection_config: str,
+    environment_digest: str,
+) -> list[dict[str, object]]:
+    record_root = tmp_path / "production" / "scientific-records"
+    record_root.mkdir(parents=True)
+    for request_digest in records:
+        (record_root / f"{request_digest}.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        production,
+        "FileScientificRunEvidenceRepository",
+        lambda _root: SimpleNamespace(load=records.get),
+    )
+    selection = SimpleNamespace(
+        candidate_id="generated-candidate",
+        source_snapshot=SimpleNamespace(sha256=selection_snapshot),
+        source_digest=selection_source,
+        config_digest=selection_config,
+        matched_seeds=(
+            SimpleNamespace(
+                seed=0,
+                scientific_request_digest=selected_request_digest,
+                scientific_record_digest=selected_request_digest,
+            ),
+        ),
+    )
+    return production._scientific_record_rows(
+        run_dir=tmp_path,
+        request=cast(CampaignCreateRequest, SimpleNamespace(environment_digest=environment_digest)),
+        outcome=cast(Any, SimpleNamespace(selection=selection)),
+        artifact_store=cast(ArtifactStore, SimpleNamespace(verify=lambda _reference: None)),
+        scientific_result={"candidate_outcomes": [{"run_digests": [selected_request_digest]}]},
+    )
+
+
+def test_scientific_record_export_keeps_other_candidates_own_source_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A campaign that evaluates several generated candidates still exports.
+
+    Reproduces the live `hard-block-verify-20260830T103424Z` failure: once the campaign promoted
+    one candidate, the repository held records from three distinct generated candidates (three
+    distinct source-snapshot/source/config triples). The exporter required *every* record to carry
+    the selected candidate's triple, so a campaign crashed in finalization precisely when it
+    succeeded. Only the environment digest is campaign-wide.
+    """
+
+    selected = _digest("a")
+    other = _digest("b")
+    records = {
+        selected: _fake_scientific_record(
+            request_digest=selected,
+            source_snapshot_digest=_digest("1"),
+            source_digest=_digest("2"),
+            config_digest=_digest("3"),
+            environment_digest=_digest("9"),
+            primary=0.61,
+        ),
+        other: _fake_scientific_record(
+            request_digest=other,
+            source_snapshot_digest=_digest("4"),
+            source_digest=_digest("5"),
+            config_digest=_digest("6"),
+            environment_digest=_digest("9"),
+            primary=0.58,
+        ),
+    }
+
+    rows = _scientific_record_rows_harness(
+        monkeypatch,
+        tmp_path,
+        records,
+        selected_request_digest=selected,
+        selection_snapshot=_digest("1"),
+        selection_source=_digest("2"),
+        selection_config=_digest("3"),
+        environment_digest=_digest("9"),
+    )
+
+    assert len(rows) == 2
+    decisions = {
+        row["record_id"]: cast(dict[str, object], row["summary"])["decision"] for row in rows
+    }
+    assert decisions[selected] == "replay_verified_scientific_result_run"
+    assert decisions[other] == "retained_unreferenced_scientific_run"
+
+
+def test_scientific_record_export_rejects_a_forged_source_identity_mix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Claiming the selected snapshot while carrying a different source digest still fails."""
+
+    selected = _digest("a")
+    forged = _digest("b")
+    records = {
+        selected: _fake_scientific_record(
+            request_digest=selected,
+            source_snapshot_digest=_digest("1"),
+            source_digest=_digest("2"),
+            config_digest=_digest("3"),
+            environment_digest=_digest("9"),
+            primary=0.61,
+        ),
+        forged: _fake_scientific_record(
+            request_digest=forged,
+            source_snapshot_digest=_digest("1"),
+            source_digest=_digest("5"),
+            config_digest=_digest("3"),
+            environment_digest=_digest("9"),
+            primary=0.58,
+        ),
+    }
+
+    with pytest.raises(ProductionFinalizationError, match="source, config, or environment"):
+        _scientific_record_rows_harness(
+            monkeypatch,
+            tmp_path,
+            records,
+            selected_request_digest=selected,
+            selection_snapshot=_digest("1"),
+            selection_source=_digest("2"),
+            selection_config=_digest("3"),
+            environment_digest=_digest("9"),
+        )
+
+
+def test_scientific_record_export_rejects_a_changed_environment_on_any_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The environment digest is campaign-wide, so it is still enforced on every record."""
+
+    selected = _digest("a")
+    other = _digest("b")
+    records = {
+        selected: _fake_scientific_record(
+            request_digest=selected,
+            source_snapshot_digest=_digest("1"),
+            source_digest=_digest("2"),
+            config_digest=_digest("3"),
+            environment_digest=_digest("9"),
+            primary=0.61,
+        ),
+        other: _fake_scientific_record(
+            request_digest=other,
+            source_snapshot_digest=_digest("4"),
+            source_digest=_digest("5"),
+            config_digest=_digest("6"),
+            environment_digest=_digest("8"),
+            primary=0.58,
+        ),
+    }
+
+    with pytest.raises(ProductionFinalizationError, match="environment identity changed"):
+        _scientific_record_rows_harness(
+            monkeypatch,
+            tmp_path,
+            records,
+            selected_request_digest=selected,
+            selection_snapshot=_digest("1"),
+            selection_source=_digest("2"),
+            selection_config=_digest("3"),
+            environment_digest=_digest("9"),
+        )

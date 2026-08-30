@@ -3795,6 +3795,15 @@ def _scientific_record_rows(
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ProductionFinalizationError("scientific record repository is unsafe")
     repository = FileScientificRunEvidenceRepository(record_root)
+    # The repository holds every scientific run this campaign performed, across *all* generated
+    # candidates -- see the `retained_unreferenced_scientific_run` decision below, which exists
+    # precisely for records outside the selected candidate's run set. Source-snapshot, source, and
+    # config digests are per-candidate identities, so they are pinned to the selection only for the
+    # records that actually belong to it; the environment digest is the one campaign-wide identity
+    # and stays checked on every record.
+    matched_request_digests = {
+        matched.scientific_request_digest for matched in selection.matched_seeds
+    }
     rows: list[dict[str, object]] = []
     observed_run_digests: set[str] = set()
     records_by_request: dict[str, object] = {}
@@ -3812,11 +3821,13 @@ def _scientific_record_rows(
             raise ProductionFinalizationError("scientific result has duplicate run evidence")
         observed_run_digests.add(record.evidence.digest)
         records_by_request[request_digest] = record
-        if (
+        if record.evidence.identities.environment_digest != request.environment_digest:
+            raise ProductionFinalizationError("scientific record environment identity changed")
+        claims_selected_source = record.source_snapshot_digest == selection.source_snapshot.sha256
+        if (request_digest in matched_request_digests or claims_selected_source) and (
             record.source_snapshot_digest != selection.source_snapshot.sha256
             or record.evidence.identities.source_digest != selection.source_digest
             or record.evidence.identities.config_digest != selection.config_digest
-            or record.evidence.identities.environment_digest != request.environment_digest
         ):
             raise ProductionFinalizationError(
                 "scientific record source, config, or environment identity changed"
