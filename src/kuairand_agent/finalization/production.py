@@ -923,6 +923,14 @@ class _VerifiedBundle:
     files: Mapping[str, Mapping[str, object]]
 
 
+# The organizer evaluator is float32-sensitive: NumPy 2.x preserves float32 through its nDCG
+# arithmetic, so the primary it returns is the float32 mean of GAUC and nDCG@5, while any float64
+# recomputation of those same two numbers lands one float32 ulp away.  This tolerance exists to
+# absorb exactly that, and it is why a derived primary may never be compared for exact equality
+# against a scorer-reported one.  See scoring/protected.py score_with_encoded_labels.
+_ORGANIZER_PRIMARY_DTYPE_TOLERANCE: Final = 2e-7
+
+
 def _manifest_metrics(value: object, location: str) -> dict[str, float]:
     if not isinstance(value, dict) or set(value) != {"GAUC", "nDCG@5", "primary"}:
         raise ProductionFinalizationError(f"{location} organizer metrics are incomplete")
@@ -933,7 +941,7 @@ def _manifest_metrics(value: object, location: str) -> dict[str, float]:
         result["primary"],
         (result["GAUC"] + result["nDCG@5"]) / 2.0,
         rel_tol=0.0,
-        abs_tol=2e-7,
+        abs_tol=_ORGANIZER_PRIMARY_DTYPE_TOLERANCE,
     ):
         raise ProductionFinalizationError(f"{location} primary is not the organizer mean")
     return result
@@ -941,6 +949,23 @@ def _manifest_metrics(value: object, location: str) -> dict[str, float]:
 
 def _require_close(left: float, right: float, location: str) -> None:
     if not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-15):
+        raise ProductionFinalizationError(f"{location} differs from reconstructed evidence")
+
+
+def _require_close_organizer_primary(left: float, right: float, location: str) -> None:
+    """Compare two organizer primaries that were not necessarily derived the same way.
+
+    Use this only where one side originates from the scorer and the other is recomputed, and only
+    for ``primary``.  ``GAUC`` and ``nDCG@5`` are carried through unchanged on both sides and must
+    still match exactly, which is what proves the difference is confined to the derived mean.
+    """
+
+    if not math.isclose(
+        left,
+        right,
+        rel_tol=0.0,
+        abs_tol=_ORGANIZER_PRIMARY_DTYPE_TOLERANCE,
+    ):
         raise ProductionFinalizationError(f"{location} differs from reconstructed evidence")
 
 
@@ -1096,8 +1121,16 @@ def _derive_bundle_status(manifest: Mapping[str, object]) -> FinalStatus:
             representative_record = record
     if representative is None or representative_fm is None or representative_record is None:
         raise ProductionFinalizationError("bundle representative matched seed is absent")
-    for name in ("GAUC", "nDCG@5", "primary"):
+    # The declared representative metrics come from the scorer; the matched-seed row recomputes
+    # primary as the float64 mean of the same GAUC and nDCG@5.  Those two must match exactly, and
+    # the derived mean is compared with the organizer dtype tolerance instead.
+    for name in ("GAUC", "nDCG@5"):
         _require_close(metrics[name], representative[name], f"representative {name}")
+    _require_close_organizer_primary(
+        metrics["primary"],
+        representative["primary"],
+        "representative primary",
+    )
     candidate_mean = _manifest_metrics(summary.get("candidate_mean"), "candidate seed mean")
     fm_mean = _manifest_metrics(summary.get("official_fm_mean"), "FM seed mean")
     reconstructed_candidate_mean = _mean_metric_rows(candidate_rows)

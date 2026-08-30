@@ -523,4 +523,6 @@ validating it, not before — is one we would apply earlier next time.
 - **Makendra Prasad** ([@makilover3000](https://github.com/makilover3000)) — benchmark contract
   verification against the starter kit (identifying that the planning documents encoded the wrong
   label and metrics); the research-model instruction surface, including constraint transmission
-  and the domain briefing; results, resource accounting, and submission documentation.
+  and the domain briefing; the rank-fusion audit that retracted the identical-ordering finding and
+  established that no candidate had been competitive standalone, and the identity-code feature work
+  it motivated; results, resource accounting, and submission documentation.

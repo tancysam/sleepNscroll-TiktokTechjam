@@ -11,6 +11,7 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 import kuairand_agent.finalization.production as production
@@ -246,6 +247,42 @@ def test_bundle_status_is_independently_derived_from_all_matched_seeds(
     expected: FinalStatus,
 ) -> None:
     assert production._derive_bundle_status(_generated_manifest(delta)) is expected
+
+
+def test_representative_primary_survives_the_organizer_float32_mean() -> None:
+    """A scorer-reported primary must verify against the float64 recomputation of its own parts.
+
+    The organizer evaluator is float32-sensitive, so ``validation.metrics`` carries the float32
+    mean of GAUC and nDCG@5 while the matched-seed row recomputes that mean in float64.  The two
+    land one float32 ulp apart.  Comparing them for exact equality stranded maki-overnight-15 at
+    FINALIZING with `representative primary differs from reconstructed evidence` after it became
+    the first campaign ever to promote a generated candidate and reach this branch.  Every fixture
+    here builds both sides from the same float64 helper, which is why it was never caught.
+    """
+
+    manifest = _generated_manifest(0.001)
+    validation = cast(dict[str, Any], manifest["validation"])
+    declared = cast(dict[str, float], validation["metrics"])
+    float64_mean = declared["primary"]
+    float32_mean = float(
+        (np.float32(declared["GAUC"]) + np.float32(declared["nDCG@5"])) / np.float32(2)
+    )
+    assert float32_mean != float64_mean, "fixture no longer exercises the dtype gap"
+    assert abs(float32_mean - float64_mean) < 1e-6
+
+    # The fixture aliases validation.metrics to the seed 0 row, so replace the mapping rather than
+    # mutating it; mutating would also move the matched-seed evidence this is checked against.
+    def _declare(primary: float) -> None:
+        validation["metrics"] = dict(declared) | {"primary": primary}
+
+    _declare(float32_mean)
+    assert production._derive_bundle_status(manifest) is FinalStatus.VALIDATION_IMPROVED
+
+    # The tolerance absorbs one dtype artifact and nothing larger: a primary that genuinely
+    # disagrees with the matched-seed evidence must still be refused.
+    _declare(float64_mean + 1e-5)
+    with pytest.raises(ProductionFinalizationError, match="representative primary"):
+        production._derive_bundle_status(manifest)
 
 
 def test_material_status_forgery_and_incomplete_confirmation_are_rejected() -> None:

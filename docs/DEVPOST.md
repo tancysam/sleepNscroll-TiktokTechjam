@@ -40,6 +40,10 @@ the measured number. The model then reflects on the trusted result and chooses w
 **The model proposes; code decides.** No metric in this system is ever self-reported. That single
 rule is what makes the run log trustworthy evidence rather than a transcript of claims.
 
+It is also not sufficient, which is the next section. Every metric here was computed by trusted
+code and every digest verified — and the number the agent was handed still did not mean what the
+agent thought it meant.
+
 ## What we think is interesting about it
 
 **Our agent was being lied to by its own evaluation harness, and we caught it by auditing the

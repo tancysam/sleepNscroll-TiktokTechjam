@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Final
 
+from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.research.schemas import ResearchOperation
 from kuairand_agent.research.source_policy import (
@@ -119,6 +120,16 @@ standalone, by 0.003 to 0.010 primary, against a seed-to-seed sigma of 0.0008. T
 hiding that. Your target is to beat `fold_b_control_primary` at the 100/0 point. Fusion can then
 only add to a model that is already competitive; it cannot rescue one that is not.
 
+One structural difference between those losing candidates and the control has never been tested.
+Every one of them built a single factorization-machine interaction over ALL feature columns, so 33
+standardized continuous aggregates share a latent space with the identity codes and cross with
+them. The control crosses only its categorical fields. Crossing continuous magnitudes into the
+same latent space adds many low-signal interaction terms, and that is a plausible cause of the
+persistent deficit. The untested alternative is to match the control's structure first: put ONLY
+the identity codes in the interaction term, keep the causal aggregates as separate additive
+first-order terms, and let the aggregates contribute without polluting the crosses. That is a
+smaller model than the ones that have been failing, not a larger one.
+
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive
 row uniformly from GAUC-eligible users, then a negative uniformly from that same user's logged
@@ -180,7 +191,7 @@ capability loading, checkpoint and prediction file I/O, and the command line. `t
 returns a dict of named finite NumPy arrays and `predict_scores` returns one finite array;
 the wrapper serializes both."""
 
-_WORKED_EXAMPLE: Final = """Worked example
+_WORKED_EXAMPLE_TEMPLATE: Final = """Worked example
 
 `candidate.py` is a protected runtime wrapper and must never be returned. The science lives in
 `model_impl.py`, whose four functions are the mutable interface: `validate_config`, `train_model`,
@@ -212,7 +223,7 @@ checkpoint validators are where branches are lost, not where score is won.
 The parent already provides four tested helpers. Call them; do not reimplement them.
 
 ```python
-codes = categorical_codes(features, 4)          # trailing identity columns, as int64
+codes = categorical_codes(features, $CODE_COUNT)          # trailing identity columns, as int64
 sizes = [embedding_table_size(code) for code in codes]   # per fold, never a constant
 tables = [rng.normal(0.0, 0.02, (size, rank)) for size in sizes]
 interaction = fm_interaction_scores(tables, codes)       # (N,) second-order FM term
@@ -259,6 +270,13 @@ Contrast, each of these is REJECTED:
 - Declaring `["train_model"]` after editing only its docstring. Docstrings are stripped first.
 - Declaring `["model_impl.py:train_model"]`. Qualified names never match; use the bare name.
 - Adding `sampling.py` with the new logic but never importing it. Unreachable code is invisible."""
+# Substituted rather than interpolated: this block contains dict literals, so an f-string would
+# have to escape them.  The count is derived because it has already drifted once: the identity
+# block went from four columns to five and this example kept saying four, which would have told a
+# candidate to slice off the trailing four and silently treat user_id_code as a magnitude.
+_WORKED_EXAMPLE: Final = _WORKED_EXAMPLE_TEMPLATE.replace(
+    "$CODE_COUNT", str(len(ID_CODE_FEATURE_NAMES))
+)
 
 
 _OPERATION: Final = {
@@ -409,10 +427,12 @@ def _runtime_contract_constraints() -> str:
             (
                 "- The trailing columns named in method card "
                 "controller_causal_feature_bundle.categorical_code_columns_csv are integer-valued "
-                "CATEGORICAL CODES, not magnitudes. They identify the video, author, tab and "
-                "duration bucket. Embed them (an embedding table or FM latent factors indexed by "
-                "the code); using them as continuous numbers is meaningless and will not rank. "
-                "Every other column is a genuine continuous feature."
+                "CATEGORICAL CODES, not magnitudes. There are "
+                f"{len(ID_CODE_FEATURE_NAMES)} of them "
+                f"({', '.join(ID_CODE_FEATURE_NAMES)}) and that card is authoritative; never "
+                "infer the count from an example. Embed them (an embedding table or FM latent "
+                "factors indexed by the code); using them as continuous numbers is meaningless "
+                "and will not rank. Every other column is a genuine continuous feature."
             ),
             (
                 "- Each fold fits its own code vocabulary, so table sizes differ per run. Size "
