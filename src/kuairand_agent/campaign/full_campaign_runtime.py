@@ -92,6 +92,7 @@ from kuairand_agent.campaign.qualification_evidence import (
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
     CandidateCampaignResult,
+    CandidateOutcome,
     ExecutableChangeEvidence,
     OuterPromotionRequest,
     ScientificCampaignCancelled,
@@ -1476,6 +1477,10 @@ def _iteration_record(
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
     primary, delta, tier = _measured_primary(candidate_result, result.incumbent)
+    execution_failed = (
+        candidate_result is not None
+        and candidate_result.outcome is CandidateOutcome.CALLBACK_FAILED
+    )
     return AggregateRecord(
         name=f"scientific_iteration_{scientific_iteration:02d}",
         values={
@@ -1487,6 +1492,20 @@ def _iteration_record(
                 None if candidate_result is None else candidate_result.outcome.value
             ),
             "candidate_reason": None if candidate_result is None else candidate_result.reason,
+            # A crashed candidate produced no score at all.  The reflection summary cannot say so,
+            # because its schema requires three finite metrics and substitutes the fallback's, so
+            # without this flag the next proposer reads a failed branch as one that tied the
+            # baseline and has no reason to avoid repeating the defect.
+            "execution_failed": execution_failed,
+            "execution_failure_note": (
+                None
+                if not execution_failed
+                else (
+                    "This iteration produced NO measured score. Its training or prediction code "
+                    "raised an exception before any evaluation. Treat it as a code defect to "
+                    "avoid, not as evidence about the scientific direction."
+                )
+            ),
             # The direction this iteration actually tested.  A proposer that cannot see this
             # cannot avoid restating it, and the convergence rule allows very few attempts.
             "proposal_family": (None if proposal is None else proposal_family_of(proposal)),

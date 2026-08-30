@@ -28,6 +28,7 @@ from kuairand_agent.campaign.full_campaign import (
 )
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateOutcome,
     ScientificCampaignConfig,
     ScientificCampaignResult,
 )
@@ -1067,3 +1068,49 @@ def test_iteration_record_carries_the_tested_direction_and_the_reflection_lesson
     # Without a proposal the record claims no direction rather than fabricating one.
     bare = runtime._iteration_record(result, reflection, scientific_iteration=2)
     assert bare.values["proposal_family"] is None
+    # A branch that ran is never flagged as an execution failure.
+    assert values["execution_failed"] is False
+    assert values["execution_failure_note"] is None
+
+
+def test_a_crashed_candidate_is_recorded_as_scoreless_rather_than_as_a_baseline_tie() -> None:
+    """A crash must not read to the next proposer as a result.
+
+    ``_reflect`` substitutes the fallback's seed-0 metrics when a run produced none, because
+    ``ExperimentResultSummary`` requires three finite metrics. In run 10 that made two candidates
+    that raised IndexError inside train_model look like they had tied the baseline, so nothing in
+    the loop had any reason to avoid repeating the defect.
+    """
+
+    config = _config()
+    fallback = _fallback(0.61)
+    crashed = SimpleNamespace(
+        candidate=SimpleNamespace(candidate_id="candidate-01-crashed"),
+        outcome=CandidateOutcome.CALLBACK_FAILED,
+        runs=(),
+        reason="callback_failed:CandidateExecutionError",
+    )
+    result = ScientificCampaignResult(
+        config_digest=config.digest,
+        fallback=fallback,
+        incumbent=fallback,
+        candidates=(cast(Any, crashed),),
+        public_feedback=(),
+        convergence=ConvergenceState.initial(0.61),
+        launches_used=config.launches_already_used + 1,
+        elapsed_seconds=1.0,
+        stop_reason=CampaignStopReason.CANDIDATES_EXHAUSTED,
+    )
+    reflection = Reflection(
+        response_id="reflection-1",
+        summary="Reported metrics matched the official FM seed 0 reference.",
+        recommendation="propose_next",
+        lessons=("Numbers matched the reference exactly.",),
+    )
+
+    values = runtime._iteration_record(result, reflection, scientific_iteration=1).values
+
+    assert values["execution_failed"] is True
+    assert values["candidate_primary"] is None
+    assert values["delta_vs_incumbent"] is None
+    assert "NO measured score" in cast(str, values["execution_failure_note"])

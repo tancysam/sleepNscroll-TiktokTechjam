@@ -11,7 +11,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 7
+PROMPT_VERSION: Final = 8
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -48,7 +48,10 @@ rediscovering them:
   any term constant across that user's rows cannot reorder them. User-side signal can only act
   through crosses with item-side features.
 
-Already measured in THIS campaign. Read this before proposing; repeating it wastes an iteration:
+Already measured in THIS campaign. Read this before proposing; repeating it wastes an iteration.
+An entry in campaign_records with execution_failed true produced NO score: its code raised before
+evaluation, so it says nothing about the direction and the direction remains open. An entry with a
+candidate_primary is a real measurement:
 - The baseline trains with pointwise log loss while GAUC and nDCG are ranking metrics, so the
   objective looked like the obvious opportunity. It was tested three ways: a within-user pairwise
   softplus objective, a user-slate listwise softmax objective, and a metric-matched pairwise
@@ -91,6 +94,17 @@ negatives, and optimise `softplus(-(s_positive - s_negative))`. Sampling users u
 sampling uniformly across all pairs, or sampling unexposed catalogue items, each optimises a
 different quantity than the one being scored. Pair this with a scoring function that has the
 capacity to reorder; on its own it has already been measured flat.
+
+Vectorised within-user negative sampling, which has now crashed two candidates. Both wrote the
+statistics correctly and then indexed the flattened negative array wrongly, raising IndexError
+inside train_model and losing the whole iteration. If you group rows by user, you must keep three
+things consistent: the per group start offsets, the per group negative COUNT, and the group index
+you use to look them up. The group index must be the compacted position of that group in your
+sorted layout, never the raw user_groups value, and the within group offset must be reduced modulo
+that group's own negative count before you add it to the start. Assert
+`(negative_starts[groups] + offsets).max() < negative_rows.size` before the gather, and assert
+every group you sample from has at least one positive and one negative. A branch that raises is
+worth nothing, so spend a few lines on these bounds.
 
 Slate sizes: median 4 impressions per user, 90th percentile 12. Because most slates are shorter
 than 5, an nDCG@5 top-K truncation is inert for the majority of users; the gain concentrates in
