@@ -13,6 +13,7 @@ from typing import Final
 from kuairand_agent import __version__
 from kuairand_agent.campaign import CampaignControllerError, CampaignEngine, CampaignStatus
 from kuairand_agent.campaign.provenance import ProvenanceError, build_campaign_request
+from kuairand_agent.campaign.prune import PruneError, iter_run_dirs, plan_prune, prune_run
 from kuairand_agent.config import (
     ConfigError,
     OpenAIFailoverResearchConfig,
@@ -431,6 +432,45 @@ def _iteration_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prune(args: argparse.Namespace) -> int:
+    """Reclaim regenerable bulk from finished campaigns; never touches evidence."""
+
+    try:
+        roots = (
+            [_absolute_cli_path(args.run_dir)]
+            if args.run_dir is not None
+            else list(iter_run_dirs(_absolute_cli_path(args.runs_root)))
+        )
+    except (PruneError, OSError) as exc:
+        print(f"PRUNE_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    plans = []
+    skipped = 0
+    for root in roots:
+        try:
+            plans.append(plan_prune(root) if args.dry_run else prune_run(root))
+        except (PruneError, OSError) as exc:
+            # One unprunable run must not abandon the rest of the sweep.
+            skipped += 1
+            print(f"skipped {root.name}: {exc}", file=sys.stderr)
+    reclaimed = sum(plan.reclaimed_bytes for plan in plans)
+    if skipped:
+        print(f"skipped {skipped} run(s); see stderr", file=sys.stderr)
+    for plan in plans:
+        if plan.targets:
+            verb = "would remove" if args.dry_run else "removed"
+            print(
+                f"{plan.run_dir.name}: {verb} {len(plan.targets)} path(s), "
+                f"{plan.reclaimed_bytes / 1e9:.2f} GB"
+                f"{'' if plan.finalized else ' (not finalized; artifacts retained)'}"
+            )
+    print(
+        f"{'would reclaim' if args.dry_run else 'reclaimed'} "
+        f"{reclaimed / 1e9:.2f} GB across {len(plans)} run(s)"
+    )
+    return 0
+
+
 def _resume(args: argparse.Namespace) -> int:
     """Reconcile abandoned executions and continue the original durable campaign."""
 
@@ -630,6 +670,13 @@ def build_parser() -> argparse.ArgumentParser:
     iteration_log.add_argument("--format", choices=("md", "jsonl"), default="md")
     iteration_log.add_argument("--output", type=Path)
     iteration_log.set_defaults(handler=_iteration_log, command_path=("iteration-log",))
+
+    prune = commands.add_parser("prune", help="reclaim regenerable bulk from finished campaigns")
+    prune_target = prune.add_mutually_exclusive_group()
+    prune_target.add_argument("--run-dir", type=Path)
+    prune_target.add_argument("--runs-root", type=Path, default=Path("runs"))
+    prune.add_argument("--dry-run", action="store_true")
+    prune.set_defaults(handler=_prune, command_path=("prune",))
 
     finalize = commands.add_parser("finalize", help="stop research and finalize deterministically")
     finalize.add_argument("--run-dir", required=True, type=Path)
