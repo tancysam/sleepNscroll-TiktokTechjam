@@ -239,6 +239,50 @@ def _rejection_events(generated_root: Path) -> tuple[str, ...]:
     return tuple(events)
 
 
+def _candidate_outcomes(run_dir: Path) -> dict[str, tuple[str, str]]:
+    """Map candidate id to its (outcome, reason) as the scientific loop recorded it.
+
+    This is what makes an execution failure visible in the log.  A candidate can be admitted,
+    trained, and still never produce inner metrics -- ``callback_failed`` is the clearest case --
+    and the run-log deliverable asks for exactly those error events.  Reading the retained
+    ``scientific_result`` row keeps the log honest about them instead of inferring silence from
+    absent metrics.
+    """
+
+    for name in ("production/finalization-support", "final"):
+        path = run_dir / name / "experiments.jsonl"
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping) or record.get("record_type") != "scientific_result":
+                continue
+            evidence = record.get("evidence")
+            outcomes = evidence.get("candidate_outcomes") if isinstance(evidence, Mapping) else None
+            if not isinstance(outcomes, Sequence) or isinstance(outcomes, (str, bytes)):
+                continue
+            resolved: dict[str, tuple[str, str]] = {}
+            for item in outcomes:
+                if not isinstance(item, Mapping):
+                    continue
+                candidate = _text(item.get("candidate_id"))
+                if candidate:
+                    resolved[candidate] = (
+                        _text(item.get("outcome")) or "unknown",
+                        _text(item.get("reason")) or "none",
+                    )
+            if resolved:
+                return resolved
+    return {}
+
+
 def _iteration_documents(generated_root: Path) -> Iterator[tuple[int, Mapping[str, object]]]:
     if not generated_root.is_dir():
         raise IterationLogError("run directory has no production/generated-source tree")
@@ -262,6 +306,7 @@ def build_iteration_log(run_dir: Path, *, project_root: Path) -> tuple[Iteration
     campaign_id = _text(documents[0][1].get("campaign_id"))
     events = _lineage_events(run_dir.parent / "research-lineage-ledger.sqlite3", campaign_id)
     rejections = _rejection_events(generated_root)
+    outcomes = _candidate_outcomes(run_dir)
 
     entries: list[IterationLogEntry] = []
     for iteration, document in documents:
@@ -292,6 +337,14 @@ def build_iteration_log(run_dir: Path, *, project_root: Path) -> tuple[Iteration
         if repairs:
             iteration_events.append(
                 f"bounded repair loop: {repairs} repair call(s) accepted before admission"
+            )
+        outcome, reason = outcomes.get(candidate_id, ("", ""))
+        if outcome:
+            iteration_events.append(f"scientific outcome: {outcome} ({reason})")
+        if outcome in {"callback_failed", "budget_rejected"} and iteration != documents[-1][0]:
+            iteration_events.append(
+                "the campaign recovered from this failure and continued to the next iteration "
+                "rather than stalling or aborting"
             )
         entries.append(
             IterationLogEntry(

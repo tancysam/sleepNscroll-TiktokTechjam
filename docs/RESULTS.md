@@ -98,18 +98,75 @@ useful: *the currently frozen bounded acceptance configuration is severely under
 0.5537 and must not replace the baseline as-is.* The mechanism is implemented, deterministic, and
 scoreable; it is simply not trained, and it is not wired into the campaign portfolio.
 
-### 3.3 Live autonomous campaign
+### 3.3 Live autonomous campaigns
 
-`PENDING` — see §6. No live-provider campaign has completed. Every finalized run in `runs/`
-records `provider = scripted` and zero API calls.
+Ten live-provider campaigns were run against `openai/gpt-5.6-sol` via OpenRouter. **Eight
+completed end to end and emitted a full organizer-valid bundle**; two crashed on defects that were
+then root-caused and fixed (§3.5). Every completed campaign recorded **zero manual interventions**.
+
+Reference campaign — `runs/postfix-20260830T105450Z` (`kuairand-1df0ab4d8d381a0535be`), the most
+recent and the one run after all three defect fixes:
 
 | Item | Value |
 |---|---|
-| Validation GAUC / nDCG@5 / primary | PENDING |
-| Absolute delta vs official baseline | PENDING |
-| Terminal reason (`CONVERGED` / cap / deadline) | PENDING |
-| Scientific iterations | PENDING |
-| Manual interventions | PENDING |
+| Campaign status | `COMPLETED`, full bundle published, `failures = []` |
+| Selected candidate | `official-fm-fallback-seed-4` (protected baseline fallback) |
+| Selected status | `baseline_reproduced` |
+| Validation GAUC / nDCG@5 / primary | 0.6679478 / 0.5361264 / 0.6020371 |
+| Absolute delta vs official five-seed FM mean | **+0.0004649** primary |
+| Terminal reason | `exact_terminal_condition_reached` (organizer convergence rule) |
+| Branches attempted / admitted / trained | 3 / 3 / 3 |
+| Inner evaluations / outer evaluations | 2 / 0 |
+| Repairs / pre-execution rejections / fallbacks | 0 / 0 / 0 |
+| Manual interventions | **0** |
+| Campaign wall time | 385.9 s (finalization 25.5 s) |
+| Charged training launches | 11 |
+| Tokens (input / output / total) | 94,936 / 16,667 / **111,603** |
+| Estimated API cost | **$0.65** |
+
+The +0.0004649 delta is against this repository's official-FM confirmation evidence and is far
+below the organizer convergence threshold ε = 0.002. **We do not claim it as an improvement.** It
+is the fallback reproducing the baseline, which is what `baseline_reproduced` means.
+
+### 3.4 The one candidate promotion we have observed
+
+`runs/hard-block-verify-20260830T103424Z` is the only run in which a generated candidate cleared
+every gate the pipeline has. `candidate-01` (a within-user BPR pairwise objective over the fixed
+33-feature causal bundle) beat its parent on both inner folds, passed outer matched-seed
+validation, and was promoted to incumbent:
+
+| | candidate-01 | parent | delta |
+|---|---|---|---|
+| Fold A primary | 0.6076452 | 0.6071290 | +0.0005161 |
+| Fold B primary | 0.5755265 | 0.5754240 | +0.0001025 |
+
+Both deltas are an order of magnitude below ε = 0.002, so this is **not** a convergence-beating
+improvement and is not claimed as one. It is reported because it is the only evidence we have that
+the generated-candidate path can clear the full gate chain, and because the campaign then crashed
+in finalization (§3.5, defect 3) and produced no bundle — the result was lost to our own defect
+rather than to the science.
+
+### 3.5 Defects found by running live, and fixed
+
+Robustness is judged on how the agent handles difficulty, not on whether it meets any. All three
+of these were found by real live runs, root-caused from the actual failure, and fixed with a
+regression test that was confirmed to fail without the fix.
+
+| # | Defect | Symptom | Root cause | Fix |
+|---|---|---|---|---|
+| 1 | Lineage CHECK-constraint violation | `sqlite3.IntegrityError` killed the campaign on iteration 2 | `promoted` was written as a real boolean even for screen-rejected candidates that had no Fold A metrics, violating the ledger's all-or-nothing invariant | `promoted` made genuinely optional; only computed when both folds are present |
+| 2 | Screen-rejected evidence discarded | Ledger silently dropped the most common outcome | The schema required both folds present to record anything | Fold A and Fold B groups made independently all-or-nothing |
+| 3 | Finalization rejected multi-candidate campaigns | Campaign promoted a candidate, then died with `scientific record source, config, or environment identity changed`, emitting no bundle | The exporter required *every* scientific record to carry the *selected* candidate's source/config/snapshot triple, but those are per-candidate identities — the crashed run held three distinct triples across seven records | Only `environment_digest` is campaign-wide and checked globally; the triple is pinned to records belonging to the selection, plus any record claiming its snapshot so a forged mix is still rejected |
+
+Defect 3 is the most consequential: it fired *precisely when the campaign succeeded*, and
+`proposal_breadth = 2` made multi-candidate campaigns the normal case. The fix is verified end to
+end — `runs/postfix-20260830T105450Z` wrote two scientific records with two distinct source
+snapshots and two distinct source digests (the exact condition that crashed the previous run) and
+finalized cleanly.
+
+A fourth event was **not** a defect: `resume` correctly refused to continue a campaign whose
+trusted source tree had changed since creation. That is the campaign-identity integrity guarantee
+working as designed, and the run was abandoned rather than bypassed.
 
 ## 4. Resource consumption
 
@@ -130,8 +187,17 @@ full six-launch qualification plus clean replay completed in **170.76 s**.
 | Run | Input | Output | Total | Cost |
 |---|---|---|---|---|
 | Scripted campaigns (all) | 0 | 0 | **0** | $0.00 |
-| Live smoke probe (`configs/live-smoke.toml`) | PENDING | PENDING | PENDING | PENDING |
-| Live autonomous campaign | PENDING | PENDING | PENDING | PENDING |
+| Live campaigns that emitted a bundle (8) | 838,411 | 131,603 | **970,014** | $5.6837 |
+| Live campaigns that crashed before finalization (2) | 170,195 | 33,310 | **203,505** | ~$1.19 (est.) |
+| **Total live spend** | | | **1,173,519** | **~$6.87** |
+
+Per completed campaign the mean is 121,251 tokens and $0.71. The reference campaign
+(`runs/postfix-20260830T105450Z`) used 111,603 tokens for $0.65.
+
+The two crashed campaigns produced no final report, so their figures are summed directly from the
+per-attempt provider journals under `runs/<run-id>/production/provider-attempt-journal/`; their
+token counts are exact, but the cost is an estimate derived at the same blended rate rather than a
+figure the adapter recorded, and is labelled as such.
 
 The provider adapter records input, cached-input, output, reasoning, and total tokens per call,
 plus estimated cost from the frozen pricing block in the config, provider wall time, transcript
@@ -153,7 +219,9 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | Run | Interventions | Detail |
 |---|---|---|
 | `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
-| Live autonomous campaign | PENDING | |
+| 8 completed live campaigns | **0 each** | No human acted between launch and bundle in any of them. Each campaign's own report independently records `Manual intervention count: 0`. |
+| 5-campaign auto-retry batch | **0** | `scripts/auto_retry_campaigns.sh` launched five consecutive independent campaigns unattended. The script only launches and stops; it cannot alter a campaign's search, and the frozen organizer ε/N are enforced at config-parse time and are not reachable from it. |
+| 2 crashed live campaigns | n/a | Both were abandoned rather than hand-repaired mid-run. The defects were fixed in source and a fresh campaign launched, so no intervention altered a running campaign. |
 
 ## 5. Evaluation integrity
 
@@ -187,13 +255,23 @@ the mechanisms are testable rather than promised.
 
 Stated plainly, because the gap matters more than the architecture:
 
-1. **No live autonomous campaign has completed.** Every finalized run records
-   `provider = scripted`, `API calls = 0`. The typed research seam is implemented, tested against
-   a fake transport, and exercised by integration tests, but has not driven a scored campaign.
-2. **No improvement over the baseline has been demonstrated.** The best completed run reproduces
-   the baseline to within noise (§3.1). We have not shown a validation-primary delta above
-   ε = 0.002.
-3. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
+1. **No improvement over the baseline has been demonstrated.** No generated candidate has produced
+   a validation-primary delta above ε = 0.002. The single promotion we observed (§3.4) was
+   +0.00052 on Fold A — real, reproducible, and an order of magnitude too small to matter. Eight
+   completed campaigns all terminated at `baseline_reproduced`.
+2. **The search has not meaningfully diversified.** Across 8 campaigns and 22 admission events,
+   17 were the same `pairwise` family, proposed as `candidate-01` in every campaign. See
+   [`agent-memory-experiment.md`](agent-memory-experiment.md) for the measurement and what we
+   built in response.
+3. **The cross-run circuit breaker has not yet had a fair test.** It is implemented and unit
+   tested, but it reads a ledger scoped by trusted-source digest, and every code change resets
+   that scope — including the change that added the breaker. It needs two consecutive campaigns on
+   an unchanged tree, which we have not yet run.
+4. **The outer-validation budget is nearly exhausted.** One of six project-wide slots remains. The
+   ledger is scoped by benchmark, dataset, and scorer digest only, so it does not reset between
+   campaigns or on code changes. At most one further candidate can ever be outer-confirmed against
+   this dataset.
+5. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
 
 ## 7. Artifact index
 
@@ -205,6 +283,18 @@ Stated plainly, because the gap matters more than the architecture:
 | Organizer verification | `runs/<run-id>/final/verification.json` |
 | Reproduction script | `runs/<run-id>/final/reproduce.sh` |
 | Per-iteration records | campaign store under `runs/<run-id>/` |
+| Per-iteration run log | `kuairand-agent iteration-log --run-dir runs/<run-id>` |
+
+The run-log deliverable (hypothesis, code diff, resulting metrics, error/recovery events per
+iteration) is emitted on demand from the campaign's own durable records:
+
+```bash
+uv run --locked --group research-tree --no-group research-neural \
+  kuairand-agent iteration-log --run-dir runs/postfix-20260830T105450Z \
+  --format md --output docs/run-logs/postfix-20260830T105450Z.md
+```
+
+`--format jsonl` emits one canonical JSON object per iteration instead.
 
 Independent verification of a retained CSV, without access to hidden-test labels:
 

@@ -204,3 +204,67 @@ def test_iteration_log_refuses_a_run_directory_without_lineage(tmp_path: Path) -
 
     with pytest.raises(IterationLogError, match="no scientific-iteration lineage"):
         build_iteration_log(tmp_path, project_root=tmp_path)
+
+
+def _write_scientific_result(run_dir: Path, outcomes: list[tuple[str, str, str]]) -> None:
+    support = run_dir / "production" / "finalization-support"
+    support.mkdir(parents=True, exist_ok=True)
+    (support / "experiments.jsonl").write_text(
+        json.dumps(
+            {
+                "record_type": "scientific_result",
+                "record_id": _digest("e"),
+                "evidence": {
+                    "candidate_outcomes": [
+                        {"candidate_id": candidate, "outcome": outcome, "reason": reason}
+                        for candidate, outcome, reason in outcomes
+                    ]
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_iteration_log_surfaces_an_execution_failure_and_its_recovery(
+    campaign: tuple[Path, Path],
+) -> None:
+    """A candidate can train and still produce no metrics; that is an error the log must report.
+
+    Reproduces `runs/postfix-20260830T105450Z`, where candidate-01 hit
+    callback_failed:CandidateExecutionError. Inferring "no errors" from absent metrics would have
+    hidden the single clearest piece of recovery evidence the campaign produced.
+    """
+
+    run_dir, project_root = campaign
+    _write_scientific_result(
+        run_dir,
+        [
+            ("candidate-01-aaaa", "callback_failed", "callback_failed:CandidateExecutionError"),
+            ("candidate-02-bbbb", "screen_rejected", "fold_b_screen_failed"),
+        ],
+    )
+
+    first, second = build_iteration_log(run_dir, project_root=project_root)
+
+    assert any("callback_failed" in item for item in first.events)
+    assert any("recovered from this failure" in item for item in first.events)
+    assert any("screen_rejected" in item for item in second.events)
+    # The final iteration must not claim a recovery that never happened.
+    assert not any("recovered from this failure" in item for item in second.events)
+
+
+def test_iteration_log_claims_no_recovery_when_the_failure_ended_the_campaign(
+    campaign: tuple[Path, Path],
+) -> None:
+    run_dir, project_root = campaign
+    _write_scientific_result(
+        run_dir,
+        [("candidate-02-bbbb", "callback_failed", "callback_failed:CandidateExecutionError")],
+    )
+
+    last = build_iteration_log(run_dir, project_root=project_root)[-1]
+
+    assert any("callback_failed" in item for item in last.events)
+    assert not any("recovered from this failure" in item for item in last.events)

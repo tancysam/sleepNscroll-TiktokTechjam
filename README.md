@@ -386,14 +386,22 @@ repository's official-FM confirmation-seed mean, roughly one fifth of one seed s
 **We do not claim it as an improvement.** It demonstrates that the pipeline runs end to end
 without human intervention and emits an organizer-valid submission.
 
+**Live autonomous campaigns.** Ten were run against `openai/gpt-5.6-sol`; **eight completed end to
+end and emitted a full organizer-valid bundle, each with zero manual interventions.** One generated
+candidate was promoted after clearing both inner folds and outer matched-seed validation
+(+0.00052 Fold A) — real, but an order of magnitude below ε = 0.002, so not claimed as an
+improvement. Total live spend across all ten: **1,173,519 tokens, ~$6.87**.
+
 GPU-hours consumed: **0.00**. Every configuration is CPU-only.
 
 ## Limitations, and what we would do with more time
 
-**What is not demonstrated.** No live-provider autonomous campaign has completed; every finalized
-run records `provider = scripted` and zero API calls. Consequently we have not shown a
-validation-primary improvement above ε = 0.002, and hidden-test performance is unknown and
-unclaimed.
+**What is not demonstrated.** No generated candidate has produced a validation-primary improvement
+above ε = 0.002. Eight completed live campaigns all terminated at `baseline_reproduced`; the one
+promotion we observed was +0.00052 on Fold A, an order of magnitude too small to matter.
+Hidden-test performance is unknown and unclaimed. The search also did not meaningfully diversify —
+17 of 22 admissions across 8 campaigns were the same pairwise family — which is the subject of
+[`docs/agent-memory-experiment.md`](docs/agent-memory-experiment.md).
 
 **The constraint-transmission asymmetry.** The most instructive defect we found was in our own
 design. `materialize.py` enforces 44 distinct constants on generated code — forbidden import
