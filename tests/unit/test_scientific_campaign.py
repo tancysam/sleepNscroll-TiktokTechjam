@@ -739,3 +739,44 @@ def test_mismatched_material_change_receipt_is_a_charged_callback_failure() -> N
     assert result.candidates[0].outcome is CandidateOutcome.CALLBACK_FAILED
     assert result.launches_used == 7
     assert result.incumbent == result.fallback
+
+
+def test_a_candidate_identical_to_its_parent_is_reported_as_having_no_effect() -> None:
+    """A null experiment and a genuine loss must not be reported with the same reason.
+
+    Many generated candidates produced metrics bit-identical to their parent: code that changed
+    while behaviour did not. Calling that `fold_b_screen_failed` tells the research model its idea
+    was beaten, when in fact its idea never took effect -- the opposite lesson, and one it cannot
+    correct from.
+    """
+
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        # Exactly the incumbent's primary: the candidate changed nothing observable.
+        return _evidence(request, 0.6)
+
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(0.6),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert result.candidates[0].outcome is CandidateOutcome.SCREEN_REJECTED
+    assert result.candidates[0].reason == "fold_b_no_measurable_effect"
+
+
+def test_a_candidate_that_genuinely_scores_worse_keeps_the_screen_failure_reason() -> None:
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        return _evidence(request, 0.599)
+
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(0.6),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert result.candidates[0].outcome is CandidateOutcome.SCREEN_REJECTED
+    assert result.candidates[0].reason == "fold_b_screen_failed"

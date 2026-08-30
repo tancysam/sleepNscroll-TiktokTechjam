@@ -112,6 +112,21 @@ def _finite_nonnegative(value: object, name: str) -> float:
     return result
 
 
+def _metrics_identical(left: OrganizerMetrics, right: OrganizerMetrics) -> bool:
+    """Whether two organizer metric triples are bit-identical.
+
+    Used to separate a candidate that lost from one that changed nothing observable. Exact
+    equality is deliberate: any real difference in predictions moves at least one metric in its
+    final bits, so anything short of identity is a genuine, if tiny, effect.
+    """
+
+    return (
+        left.gauc == right.gauc
+        and left.ndcg_at_5 == right.ndcg_at_5
+        and left.primary == right.primary
+    )
+
+
 def _primary(metrics: OrganizerMetrics) -> Decimal:
     if not isinstance(metrics, OrganizerMetrics):
         raise ScientificCampaignError("metrics must be organizer aggregate metrics")
@@ -1187,12 +1202,23 @@ def run_scientific_campaign(
             )
         )
         if not passed:
+            # A candidate whose fold metrics are bit-identical to its parent's did not score
+            # worse; it had no measurable effect at all. Reporting both as "screen failed" tells
+            # the research model its idea was beaten when in fact its idea never ran, which are
+            # opposite lessons. Identical metrics are strong evidence of identical predictions
+            # rather than proof of them, so the reason is named for what was observed.
+            reason = (
+                "fold_b_no_measurable_effect"
+                if evidence.metrics is not None
+                and _metrics_identical(evidence.metrics, parent_fold_b)
+                else "fold_b_screen_failed"
+            )
             results.append(
                 CandidateCampaignResult(
                     candidate=candidate,
                     outcome=CandidateOutcome.SCREEN_REJECTED,
                     runs=(evidence,),
-                    reason="fold_b_screen_failed",
+                    reason=reason,
                 )
             )
             convergence = convergence.update_after_iteration(None)
