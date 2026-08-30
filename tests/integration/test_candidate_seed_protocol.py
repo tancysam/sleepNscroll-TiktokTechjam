@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import pytest
 
 from kuairand_agent.candidate_api.protocol import (
     PredictionExpectation,
@@ -30,6 +33,16 @@ SEED = ROOT / "candidate_seed"
 SOURCE = "1" * 64
 TRAIN_DATA = "2" * 64
 PREDICT_DATA = "3" * 64
+
+
+def _load_seed_model_impl() -> Any:
+    """Import the seed model module directly, the way a materialized candidate would."""
+
+    spec = importlib.util.spec_from_file_location("seed_model_impl", SEED / "model_impl.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _sha256(path: Path) -> str:
@@ -330,3 +343,100 @@ def test_failing_training_diagnostics_does_not_discard_a_successful_training_run
     assert "final_objective" not in diagnostics
     # Controller owned shape facts still describe the run that did happen.
     assert diagnostics["row_count"] == 4
+
+
+def _identity_fixture(rows: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A realistic 37 column matrix: 33 continuous columns then four identity code columns."""
+
+    rng = np.random.default_rng(seed)
+    per_user = 5
+    columns = [np.full(rows, 0.3366)]
+    for _ in range(9):
+        exposure = rng.integers(0, 400, size=rows).astype(np.float64)
+        positive = np.minimum(exposure, rng.integers(0, 200, size=rows)).astype(np.float64)
+        columns.extend([exposure, positive, (positive + 10.0) / (exposure + 20.0)])
+    duration = rng.gamma(2.0, 40.0, size=rows)
+    columns.extend(
+        [
+            duration,
+            np.log1p(duration),
+            (duration >= 18.0).astype(np.float64),
+            rng.integers(0, 14, size=rows).astype(np.float64),
+            rng.integers(0, 15, size=rows).astype(np.float64),
+        ]
+    )
+    for cardinality in (7538, 6482, 15, 6):
+        columns.append(rng.integers(0, cardinality, size=rows).astype(np.float64))
+    features = np.ascontiguousarray(np.column_stack(columns), dtype=np.float64)
+
+    user_groups = np.repeat(np.arange(rows // per_user), per_user).astype(np.int64)
+    targets = np.empty(rows, dtype=np.float64)
+    for user in range(rows // per_user):
+        block = slice(user * per_user, (user + 1) * per_user)
+        labels = rng.integers(0, 2, size=per_user).astype(np.float64)
+        if labels.sum() in (0.0, float(per_user)):
+            labels[0] = 1.0 - labels[0]
+        targets[block] = labels
+    return features, targets, user_groups
+
+
+def test_seed_fm_helper_keeps_its_two_accumulators_at_different_shapes() -> None:
+    """Mixing the (N, rank) and (N,) accumulators is this project's most frequent defect.
+
+    Three generated candidates across runs 11 and 12 raised a broadcast error on exactly this,
+    so the provided helper is pinned rather than left to prose in the briefing.
+    """
+
+    seed_module = _load_seed_model_impl()
+    features, _, _ = _identity_fixture(400, 3)
+    codes = seed_module.categorical_codes(features, 4)
+
+    assert len(codes) == 4
+    assert all(code.dtype == np.int64 for code in codes)
+    tables = [
+        np.linspace(0.0, 1.0, seed_module.embedding_table_size(code) * 6).reshape(-1, 6)
+        for code in codes
+    ]
+    scores = seed_module.fm_interaction_scores(tables, codes)
+
+    assert scores.shape == (features.shape[0],)
+    assert bool(np.isfinite(scores).all())
+    assert float(scores.std()) > 0.0
+
+
+def test_seed_fm_helper_clamps_identities_absent_from_training() -> None:
+    seed_module = _load_seed_model_impl()
+    features, _, _ = _identity_fixture(200, 5)
+    codes = seed_module.categorical_codes(features, 4)
+    tables = [np.ones((seed_module.embedding_table_size(code), 4)) for code in codes]
+    # A validation identity beyond every training code must land on the spare row, not raise.
+    unseen = [code.copy() for code in codes]
+    unseen[0][:] = tables[0].shape[0] + 50
+
+    scores = seed_module.fm_interaction_scores(tables, unseen)
+
+    assert bool(np.isfinite(scores).all())
+
+
+def test_seed_pair_sampler_stays_inside_each_user_and_respects_labels() -> None:
+    """Within-user pair sampling crashed three of three candidates that attempted it."""
+
+    seed_module = _load_seed_model_impl()
+    generator = np.random.default_rng(11)
+    for trial in range(8):
+        _, targets, user_groups = _identity_fixture(1000, trial)
+        positives, negatives = seed_module.within_user_pairs(targets, user_groups, generator, 2048)
+
+        assert positives.shape == negatives.shape == (2048,)
+        assert float(targets[positives].min()) == 1.0
+        assert float(targets[negatives].max()) == 0.0
+        assert bool((user_groups[positives] == user_groups[negatives]).all())
+
+
+def test_seed_pair_sampler_rejects_a_split_with_no_eligible_user() -> None:
+    seed_module = _load_seed_model_impl()
+    targets = np.zeros(10, dtype=np.float64)
+    user_groups = np.repeat(np.arange(2), 5).astype(np.int64)
+
+    with pytest.raises(Exception, match="GAUC eligible"):
+        seed_module.within_user_pairs(targets, user_groups, np.random.default_rng(0), 4)

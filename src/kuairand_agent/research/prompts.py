@@ -11,7 +11,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 9
+PROMPT_VERSION: Final = 10
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -67,11 +67,12 @@ controller_causal_feature_bundle.categorical_code_columns_csv. A candidate can n
 per-identity embeddings the way the baseline does, and combine them with the causal aggregate
 columns the baseline never sees. Capacity is no longer the constraint it was.
 
-Where the headroom is, re-ranked by what your runtime interface can actually reach:
+Where the headroom is. These are all reachable from your interface and all worth covering; the
+campaign has few iterations, so prefer a direction the records show has not been measured yet
+rather than a variation on one that has:
 1. Identity embeddings combined with the causal aggregate columns, trained under a ranking
-   objective. The baseline has identities but no causal aggregates; the previous candidates had
-   aggregates but no identities. Holding both is strictly more information than either. This is
-   the single most promising direction and it is fully reachable.
+   objective. The baseline has identities but no causal aggregates; earlier candidates had
+   aggregates but no identities. Holding both is strictly more information than either.
 2. Interaction structure over the codes: FM latent factors, or explicit user_groups-by-item-code
    interactions. Note the organizers measured embedding dimension k = 8/16/32 as flat ON IDENTITIES
    ALONE, so raise capacity only together with the aggregate columns or a ranking objective.
@@ -170,6 +171,27 @@ def train_model(features, targets, user_groups, config, seed):
 Note the third argument. `user_groups` is the trusted per-row user identity, and the benchmark
 ranks strictly within a user, so it is what any ranking objective must group by. The pointwise
 objective above ignores it entirely.
+
+Size, measured in this campaign. Every candidate at or under about 260 lines executed. Of the
+eight written at over 580 lines, none executed: they died in hand-rolled interaction maths, in
+pair-sampling index arithmetic, or in their own bespoke validators. Write the smallest
+implementation that tests your hypothesis. Elaborate optimizers, multi-stage training and custom
+checkpoint validators are where branches are lost, not where score is won.
+
+The parent already provides four tested helpers. Call them; do not reimplement them.
+
+```python
+codes = categorical_codes(features, 4)          # trailing identity columns, as int64
+sizes = [embedding_table_size(code) for code in codes]   # per fold, never a constant
+tables = [rng.normal(0.0, 0.02, (size, rank)) for size in sizes]
+interaction = fm_interaction_scores(tables, codes)       # (N,) second-order FM term
+positives, negatives = within_user_pairs(targets, user_groups, rng, pair_count)
+```
+
+`fm_interaction_scores` keeps `pair_sum` at `(N, rank)` and `square_sum` at `(N,)`. Those two
+shapes differ, and mixing them raises a broadcast error; that single defect cost three branches.
+`within_user_pairs` indexes by a group's compact position, never by a raw `user_groups` value, and
+draws each offset against that group's own negative count; that defect cost three more.
 
 A valid response returns `model_impl.py` implementing a genuinely different mechanism:
 

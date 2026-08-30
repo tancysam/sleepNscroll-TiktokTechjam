@@ -178,7 +178,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
-    assert PROMPT_VERSION == 9
+    assert PROMPT_VERSION == 10
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -229,3 +229,26 @@ def test_source_operations_state_the_schema_rules_that_cost_an_attempt(
     rendered = " ".join(instructions_for(operation).split())
     assert "must be unique" in rendered
     assert "Never return candidate.py" in rendered
+
+
+def test_implement_briefing_points_at_the_provided_helpers_and_their_shapes() -> None:
+    """Prose about shapes did not stop the defect; the provided helpers and their shapes must.
+
+    Runs 11 and 12 lost six branches between hand-rolled FM interaction maths and within-user
+    pair-sampling index arithmetic, so the briefing names the tested helpers explicitly.
+    """
+
+    rendered = instructions_for(ResearchOperation.IMPLEMENT)
+
+    for helper in (
+        "categorical_codes",
+        "embedding_table_size",
+        "fm_interaction_scores",
+        "within_user_pairs",
+    ):
+        assert helper in rendered, helper
+    # The two accumulators that must not be mixed.
+    assert "(N, rank)" in rendered
+    assert "(N,)" in rendered
+    # The measured size finding.
+    assert "260 lines" in rendered
