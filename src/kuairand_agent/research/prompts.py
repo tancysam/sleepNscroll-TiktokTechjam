@@ -61,11 +61,20 @@ candidate_primary is a real measurement:
   against a baseline that learns a per-identity embedding table. They lacked the capacity to
   reorder anything, which is the most likely reason the objective looked inert.
 
-What changed: the feature matrix now carries categorical identity codes for video, author, tab and
-duration bucket, listed in method card
+What changed: the feature matrix now carries categorical identity codes for user, video, author,
+tab and duration bucket, listed in method card
 controller_causal_feature_bundle.categorical_code_columns_csv. A candidate can now learn
 per-identity embeddings the way the baseline does, and combine them with the causal aggregate
 columns the baseline never sees. Capacity is no longer the constraint it was.
+
+The user code is new and it is the important one. Until now no user identity reached prediction
+time at all: user_groups is a training-only capability and the prediction request carries the
+feature matrix and nothing else, so no candidate could evaluate a user-conditioned term when it
+scored. That ruled out user-by-video and user-by-author crosses, which is where the baseline FM
+gets most of its ordering power, and it is the most likely reason every candidate so far has
+scored below the baseline standalone. Note the distinction the organizers measured: a user-side
+FIRST-ORDER term is worth exactly zero because it is constant within a user, but a user EMBEDDING
+crossed with an item embedding varies across that user's rows and can reorder them.
 
 Where the headroom is. These are all reachable from your interface and all worth covering; the
 campaign has few iterations, so prefer a direction the records show has not been measured yet
@@ -87,6 +96,28 @@ NOT reachable from your interface. Do not propose these, they cannot be implemen
 - Multi-task learning on other feedback signals, and censored watch-time regression. You receive
   exactly one binary target vector; no auxiliary outcome reaches your interface.
 - Anything using the randomized exposure log. It is blocked by the field policy.
+
+How your score is actually computed, which changes what the campaign records mean. Your
+predictions are never scored alone. The controller rank-normalises them within each user, does the
+same to the official FM baseline's predictions, and scores five fixed blends of the two: 100/0,
+75/25, 50/50, 25/75 and 0/100, model first. The Fold B screen picks whichever blend scores highest
+and freezes that weight for every later fold and seed. `candidate_primary` in campaign_records is
+that BLEND's score, not your model's.
+
+Three consequences, and every one of them has already misled a previous iteration of this
+campaign:
+- A `candidate_primary` exactly equal to the official FM control means the 0/100 blend won, i.e.
+  the selector threw your model away entirely. That is the harshest possible verdict. It has
+  repeatedly been misread in these records as "flat" or "matched the baseline". It is neither.
+- A `candidate_primary` close to the baseline usually means the 25/75 blend won, so roughly three
+  quarters of that number is the baseline's ordering and not yours.
+- `candidate_standalone_primary` in campaign_records is the 100/0 point. That is the only field
+  that measures YOUR model. Read it first, and compare it to `fold_b_control_primary`.
+
+To date every generated candidate in this project has scored BELOW the official FM control
+standalone, by 0.003 to 0.010 primary, against a seed-to-seed sigma of 0.0008. The blend has been
+hiding that. Your target is to beat `fold_b_control_primary` at the 100/0 point. Fusion can then
+only add to a model that is already competitive; it cannot rescue one that is not.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive

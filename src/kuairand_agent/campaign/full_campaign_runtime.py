@@ -119,6 +119,7 @@ from kuairand_agent.campaign.store import (
     CampaignStore,
     OuterQueryLedger,
 )
+from kuairand_agent.candidates.fusion import FUSION_WEIGHT_GRID
 from kuairand_agent.config import ResearchConfig
 from kuairand_agent.contract import benchmark_digest, verify_starter_kit
 from kuairand_agent.data.canonical import (
@@ -757,7 +758,15 @@ def _research_context_evidence(
                         str(value) for value in features.outer_and_final.code_cardinalities
                     ),
                     "code_cardinalities_vary_by_fold": True,
+                    # This was previously a bare boolean, which disclosed the mechanism without
+                    # explaining it.  Candidate predictions are rank-blended with the official FM
+                    # control, so the primary a candidate sees is the blend's, never its own.
                     "fold_b_selected_fusion_only": True,
+                    "fusion_weight_grid_model_then_control_csv": ";".join(
+                        f"{model}/{control}" for model, control in FUSION_WEIGHT_GRID
+                    ),
+                    "fusion_scored_metric_is_the_blend_not_the_model": True,
+                    "fusion_weight_frozen_on_fold_b_and_reused_below": True,
                     "uses_public_labels_for_features": False,
                     "uses_prediction_period_outcomes": False,
                 },
@@ -1475,15 +1484,69 @@ def _measured_primary(
     return primary, delta, "inner_fold"
 
 
+def _fusion_disclosure(
+    records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord],
+) -> dict[str, str | float | None]:
+    """Describe what rank fusion did to this iteration's predictions.
+
+    Every candidate prediction is rank-fused with the official FM control on a fixed five-point
+    weight grid chosen on the Fold B screen and frozen for every tier below it.  The primary that
+    reaches selection and reflection is the *blend's*, so a model far weaker than the control still
+    reports a score near it, and a model the selector rejects outright reports the control's score
+    exactly.  Without these fields the proposer reads "scored the same as the baseline" when the
+    truth is "was discarded", and has no reason to change anything.
+    """
+
+    record = records.get((ScientificTier.FOLD_B_SCREEN, 0))
+    selection = None if record is None else record.fusion_selection
+    if selection is None:
+        return {
+            "candidate_standalone_primary": None,
+            "fold_b_control_primary": None,
+            "fusion_weights_selected": None,
+            "fusion_note": None,
+        }
+    standalone = selection.standalone_primary
+    control = selection.control_primary
+    weights = selection.selected_weights
+    if selection.model_was_discarded:
+        note = (
+            "Rank fusion selected weight 0.0 for this model on the Fold B screen, so the reported "
+            "primary is the official FM control's score with none of this model's ordering in it. "
+            "The model itself scored candidate_standalone_primary. This is a rejection, NOT a tie."
+        )
+    elif standalone is not None and control is not None and standalone < control:
+        note = (
+            "The reported primary is a blend of this model with the official FM control at "
+            "weights fusion_weights_selected. Scored alone the model was WEAKER than the control "
+            "(candidate_standalone_primary below fold_b_control_primary), so most of the reported "
+            "score is the control's, not this model's."
+        )
+    else:
+        note = (
+            "The reported primary is a blend of this model with the official FM control at "
+            "weights fusion_weights_selected. Scored alone this model was at least as strong as "
+            "the control."
+        )
+    return {
+        "candidate_standalone_primary": None if standalone is None else round(standalone, 7),
+        "fold_b_control_primary": None if control is None else round(control, 7),
+        "fusion_weights_selected": f"{weights[0]} model, {weights[1]} official FM control",
+        "fusion_note": note,
+    }
+
+
 def _iteration_record(
     result: ScientificCampaignResult,
     reflection: Reflection,
     *,
     scientific_iteration: int,
     proposal: Proposal | None = None,
+    fusion_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord] | None = None,
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
     primary, delta, tier = _measured_primary(candidate_result, result.incumbent)
+    fusion = _fusion_disclosure({} if fusion_records is None else fusion_records)
     execution_failed = (
         candidate_result is not None
         and candidate_result.outcome is CandidateOutcome.CALLBACK_FAILED
@@ -1521,6 +1584,8 @@ def _iteration_record(
             "candidate_primary": None if primary is None else round(primary, 6),
             "candidate_primary_tier": tier,
             "delta_vs_incumbent": None if delta is None else round(delta, 6),
+            # candidate_primary above is the FUSED score. These four say what the model itself did.
+            **fusion,
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
@@ -2273,6 +2338,9 @@ def _run_autonomous_followups(
             reflection,
             scientific_iteration=runtime_template.scientific_iteration,
             proposal=lineage.proposal,
+            # The first iteration ran on runtime_template itself, so its fusion records are here.
+            # Later iterations each get a fresh records dict from the replace() below.
+            fusion_records=runtime_template.records,
         ),
     ]
     rejected_records = list(prior_records)
@@ -2454,6 +2522,7 @@ def _run_autonomous_followups(
                 reflection,
                 scientific_iteration=iteration,
                 proposal=lineage.proposal,
+                fusion_records=iteration_runtime.records,
             )
         )
         if result.incumbent.candidate_id == candidate_id:
