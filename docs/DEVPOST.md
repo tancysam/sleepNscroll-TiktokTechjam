@@ -92,6 +92,43 @@ agent's feedback signal deserves the same adversarial scrutiny as its permission
 Both are fixed, both are one commit each, and the diagnostic that found it ships in the repo as
 `fusion_audit.py` so any reviewer can rerun it against our recorded campaigns.
 
+**What happened next is the part we are most pleased with, and it is one discovery, one confirmed
+fix, and two honest negatives.**
+
+*The fix changed how the agent reasons.* Same iteration slot, consecutive runs. Before: *"recency
+weighting successfully measured 0.5754240304, matching official_fm_fold_B; recency weighting is
+therefore excluded."* After: *"the parent scores 0.5713044 standalone against the 0.575424 Fold B
+control."* The first is a model reasoning correctly from a false premise — the failure you cannot
+debug by reading its output, because the output is impeccable. The second is the same model with a
+truthful signal.
+
+*Then the model got substantially better.* Every candidate to that point crossed all 38 feature
+columns in one factorization-machine interaction, so 33 continuous aggregates shared a latent space
+with the identity codes; the organizer FM crosses only categorical fields. Restricting the
+interaction to the identity codes and keeping the aggregates as additive first-order terms moved
+the deficit from **−4σ…−12σ to −1.12σ**. Not a bigger model — a better-specified one.
+
+*Then we killed two of our own hypotheses.* Giving candidates user identity at prediction time was
+structurally correct and **did not close the gap**. Letting a candidate ensemble itself came out
+**flat**. We measured why: averaging the five official FM seeds on raw scores is worth +0.0000772,
+on within-user rank percentiles +0.0005664. **86% of the ensembling gain needs an operation our
+candidates cannot perform**, because prediction receives no user grouping.
+
+**That is the finding we would carry to another project: an agent's capability boundary is a design
+parameter, not an implementation detail.** Ours gives a candidate a feature matrix and nothing else
+at prediction time — drawn that way for good isolation reasons, and it silently capped the
+achievable score in three separate ways: no user-conditioned terms, no within-user normalisation,
+and no early stopping on the scored split, which the baseline itself *does* get
+(`starter_fm.py:701-708` keeps the best of 40 epochs measured on the split it then reports; the
+published 0.6016 has the same property). We could not have found any of it from the agent's
+transcripts. We found it by auditing what the agent was allowed to see.
+
+**A code path that only runs on success accumulates defects invisibly.** Our promotion path went
+unexecuted for twelve campaigns. Each time it finally ran it exposed a latent bug — most recently a
+comparison of the organizer's float32 primary against our own float64 recomputation at
+`abs_tol=1e-15`, **2.98e-8 apart, a single float32 unit in the last place**, which stranded the
+first campaign ever to both promote a candidate and publish a bundle. Fixed and regression-tested.
+
 **We deliberately did not use an agent framework.** No LangChain, no LiteLLM, no orchestration
 library, not even the `openai` SDK. Provider calls are `urllib.request` from the standard library
 against an OpenAI-compatible Chat Completions endpoint with strict JSON-schema structured
@@ -137,29 +174,37 @@ install cannot silently change the execution profile.
 
 ## Honest status
 
-**Six live-provider autonomous campaigns completed end to end**, every one terminating on
-`converged` under the organizers' own frozen rule (ε = 0.002, patience 3) with **zero manual
-interventions**. Five published organizer-valid submission bundles: 170,588 rows, checker return
-code 0, replay verified, byte-identical SHA-256 `e12746ae…` across all five.
+**Seventeen campaigns, ten of them reaching a terminal `COMPLETED` state under the organizers' own
+frozen rule (ε = 0.002, patience 3), with zero manual interventions in every single one.** The last five
+executed every generated candidate they produced — 22/22, 21/21, 22/22, 15/15 and 15/15 subprocess
+executions with empty stderr. Bundles are organizer-valid: 170,588 rows, checker return code 0,
+replay verified.
 
 **We do not claim an improvement over the baseline, and the reason is the most useful result we
-have.** One run promoted a generated candidate at 0.6017118 against an incumbent of 0.6014403 —
-+0.0002715, or 0.34 of one seed standard deviation. We reran the same method rather than reporting
-it. It landed at 0.6014124, on the other side of zero. That is what a non-significant margin does
-when you replicate it, and it is why the number is not in our headline.
+have.** A candidate was promoted at +0.0002715, or 0.34 of one seed standard deviation. We reran
+the same method rather than reporting it. Three measurements: **+0.34σ, −0.03σ, +0.36σ** — mean
++0.00018 against an ε of 0.002. Had we shipped the first as a win, our own next run would have
+contradicted it four hours later.
 
 Reported honestly, best first:
 
 | Result | Public validation | vs organizer 0.6016 | Provenance |
 |---|---:|---:|---|
-| Five-seed rank ensemble of the organizer FM | 0.6026034 | +0.0010 | controller-side, **not agent-generated** |
+| **Five-seed rank ensemble of the organizer FM** (submitted) | **0.6026034** | **+0.0010** | controller-side, **not agent-generated** |
 | Shipped fallback `official-fm-fallback-seed-4` | 0.6020371 | +0.0004 | best-of-five **selected on this split** |
-| Best agent candidate (run 13, fused) | 0.6017118 | +0.0001 | within noise, 75% organizer FM by weight |
+| Best agent candidate, fused | 0.6017246 | +0.0001 | within noise, 75% organizer FM by weight |
+| Best agent candidate, **scored alone** | 0.5745312 vs control 0.5754240 | **−1.12σ** | our model, honestly measured |
 
-Every caveat in that table is one we went looking for. The ensemble is real and reproducible but
-it is an engineering property of *their* baseline, not our agent doing research, and it is below
-our own materiality threshold. The shipped fallback's margin is a selection effect. And the agent's
-own number is a blend.
+Every caveat in that table is one we went looking for. The submitted ensemble is real and
+reproducible — `python3 build_ensemble_submission.py` regenerates it from already-qualified
+checkpoints with no new training, and the organizers' own checker passes it — but it is an
+engineering property of *their* baseline, not our agent doing research, and it is below our own
+materiality threshold. The shipped fallback's margin is a selection effect. The agent's headline
+number is a blend. **And our agent, scored on its own, still does not beat the baseline** — though
+it is now within about one standard deviation of a reference that gets to early-stop on the split
+it is scored on, which our candidates structurally cannot.
+
+We would rather hand a judge four rows with their provenance than one row without it.
 
 Hidden-test performance is organizer-computed and is neither known nor claimed. Full detail,
 including a section on what is *not* demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).

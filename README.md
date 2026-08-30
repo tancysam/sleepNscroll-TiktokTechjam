@@ -318,10 +318,22 @@ whose `hash_source_tree` digest matches the one recorded in that run's
 | `runs/maki-overnight-11/final` | `b7ef85773ef03cb2e38b2614…` | `784ae49` |
 | `runs/maki-overnight-12/final` | `59714d3bc49ad73a1c8effd0…` | `7b7d83e` |
 | `runs/maki-overnight-14/final` | `3a6d21e5b220595acc773497…` | `e758693` or `702e548` |
+| `runs/maki-overnight-15/final` | `8eee43fa4f27…` | **unusable — see below** |
+| `runs/maki-overnight-16/final` | `258e67f72773…` | `8978b4b` |
+| `runs/maki-overnight-17/final` | `160f902c43ba…` | `d8f0baa` |
 
 Verified by computing `hash_source_tree` in a detached worktree at each commit and comparing
-against the recorded digest; all six match exactly. Run 14's two commits share a digest because
+against the recorded digest; every one matches exactly. Run 14's two commits share a digest because
 `702e548` changes documentation only, and documentation is outside the hashed source slice.
+
+**Runs 16 and 17 are the only bundles that replay against the repository as submitted.** Every
+earlier bundle requires checking out its own older commit first.
+
+`runs/maki-overnight-15/final` is the **only agent-generated submission** the project produced
+(SHA-256 `c98d7cd6…`, organizer checker rc=0) and it cannot be replayed at any commit.
+`replay_final_bundle` calls `_verify_closed_bundle` before the current-source check, so at a fixed
+commit it fails source identity, and at its own commit `8124607` the float32 defect it was stranded
+by is still present and the bundle check fails. Both doors are shut, exactly as for run 13.
 
 `runs/maki-overnight-13` has no bundle. Its campaign ran at `f66e364`
 (`cca9cc26a6e57fdb36fc6dfb…`) and promoted a generated candidate for the first time, which exposed
@@ -405,31 +417,32 @@ Headline, stated conservatively:
 | FM — official baseline (validation) | 0.6674 | 0.5357 | 0.6016 |
 | FM — official baseline (test) | 0.6610 | 0.5282 | 0.5946 |
 | Oracle ceiling (test) | 1.0000 | 0.7289 | 0.8645 |
-| Best agent-generated candidate (validation, matched outer seeds 0/1/2) | — | — | 0.6017118 |
-| Five-seed rank ensemble of the official FM (validation) | — | — | 0.6026034 |
+| Best agent-generated candidate (validation, matched outer seeds 0/1/2) | — | — | 0.6017246 |
+| **Five-seed rank ensemble of the official FM (validation, shipped)** | 0.6688063 | 0.5364006 | **0.6026034** |
 
 **No generated candidate has beaten the baseline by a material margin, and we do not claim an
-improvement.** Six live autonomous campaigns converged with zero manual interventions on
-2026-08-30. Five selected the protected official-FM fallback; one promoted a generated candidate
-and the controller recorded it as `promoted_unconfirmed` because its delta did not clear ε = 0.002.
+improvement.** Nine live autonomous campaigns ran with **zero manual interventions**; seventeen
+campaigns in total across the project. Seven selected the protected official-FM fallback; two
+promoted a generated candidate, neither clearing ε = 0.002.
 
-The best generated result, `maki-overnight-13` `candidate-01`, scored 0.6017118 against an
-incumbent of 0.6014403 — **+0.0002715, or 0.34 of one seed standard deviation.** We reran the same
-method rather than reporting it, and `maki-overnight-14` landed at 0.6014124, on the other side of
-zero. That replication is the reason the number is not our headline.
+The best generated result, `maki-overnight-15` `candidate-01`, scored 0.6017246 against an
+incumbent of 0.6014403 — **+0.0002844, or 0.36 of one seed standard deviation.** The same method
+was run three times: **+0.34σ, −0.03σ, +0.36σ**, mean +0.00018 against ε = 0.002. Run 13's original
++0.0002715 was replicated rather than reported, and run 14 landed on the other side of zero. That
+replication is the reason the number is not our headline.
 
 Three caveats we went looking for and are reporting against ourselves:
 
 - **The agent's number is a blend, not its model.** Every candidate prediction is rank-fused with
-  the official FM over a fixed five-point weight grid. 0.6017118 is a 25/75 blend, so roughly three
-  quarters of it is the organizer's ordering. Scored alone, every candidate we have run sits 4σ to
-  12σ *below* the baseline. Reproduce with `python3 fusion_audit.py <run-id>`; the analysis is in
+  the official FM over a fixed five-point weight grid, and the recorded metric is the blend's.
+  0.6017246 is a 25/75 blend, so roughly three quarters of it is the organizer's ordering. Scored
+  alone, no candidate we have run has beaten the baseline — best is 0.5745312 against 0.5754240,
+  or −1.12σ. Reproduce with `python3 fusion_audit.py <run-id>`; the analysis is in
   [`docs/RESULTS.md`](docs/RESULTS.md) §3.3a.
 - **The five-seed ensemble is not an agent result.** 0.6026034 beats the 0.6016 baseline by
-  +0.0010 with no selection effect, and is reproducible offline from artifacts already in
-  `runs/maki-qualification` via `python3 seed_ensemble_probe.py`. But it ensembles the organizer's
-  own baseline with itself, it is controller-side rather than agent-generated, and it is below our
-  own ε = 0.002 materiality threshold.
+  +0.0010 with no selection effect. But it ensembles the organizer's own baseline with itself, it
+  is controller-side rather than agent-generated, and it is below our own ε = 0.002 materiality
+  threshold.
 - **The shipped fallback's margin is a selection effect.** `official-fm-fallback-seed-4` scores
   0.6020371, but seed 4 was chosen as the best of five on the same split it is reported on
   (`qualification.py:1080`). That is not a clean margin over the baseline.
@@ -437,16 +450,59 @@ Three caveats we went looking for and are reporting against ourselves:
 What the runs do demonstrate is that the loop runs end to end without human intervention,
 converges under the frozen rule, and emits an organizer-valid submission every time.
 
+### The submitted artifact
+
+```sh
+python3 build_ensemble_submission.py            # ~12 min; writes ensemble-submission/
+cd kuairand-starter-kit && python submit.py ../ensemble-submission/submission.csv \
+    --data_dir ../.data/KuaiRand-Pure/data --split test --check      # returns 0
+```
+
+A five-seed within-user rank ensemble of the official FM, scoring **0.6026034355** on public
+validation. It performs **no new training**: every member is an already-qualified organizer FM run
+from `runs/maki-qualification`, each checkpoint is verified against its qualification digest, the
+shared encoding is verified across all five rather than assumed, and inference runs through the
+hash-pinned organizer source. The number reproduced exactly through two independent code paths.
+`ensemble-submission/provenance.json` records that it is controller-side and not agent-generated,
+and that it does not clear ε.
+
+Members are combined on within-user rank percentiles, not raw scores. That choice is worth
++0.0004891 (`python3 ensemble_mode_probe.py`) — and it is precisely the operation a *candidate*
+cannot perform, because prediction receives no `user_groups`. See Limitations.
+
 GPU-hours consumed: **0.00** — every configuration is CPU-only. Total provider spend across every
-run to date: **$24.74** for 2,438,868 tokens over 114 calls.
+run to date: **$29.27** for **2,996,874 tokens** over **141 attempts** (130 returned a usage
+block). Regenerate with `python3 token_accounting.py`.
 
 ## Limitations, and what we would do with more time
 
-**What is not demonstrated.** We have not shown a validation-primary improvement above ε = 0.002.
-Six live campaigns converged; five selected the official-FM fallback and the one promotion did not
-clear ε. The pairwise direction was separately swept to convergence over twelve configurations
-without beating the baseline in any of them. Hidden-test performance is unknown and unclaimed;
-only the organizers can measure it.
+**What is not demonstrated.** We have not shown a validation-primary improvement above ε = 0.002,
+and no generated candidate has beaten the baseline scored on its own. The pairwise direction was
+separately swept to convergence over twelve configurations without beating the baseline in any of
+them. Hidden-test performance is unknown and unclaimed; only the organizers can measure it.
+
+**The candidate seam capped what the agent could achieve, and we can show it.** A candidate's
+prediction request carries the feature matrix and the checkpoint and nothing else
+(`candidate_api/runtime_contract.py`, `prediction_request_fields`). Three consequences, each
+measured rather than argued:
+
+1. **No user identity at prediction time**, so no user×item crosses — the term the baseline FM
+   draws most of its ordering power from. We added `user_id_code` (bundle 37 → 38 columns, user
+   vocabulary 26,211). **The hypothesis was falsified:** the gap stayed at −5σ.
+2. **No `user_groups` at prediction time**, so no within-user rank normalisation. This is why a
+   candidate that ensembles itself gains nothing: on the five official FM seeds, raw-score
+   averaging is worth +0.0000772 while rank averaging is worth +0.0005664. **86% of the ensembling
+   gain requires an operation the seam denies.** Reproduce with `python3 ensemble_mode_probe.py`.
+3. **No early stopping on the scored split** — which the baseline *does* get.
+   `baselines/starter_fm.py:701-708` keeps the best of up to 40 epochs measured on the split it
+   then reports, and the published 0.6016 has the same property (`baseline.py:88`). Our candidate
+   gets one shot, so the residual ~1σ is measured against an advantaged reference.
+
+The transferable point is that **an agent's capability boundary is a design parameter, not a
+detail.** Ours was drawn for good isolation reasons and silently capped the achievable score. What
+finally moved the number was not a better model but a better-specified interaction structure:
+restricting the FM interaction to the identity codes and keeping the causal aggregates additive
+took the gap from −4σ…−12σ to **−1.12σ**.
 
 **Our agent's feedback signal was wrong for three campaigns, and we found it late.** Candidate
 predictions are rank-fused with the official FM baseline, and the score recorded for a candidate is
@@ -468,9 +524,18 @@ accumulator with an `(N, rank)` one inside hand-written factorization-machine in
 and a non-scalar checkpoint entry read by the candidate's own `training_diagnostics`.
 Implementation size predicted this almost perfectly: candidates at or under roughly 260 lines
 executed 3 for 3, while none of the eight written at over 580 lines executed. After tested helpers
-for those three classes were added to the candidate seed, the last two campaigns executed **3 of 3
-and 3 of 3**. A crash inside `train_model` still ends a branch outright, because the repair loop
-covers pre-execution static gates only — the clearest structural gap remaining in the loop.
+for those three classes were added to the candidate seed, the last five campaigns executed
+**3 of 3 every time** — 22/22, 21/21, 22/22, 15/15 and 15/15 subprocess executions with empty
+stderr throughout. A crash inside `train_model` still ends a branch outright, because the repair
+loop covers pre-execution static gates only — the clearest structural gap remaining in the loop.
+
+**A code path that runs only on success accumulates defects invisibly.** The promotion path went
+unexecuted for twelve campaigns, and each time it finally ran it exposed a latent bug: a ledger
+export that misattributed runs (run 13), then a comparison of the float32 organizer primary against
+its own float64 recomputation at `abs_tol=1e-15` — **2.98e-8 apart, one float32 ulp** — which
+stranded run 15 at `FINALIZING` after it became the first campaign to promote a candidate *and*
+publish a bundle. Both are fixed and regression-tested. Both were found by reading the whole run
+rather than the failing traceback.
 
 **The constraint-transmission asymmetry.** The most instructive defect we found was in our own
 design. `materialize.py` enforces 44 distinct constants on generated code — forbidden import
