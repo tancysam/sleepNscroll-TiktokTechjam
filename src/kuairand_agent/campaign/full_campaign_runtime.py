@@ -47,6 +47,10 @@ from kuairand_agent.campaign.controller import (
     CampaignEngine,
     CampaignStatus,
 )
+from kuairand_agent.campaign.eda import (
+    within_user_feature_diagnostics,
+    within_user_label_structure,
+)
 from kuairand_agent.campaign.full_campaign import (
     CampaignDataPlane,
     FinalizationSelectionPlan,
@@ -734,6 +738,19 @@ def _research_context_evidence(
                     "long_view_positive_count": train_positive_count,
                     "long_view_positive_rate": train_positive_count / train_count,
                 },
+            ),
+            # Train-only within-user diagnostics. Without these the agent proposes modelling
+            # changes knowing only row counts and duration percentiles, which motivates no
+            # hypothesis the briefing does not already name.
+            *within_user_label_structure(
+                labels=data.outer_train_labels,
+                user_ids=data.outer_train_inputs.user_id,
+            ),
+            *within_user_feature_diagnostics(
+                feature_names=features.outer_and_final.prefix.feature_names,
+                feature_values=features.outer_and_final.prefix.values,
+                labels=data.outer_train_labels,
+                user_ids=data.outer_train_inputs.user_id,
             ),
         ),
         validation_input_eda=(
