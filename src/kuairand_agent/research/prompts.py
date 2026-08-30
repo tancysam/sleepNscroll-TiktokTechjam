@@ -322,6 +322,13 @@ def _blocked_family_constraints(blocked_families: Sequence[tuple[str, str]]) -> 
         "and the feature-authority section describes axes reachable inside your own code; both "
         "remain open except where named above."
     )
+    lines.append("")
+    lines.append(
+        "Write your proposal as a positive description of what you ARE doing. Do not restate a "
+        "closed family's name to explain what you are avoiding: your proposal text is classified "
+        "by the mechanism it names, so disclaiming a closed family in prose can misfile the "
+        "proposal into it."
+    )
     return "\n".join(lines)
 
 

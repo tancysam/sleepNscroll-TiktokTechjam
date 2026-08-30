@@ -221,10 +221,52 @@ def _observe_candidate_failure(
     )
 
 
+# A proposal that names a family only to disclaim it is not a proposal in that family. Once the
+# propose instructions list the closed families, the model states which one it is avoiding, and a
+# bare substring match then blocks exactly the proposals that heeded the instruction. Observed in
+# runs/guided-20260830T170124Z, where "without entering the closed pairwise family" and "do not use
+# the closed pairwise family" each blocked a listwise and a feature-interaction proposal.
+_AVOIDANCE_CUES: Final = (
+    "not ",
+    "n't",
+    "without",
+    "avoid",
+    "instead of",
+    "rather than",
+    "no longer",
+    "closed",
+    "blocked",
+    "exclude",
+    "never",
+    "unlike",
+    "other than",
+    "except",
+    "rejected",
+    "ruled out",
+)
+
+
+def _affirmative_clauses(text: str) -> tuple[str, ...]:
+    """Split ``text`` into clauses and drop the ones that disclaim rather than assert.
+
+    The error costs here are asymmetric. Blocking a proposal that was never in the family wastes
+    the whole iteration and, repeated, closes the campaign with nothing built. Missing a genuine
+    repeat merely spends one training run that then gets measured on its merits. So a family is
+    claimed only where it is asserted in a clause carrying no avoidance cue.
+    """
+
+    return tuple(
+        clause
+        for clause in re.split(r"[.;,:]|--", text)
+        if not any(cue in clause for cue in _AVOIDANCE_CUES)
+    )
+
+
 def _proposal_family(proposal: Proposal) -> str:
     scientific_text = " ".join(
         (proposal.objective, proposal.mechanism, proposal.principal_change)
     ).lower()
+    asserted = _affirmative_clauses(scientific_text)
     families = (
         ("pairwise", ("pairwise", "bpr")),
         ("listwise", ("listwise", "lambdarank", "lambda rank")),
@@ -232,7 +274,7 @@ def _proposal_family(proposal: Proposal) -> str:
         ("user-balanced", ("user balanced", "user-balanced")),
     )
     for family, markers in families:
-        if any(marker in scientific_text for marker in markers):
+        if any(marker in clause for clause in asserted for marker in markers):
             return family
     normalized = re.sub(r"[^a-z0-9]+", "-", proposal.objective.lower()).strip("-")
     return normalized[:64] or "unknown"
