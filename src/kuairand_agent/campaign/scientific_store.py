@@ -239,6 +239,18 @@ class DurableScientificLedgerAdapter:
         if projection.max_queries != self._max_distinct_candidates:
             raise ScientificStoreError("project ledger limit changed after adapter binding")
         self._assert_project_campaign_identity(projection.queries)
+        # Scoped to this campaign, matching the per-campaign ration the ledger enforces on
+        # reservation. The selector compares this set against outer_promotion_limit, so passing
+        # every campaign's fingerprints made the *project* history exhaust a *campaign's*
+        # allowance: once six candidates had ever been queried, every later candidate was rejected
+        # as `outer_candidate_limit` even when its own campaign had spent none of its six.
+        own_fingerprints = tuple(
+            dict.fromkeys(
+                item.candidate_fingerprint
+                for item in projection.queries
+                if item.campaign_id == self._campaign_id
+            )
+        )
         return OuterPromotionLedgerSnapshot(
             revision=projection.revision,
             campaign_digest=self._campaign_digest,
@@ -246,7 +258,7 @@ class DurableScientificLedgerAdapter:
             dataset_digest=self._dataset_digest,
             scorer_digest=self._scorer_digest,
             max_distinct_candidates=self._max_distinct_candidates,
-            candidate_fingerprints=projection.candidate_fingerprints,
+            candidate_fingerprints=own_fingerprints,
         )
 
     def _validate_request(self, request: OuterPromotionRequest) -> None:

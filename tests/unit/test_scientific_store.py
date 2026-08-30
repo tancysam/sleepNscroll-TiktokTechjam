@@ -541,3 +541,45 @@ def test_constructor_rejects_campaign_project_limit_mismatch(tmp_path: Path) -> 
             scorer_digest=_SCORER,
             evidence_registry={},
         )
+
+
+def test_snapshot_candidate_ids_are_scoped_to_the_campaign(tmp_path: Path) -> None:
+    """Another campaign's outer history must not exhaust this campaign's candidate allowance.
+
+    Reproduces `runs/feat-130658Z`, where the best candidate the project had ever produced --
+    positive on both inner folds -- was discarded as `inner_rejected / outer_candidate_limit`
+    while its own campaign had spent zero of its six outer queries. The selector compares
+    `outer_candidate_ids` against `outer_promotion_limit`, and the snapshot was handing it every
+    campaign's fingerprints, so six historical queries permanently blocked promotion for every
+    future campaign.
+    """
+
+    ledger_path = tmp_path / "outer.sqlite"
+    ledger = OuterQueryLedger.create(ledger_path, max_queries=6)
+    stores: list[CampaignStore] = []
+    try:
+        earlier = _create_store(tmp_path / "earlier.sqlite", "earlier-campaign")
+        stores.append(earlier)
+        earlier_adapter = DurableScientificLedgerAdapter(
+            earlier, ledger, scorer_digest=_SCORER, evidence_registry={}
+        )
+        for index in range(6):
+            earlier_adapter.reserve(_request(index))
+
+        # A fresh campaign sees none of that in its own allowance.
+        current = _create_store(tmp_path / "current.sqlite", "current-campaign")
+        stores.append(current)
+        adapter = DurableScientificLedgerAdapter(
+            current, ledger, scorer_digest=_SCORER, evidence_registry={}
+        )
+
+        snapshot = adapter.snapshot()
+
+        assert snapshot.candidate_fingerprints == ()
+        assert snapshot.max_distinct_candidates == 6
+        # The project log still holds every historical query, unchanged.
+        assert len(ledger.projection().candidate_fingerprints) == 6
+    finally:
+        for store in stores:
+            store.close()
+        ledger.close()
