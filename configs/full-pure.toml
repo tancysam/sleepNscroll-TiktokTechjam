@@ -29,6 +29,10 @@ provider = "openai"
 max_repairs_per_experiment = 2
 run_kind = "autonomous"
 allow_scripted_demo = false
+# Up to 2 independently proposed candidates per scientific iteration: try a second idea against
+# the same parent only when the first was not promoted, so a losing branch never wastes a launch
+# against an already-superseded incumbent.
+proposal_breadth = 2
 
 [research.openai]
 reasoning_effort = "low"

@@ -25,6 +25,7 @@ HARD_MAX_WALL_SECONDS: Final = 21_600
 HARD_MIN_FINALIZATION_RESERVE_SECONDS: Final = 600
 HARD_MAX_OUTER_PROMOTIONS: Final = 6
 HARD_MAX_REPAIRS: Final = 2
+HARD_MAX_PROPOSAL_BREADTH: Final = 4
 FROZEN_CONVERGENCE_EPSILON: Final = 0.002
 FROZEN_CONVERGENCE_PATIENCE: Final = 3
 FROZEN_CONFIRMATION_SEEDS: Final = (0, 1, 2)
@@ -132,6 +133,7 @@ class ResearchConfig:
     run_kind: str = "demo"
     allow_scripted_demo: bool = False
     openai: OpenAIResearchConfig | OpenAIFailoverResearchConfig | None = None
+    proposal_breadth: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +181,7 @@ class AgentConfig:
             "max_repairs_per_experiment": self.research.max_repairs_per_experiment,
             "run_kind": self.research.run_kind,
             "allow_scripted_demo": self.research.allow_scripted_demo,
+            "proposal_breadth": self.research.proposal_breadth,
         }
         if self.research.openai is not None:
             normalized_openai = dataclasses.asdict(self.research.openai)
@@ -368,6 +371,7 @@ def parse_config(raw: Mapping[str, Any]) -> AgentConfig:
             "run_kind",
             "allow_scripted_demo",
             "openai",
+            "proposal_breadth",
         }
         unknown_research = set(research_raw) - expected_research
         missing_research = {
@@ -632,6 +636,16 @@ def parse_config(raw: Mapping[str, Any]) -> AgentConfig:
         raise ConfigError("demo runs require research.allow_scripted_demo = true")
     if schema_version != 1 and run_kind != "demo" and allow_scripted_demo:
         raise ConfigError("research.allow_scripted_demo is valid only for demo runs")
+    proposal_breadth = (
+        _integer(
+            research_raw,
+            "proposal_breadth",
+            minimum=1,
+            maximum=HARD_MAX_PROPOSAL_BREADTH,
+        )
+        if "proposal_breadth" in research_raw
+        else 1
+    )
     research = ResearchConfig(
         provider=provider,
         max_repairs_per_experiment=_integer(
@@ -643,6 +657,7 @@ def parse_config(raw: Mapping[str, Any]) -> AgentConfig:
         run_kind=run_kind,
         allow_scripted_demo=allow_scripted_demo,
         openai=openai,
+        proposal_breadth=proposal_breadth,
     )
     return AgentConfig(
         schema_version=schema_version,

@@ -728,6 +728,130 @@ _LEDGER_SCHEMA_STATEMENTS: Final = (
 
 _LEDGER_TABLES: Final = frozenset({"ledger_meta", "ledger_state", "outer_queries"})
 
+_LINEAGE_SCHEMA_STATEMENTS: Final = (
+    """CREATE TABLE ledger_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    ) STRICT""",
+    """CREATE TABLE ledger_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        revision INTEGER NOT NULL CHECK(revision >= 0),
+        updated_at TEXT NOT NULL
+    ) STRICT""",
+    """CREATE TABLE lineage_events (
+        event_id INTEGER PRIMARY KEY,
+        campaign_id TEXT NOT NULL CHECK(length(campaign_id) > 0),
+        benchmark_digest TEXT NOT NULL CHECK(length(benchmark_digest) = 64),
+        starter_digest TEXT NOT NULL CHECK(length(starter_digest) = 64),
+        source_digest TEXT NOT NULL CHECK(length(source_digest) = 64),
+        outcome TEXT NOT NULL CHECK(outcome IN ('rejected', 'admitted')),
+        candidate_id TEXT NOT NULL CHECK(length(candidate_id) > 0),
+        proposal_family TEXT NOT NULL CHECK(length(proposal_family) > 0),
+        proposal_signature TEXT CHECK(
+            proposal_signature IS NULL OR length(proposal_signature) = 64
+        ),
+        repairs_attempted INTEGER CHECK(repairs_attempted IS NULL OR repairs_attempted >= 0),
+        root_failure_fingerprint TEXT CHECK(
+            root_failure_fingerprint IS NULL OR length(root_failure_fingerprint) = 64
+        ),
+        root_failure_category TEXT,
+        root_failure_code TEXT,
+        root_failure_subject TEXT,
+        terminal_failure_fingerprint TEXT CHECK(
+            terminal_failure_fingerprint IS NULL OR length(terminal_failure_fingerprint) = 64
+        ),
+        terminal_failure_category TEXT,
+        terminal_failure_code TEXT,
+        terminal_failure_subject TEXT,
+        diagnostic TEXT,
+        inner_fold_a_gauc REAL CHECK(
+            inner_fold_a_gauc IS NULL OR (inner_fold_a_gauc BETWEEN 0.0 AND 1.0)
+        ),
+        inner_fold_a_ndcg_at_5 REAL CHECK(
+            inner_fold_a_ndcg_at_5 IS NULL OR (inner_fold_a_ndcg_at_5 BETWEEN 0.0 AND 1.0)
+        ),
+        inner_fold_a_primary REAL CHECK(
+            inner_fold_a_primary IS NULL OR (inner_fold_a_primary BETWEEN 0.0 AND 1.0)
+        ),
+        inner_fold_b_gauc REAL CHECK(
+            inner_fold_b_gauc IS NULL OR (inner_fold_b_gauc BETWEEN 0.0 AND 1.0)
+        ),
+        inner_fold_b_ndcg_at_5 REAL CHECK(
+            inner_fold_b_ndcg_at_5 IS NULL OR (inner_fold_b_ndcg_at_5 BETWEEN 0.0 AND 1.0)
+        ),
+        inner_fold_b_primary REAL CHECK(
+            inner_fold_b_primary IS NULL OR (inner_fold_b_primary BETWEEN 0.0 AND 1.0)
+        ),
+        parent_fold_a_primary REAL CHECK(
+            parent_fold_a_primary IS NULL OR (parent_fold_a_primary BETWEEN 0.0 AND 1.0)
+        ),
+        parent_fold_b_primary REAL CHECK(
+            parent_fold_b_primary IS NULL OR (parent_fold_b_primary BETWEEN 0.0 AND 1.0)
+        ),
+        promoted INTEGER CHECK(promoted IS NULL OR promoted IN (0, 1)),
+        metadata_json TEXT NOT NULL CHECK(json_valid(metadata_json)),
+        created_at TEXT NOT NULL,
+        CHECK(
+            (outcome = 'rejected'
+                AND repairs_attempted IS NOT NULL
+                AND root_failure_fingerprint IS NOT NULL
+                AND root_failure_category IS NOT NULL
+                AND root_failure_code IS NOT NULL
+                AND root_failure_subject IS NOT NULL
+                AND terminal_failure_fingerprint IS NOT NULL
+                AND terminal_failure_category IS NOT NULL
+                AND terminal_failure_code IS NOT NULL
+                AND terminal_failure_subject IS NOT NULL
+                AND diagnostic IS NOT NULL
+                AND inner_fold_a_gauc IS NULL AND inner_fold_a_ndcg_at_5 IS NULL
+                AND inner_fold_a_primary IS NULL AND inner_fold_b_gauc IS NULL
+                AND inner_fold_b_ndcg_at_5 IS NULL AND inner_fold_b_primary IS NULL
+                AND parent_fold_a_primary IS NULL AND parent_fold_b_primary IS NULL
+                AND promoted IS NULL)
+            OR
+            (outcome = 'admitted'
+                AND repairs_attempted IS NULL
+                AND root_failure_fingerprint IS NULL
+                AND root_failure_category IS NULL
+                AND root_failure_code IS NULL
+                AND root_failure_subject IS NULL
+                AND terminal_failure_fingerprint IS NULL
+                AND terminal_failure_category IS NULL
+                AND terminal_failure_code IS NULL
+                AND terminal_failure_subject IS NULL
+                AND diagnostic IS NULL
+                -- Fold metrics are optional even for 'admitted': training can still fail (e.g.
+                -- CALLBACK_FAILED) after materialization succeeds, before any metric exists. A
+                -- candidate that fails the Fold B screen never reaches Fold A, so each fold's own
+                -- (inner metrics, parent reference) pair travels together, but Fold A and Fold B
+                -- are independent of each other. Promotion requires both folds to exist.
+                AND (
+                    (inner_fold_a_gauc IS NULL AND inner_fold_a_ndcg_at_5 IS NULL
+                        AND inner_fold_a_primary IS NULL AND parent_fold_a_primary IS NULL)
+                    OR
+                    (inner_fold_a_gauc IS NOT NULL AND inner_fold_a_ndcg_at_5 IS NOT NULL
+                        AND inner_fold_a_primary IS NOT NULL AND parent_fold_a_primary IS NOT NULL)
+                )
+                AND (
+                    (inner_fold_b_gauc IS NULL AND inner_fold_b_ndcg_at_5 IS NULL
+                        AND inner_fold_b_primary IS NULL AND parent_fold_b_primary IS NULL)
+                    OR
+                    (inner_fold_b_gauc IS NOT NULL AND inner_fold_b_ndcg_at_5 IS NOT NULL
+                        AND inner_fold_b_primary IS NOT NULL AND parent_fold_b_primary IS NOT NULL)
+                )
+                AND (
+                    promoted IS NULL
+                    OR (inner_fold_a_primary IS NOT NULL AND inner_fold_b_primary IS NOT NULL)
+                ))
+        )
+    ) STRICT""",
+    """CREATE INDEX lineage_events_scope
+        ON lineage_events(benchmark_digest, starter_digest, source_digest, event_id)""",
+    *_append_only_statements(("lineage_events",)),
+)
+
+_LINEAGE_TABLES: Final = frozenset({"ledger_meta", "ledger_state", "lineage_events"})
+
 
 def _schema_code_digest(statements: Sequence[str]) -> str:
     payload = "\n-- statement --\n".join(statement.strip() for statement in statements)
@@ -736,6 +860,7 @@ def _schema_code_digest(statements: Sequence[str]) -> str:
 
 _CAMPAIGN_SCHEMA_DIGEST: Final = _schema_code_digest(_CAMPAIGN_SCHEMA_STATEMENTS)
 _LEDGER_SCHEMA_DIGEST: Final = _schema_code_digest(_LEDGER_SCHEMA_STATEMENTS)
+_LINEAGE_SCHEMA_DIGEST: Final = _schema_code_digest(_LINEAGE_SCHEMA_STATEMENTS)
 
 
 def _text(value: object, location: str) -> str:
@@ -3928,3 +4053,423 @@ class OuterQueryLedger:
                 max_queries=self.max_queries,
                 queries=tuple(projected),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class LineageFoldMetrics:
+    """One immutable (GAUC, nDCG@5, primary) triple for a single inner fold."""
+
+    gauc: float
+    ndcg_at_5: float
+    primary: float
+
+    def __post_init__(self) -> None:
+        for name in ("gauc", "ndcg_at_5", "primary"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise StoreInvariantError(f"lineage fold metric {name} must be a real number")
+            if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                raise StoreInvariantError(f"lineage fold metric {name} must be finite in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class LineageEventRecord:
+    """One immutable project-wide research-lineage event."""
+
+    event_id: int
+    campaign_id: str
+    outcome: Literal["rejected", "admitted"]
+    candidate_id: str
+    proposal_family: str
+    proposal_signature: str | None
+    repairs_attempted: int | None
+    root_failure_fingerprint: str | None
+    root_failure_category: str | None
+    root_failure_code: str | None
+    root_failure_subject: str | None
+    terminal_failure_fingerprint: str | None
+    terminal_failure_category: str | None
+    terminal_failure_code: str | None
+    terminal_failure_subject: str | None
+    diagnostic: str | None
+    inner_fold_a: LineageFoldMetrics | None
+    inner_fold_b: LineageFoldMetrics | None
+    parent_fold_a_primary: float | None
+    parent_fold_b_primary: float | None
+    promoted: bool | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchLineageSummary:
+    """Bounded, typed cross-run evidence for one exact benchmark/starter/source identity.
+
+    Scoping by all three digests together means a change to the organizer benchmark contract, the
+    starter kit, or (most importantly) this repository's own trusted controller source
+    automatically starts a clean slate: stale evidence from a since-fixed bug can never keep
+    blocking a corrected agent.
+    """
+
+    root_failure_totals: Mapping[str, int]
+    proposal_family_rejection_totals: Mapping[str, int]
+    proposal_family_admission_totals: Mapping[str, int]
+    recent_events: tuple[LineageEventRecord, ...]
+
+
+def _lineage_event_record(row: sqlite3.Row) -> LineageEventRecord:
+    """Build one typed lineage event from its stored row."""
+
+    return LineageEventRecord(
+        event_id=int(row["event_id"]),
+        campaign_id=_row_text(row, "campaign_id"),
+        outcome=cast(Literal["rejected", "admitted"], _row_text(row, "outcome")),
+        candidate_id=_row_text(row, "candidate_id"),
+        proposal_family=_row_text(row, "proposal_family"),
+        proposal_signature=row["proposal_signature"],
+        repairs_attempted=row["repairs_attempted"],
+        root_failure_fingerprint=row["root_failure_fingerprint"],
+        root_failure_category=row["root_failure_category"],
+        root_failure_code=row["root_failure_code"],
+        root_failure_subject=row["root_failure_subject"],
+        terminal_failure_fingerprint=row["terminal_failure_fingerprint"],
+        terminal_failure_category=row["terminal_failure_category"],
+        terminal_failure_code=row["terminal_failure_code"],
+        terminal_failure_subject=row["terminal_failure_subject"],
+        diagnostic=row["diagnostic"],
+        inner_fold_a=(
+            None
+            if row["inner_fold_a_primary"] is None
+            else LineageFoldMetrics(
+                gauc=row["inner_fold_a_gauc"],
+                ndcg_at_5=row["inner_fold_a_ndcg_at_5"],
+                primary=row["inner_fold_a_primary"],
+            )
+        ),
+        inner_fold_b=(
+            None
+            if row["inner_fold_b_primary"] is None
+            else LineageFoldMetrics(
+                gauc=row["inner_fold_b_gauc"],
+                ndcg_at_5=row["inner_fold_b_ndcg_at_5"],
+                primary=row["inner_fold_b_primary"],
+            )
+        ),
+        parent_fold_a_primary=row["parent_fold_a_primary"],
+        parent_fold_b_primary=row["parent_fold_b_primary"],
+        promoted=(None if row["promoted"] is None else bool(row["promoted"])),
+        created_at=_row_text(row, "created_at"),
+    )
+
+
+class ResearchLineageLedger:
+    """Project-wide append-only ledger of generated-candidate proposal outcomes.
+
+    Unlike :class:`OuterQueryLedger`, this ledger is advisory rather than a hard safety limit: it
+    lets a later campaign start with typed knowledge of which proposal families and root failures
+    an earlier campaign already exhausted against the exact same benchmark, starter kit, and
+    trusted controller source identity, instead of rediscovering the same failure from scratch.
+    """
+
+    def __init__(self, path: Path, connection: sqlite3.Connection, *, read_only: bool) -> None:
+        self.path = path
+        self._connection = connection
+        self._read_only = read_only
+
+    @classmethod
+    def create(cls, path: str | Path) -> Self:
+        database = Path(path).absolute()
+        _claim_database(database)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = _connect(database, read_only=False)
+            _initialize_schema(
+                connection,
+                statements=_LINEAGE_SCHEMA_STATEMENTS,
+                meta_table="ledger_meta",
+                kind="kuairand-research-lineage-ledger",
+                schema_digest=_LINEAGE_SCHEMA_DIGEST,
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT INTO ledger_state(singleton, revision, updated_at) VALUES (1, 0, ?)",
+                    (_now(),),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            os.chmod(database, 0o600)
+            return cls(database, connection, read_only=False)
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            _cleanup_claimed_database(database)
+            raise
+
+    @classmethod
+    def open(cls, path: str | Path, *, read_only: bool = False) -> Self:
+        database = Path(path).absolute()
+        if database.is_symlink() or not database.is_file():
+            raise CampaignNotFoundError(
+                f"project research-lineage ledger does not exist: {database}"
+            )
+        connection = _connect(database, read_only=read_only)
+        try:
+            _verify_schema(
+                connection,
+                meta_table="ledger_meta",
+                kind="kuairand-research-lineage-ledger",
+                schema_digest=_LINEAGE_SCHEMA_DIGEST,
+                expected_tables=_LINEAGE_TABLES,
+            )
+            return cls(database, connection, read_only=read_only)
+        except BaseException:
+            connection.close()
+            raise
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    @contextlib.contextmanager
+    def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+        if write and self._read_only:
+            raise StoreInvariantError("read-only research-lineage ledger cannot be mutated")
+        self._connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        try:
+            yield self._connection
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
+
+    def _advance(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "UPDATE ledger_state SET revision = revision + 1, updated_at = ? WHERE singleton = 1",
+            (_now(),),
+        )
+
+    def record_rejection(
+        self,
+        *,
+        campaign_id: str,
+        benchmark_digest: str,
+        starter_digest: str,
+        source_digest: str,
+        candidate_id: str,
+        proposal_family: str,
+        proposal_signature: str | None,
+        repairs_attempted: int,
+        root_failure_fingerprint: str,
+        root_failure_category: str,
+        root_failure_code: str,
+        root_failure_subject: str,
+        terminal_failure_fingerprint: str,
+        terminal_failure_category: str,
+        terminal_failure_code: str,
+        terminal_failure_subject: str,
+        diagnostic: str,
+    ) -> None:
+        """Append one pre-admission rejection observed by a live research campaign."""
+
+        campaign = _text(campaign_id, "campaign_id")
+        benchmark = _digest(benchmark_digest, "benchmark_digest")
+        starter = _digest(starter_digest, "starter_digest")
+        source = _digest(source_digest, "source_digest")
+        candidate = _text(candidate_id, "candidate_id")
+        family = _text(proposal_family, "proposal_family")
+        signature = _optional_digest(proposal_signature, "proposal_signature")
+        if type(repairs_attempted) is not int or repairs_attempted < 0:
+            raise StoreInvariantError("repairs_attempted must be a non-negative integer")
+        root_fingerprint = _digest(root_failure_fingerprint, "root_failure_fingerprint")
+        terminal_fingerprint = _digest(terminal_failure_fingerprint, "terminal_failure_fingerprint")
+        bounded_diagnostic = _text(diagnostic, "diagnostic")[:2000]
+        metadata_json = _json_object({}, "lineage-event metadata")
+        with self._transaction(write=True) as connection:
+            connection.execute(
+                """INSERT INTO lineage_events(
+                    campaign_id, benchmark_digest, starter_digest, source_digest, outcome,
+                    candidate_id, proposal_family, proposal_signature, repairs_attempted,
+                    root_failure_fingerprint, root_failure_category, root_failure_code,
+                    root_failure_subject, terminal_failure_fingerprint, terminal_failure_category,
+                    terminal_failure_code, terminal_failure_subject, diagnostic, metadata_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, 'rejected', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    campaign,
+                    benchmark,
+                    starter,
+                    source,
+                    candidate,
+                    family,
+                    signature,
+                    repairs_attempted,
+                    root_fingerprint,
+                    _text(root_failure_category, "root_failure_category"),
+                    _text(root_failure_code, "root_failure_code"),
+                    _text(root_failure_subject, "root_failure_subject"),
+                    terminal_fingerprint,
+                    _text(terminal_failure_category, "terminal_failure_category"),
+                    _text(terminal_failure_code, "terminal_failure_code"),
+                    _text(terminal_failure_subject, "terminal_failure_subject"),
+                    bounded_diagnostic,
+                    metadata_json,
+                    _now(),
+                ),
+            )
+            self._advance(connection)
+
+    def record_admission(
+        self,
+        *,
+        campaign_id: str,
+        benchmark_digest: str,
+        starter_digest: str,
+        source_digest: str,
+        candidate_id: str,
+        proposal_family: str,
+        proposal_signature: str | None,
+        inner_fold_a: LineageFoldMetrics | None = None,
+        inner_fold_b: LineageFoldMetrics | None = None,
+        parent_fold_a_primary: float | None = None,
+        parent_fold_b_primary: float | None = None,
+        promoted: bool | None = None,
+    ) -> None:
+        """Append one successful admission observed by a live research campaign.
+
+        Fold evidence is optional and each fold travels independently: a candidate that fails the
+        Fold B screen never reaches Fold A, but its real Fold B result is still worth a future
+        campaign knowing, so pass ``inner_fold_b``/``parent_fold_b_primary`` alone in that case.
+        ``promoted`` requires both folds, since promotion is impossible without a Fold A
+        confirmation. Call with no evidence at all right after materialization succeeds if
+        training has not run yet; a corrected caller may still choose to record a second, richer
+        event once evidence exists rather than mutate this one, since the table is append-only.
+        """
+
+        campaign = _text(campaign_id, "campaign_id")
+        benchmark = _digest(benchmark_digest, "benchmark_digest")
+        starter = _digest(starter_digest, "starter_digest")
+        source = _digest(source_digest, "source_digest")
+        candidate = _text(candidate_id, "candidate_id")
+        family = _text(proposal_family, "proposal_family")
+        signature = _optional_digest(proposal_signature, "proposal_signature")
+        if (inner_fold_a is None) != (parent_fold_a_primary is None):
+            raise StoreInvariantError("inner_fold_a and parent_fold_a_primary travel together")
+        if (inner_fold_b is None) != (parent_fold_b_primary is None):
+            raise StoreInvariantError("inner_fold_b and parent_fold_b_primary travel together")
+        if promoted is not None and (inner_fold_a is None or inner_fold_b is None):
+            raise StoreInvariantError("promoted requires both Fold A and Fold B evidence")
+        for name, value in (
+            ("parent_fold_a_primary", parent_fold_a_primary),
+            ("parent_fold_b_primary", parent_fold_b_primary),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise StoreInvariantError(f"{name} must be finite in [0, 1]")
+        if promoted is not None and type(promoted) is not bool:
+            raise StoreInvariantError("promoted must be boolean")
+        metadata_json = _json_object({}, "lineage-event metadata")
+        with self._transaction(write=True) as connection:
+            connection.execute(
+                """INSERT INTO lineage_events(
+                    campaign_id, benchmark_digest, starter_digest, source_digest, outcome,
+                    candidate_id, proposal_family, proposal_signature,
+                    inner_fold_a_gauc, inner_fold_a_ndcg_at_5, inner_fold_a_primary,
+                    inner_fold_b_gauc, inner_fold_b_ndcg_at_5, inner_fold_b_primary,
+                    parent_fold_a_primary, parent_fold_b_primary, promoted,
+                    metadata_json, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, 'admitted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )""",
+                (
+                    campaign,
+                    benchmark,
+                    starter,
+                    source,
+                    candidate,
+                    family,
+                    signature,
+                    None if inner_fold_a is None else inner_fold_a.gauc,
+                    None if inner_fold_a is None else inner_fold_a.ndcg_at_5,
+                    None if inner_fold_a is None else inner_fold_a.primary,
+                    None if inner_fold_b is None else inner_fold_b.gauc,
+                    None if inner_fold_b is None else inner_fold_b.ndcg_at_5,
+                    None if inner_fold_b is None else inner_fold_b.primary,
+                    parent_fold_a_primary,
+                    parent_fold_b_primary,
+                    None if promoted is None else int(promoted),
+                    metadata_json,
+                    _now(),
+                ),
+            )
+            self._advance(connection)
+
+    def summary(
+        self,
+        *,
+        benchmark_digest: str,
+        starter_digest: str,
+        source_digest: str,
+        limit: int = 20,
+    ) -> ResearchLineageSummary:
+        """Return bounded typed evidence for one exact benchmark/starter/source identity."""
+
+        benchmark = _digest(benchmark_digest, "benchmark_digest")
+        starter = _digest(starter_digest, "starter_digest")
+        source = _digest(source_digest, "source_digest")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise StoreInvariantError(
+                "research-lineage summary limit must be an integer in [1, 200]"
+            )
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                """SELECT * FROM lineage_events
+                WHERE benchmark_digest = ? AND starter_digest = ? AND source_digest = ?
+                ORDER BY event_id ASC""",
+                (benchmark, starter, source),
+            ).fetchall()
+        root_failure_totals: dict[str, int] = {}
+        family_rejections: dict[str, int] = {}
+        family_admissions: dict[str, int] = {}
+        events: list[LineageEventRecord] = []
+        for row in rows:
+            outcome = _row_text(row, "outcome")
+            family = _row_text(row, "proposal_family")
+            if outcome == "rejected":
+                fingerprint = _row_text(row, "root_failure_fingerprint")
+                root_failure_totals[fingerprint] = root_failure_totals.get(fingerprint, 0) + 1
+                family_rejections[family] = family_rejections.get(family, 0) + 1
+            else:
+                family_admissions[family] = family_admissions.get(family, 0) + 1
+            events.append(_lineage_event_record(row))
+        return ResearchLineageSummary(
+            root_failure_totals=MappingProxyType(root_failure_totals),
+            proposal_family_rejection_totals=MappingProxyType(family_rejections),
+            proposal_family_admission_totals=MappingProxyType(family_admissions),
+            recent_events=tuple(events[-limit:]),
+        )
+
+    def events_for_campaign(self, campaign_id: str) -> tuple[LineageEventRecord, ...]:
+        """Return one campaign's own events in durable order, across every identity scope.
+
+        Reporting reads a single completed campaign, so unlike :meth:`summary` this is scoped by
+        campaign rather than by benchmark/starter/source identity: a run's own log must stay
+        readable after a later code change moves the active lineage scope.
+        """
+
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                "SELECT * FROM lineage_events WHERE campaign_id = ? ORDER BY event_id ASC",
+                (_text(campaign_id, "campaign_id"),),
+            ).fetchall()
+        return tuple(_lineage_event_record(row) for row in rows)

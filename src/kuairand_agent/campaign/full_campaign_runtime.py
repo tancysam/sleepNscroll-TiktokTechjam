@@ -114,7 +114,9 @@ from kuairand_agent.campaign.selector import (
 from kuairand_agent.campaign.store import (
     ArtifactSpec,
     CampaignStore,
+    LineageFoldMetrics,
     OuterQueryLedger,
+    ResearchLineageLedger,
 )
 from kuairand_agent.config import ResearchConfig
 from kuairand_agent.contract import benchmark_digest, verify_starter_kit
@@ -169,6 +171,8 @@ from kuairand_agent.research.production import (
     prepare_or_rehydrate_live_lineage,
     prepare_or_rehydrate_scripted_lambdarank_lineage,
 )
+from kuairand_agent.research.production import _proposal_family as _lineage_proposal_family
+from kuairand_agent.research.production import _proposal_signature as _lineage_proposal_signature
 from kuairand_agent.research.provider import (
     OpenAIChatCompletionsConfig,
     OpenAIChatCompletionsModel,
@@ -1485,6 +1489,78 @@ def _rejected_lineage_record(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _LineageAdmissionMetrics:
+    """This attempt's own inner-fold outcome, extracted for durable cross-run recording."""
+
+    inner_fold_a: LineageFoldMetrics | None
+    inner_fold_b: LineageFoldMetrics | None
+    parent_fold_a_primary: float | None
+    parent_fold_b_primary: float | None
+    promoted: bool | None
+
+
+def _lineage_admission_metrics(
+    *,
+    parent_incumbent: IncumbentEvidence,
+    result: ScientificCampaignResult,
+    candidate_id: str,
+) -> _LineageAdmissionMetrics:
+    """Extract one attempt's fold evidence against its actual parent, not the fixed FM baseline.
+
+    ``parent_incumbent`` must be the incumbent as it stood *before* this attempt's own
+    ``run_scientific_campaign`` call, since a promotion inside that call replaces
+    ``result.incumbent`` with the just-processed candidate itself.
+    """
+
+    # Each fold's own (inner metrics, parent reference) pair travels together, but Fold A and
+    # Fold B are independent of each other: a candidate that fails the Fold B screen never
+    # reaches Fold A, and its real Fold B result is still worth a future campaign knowing rather
+    # than discarding. `promoted` is only ever meaningful (and only ever stored) alongside full
+    # evidence from both folds, since promotion is impossible without a Fold A confirmation.
+    empty = _LineageAdmissionMetrics(None, None, None, None, None)
+    own_result = next(
+        (item for item in result.candidates if item.candidate.candidate_id == candidate_id),
+        None,
+    )
+    if own_result is None or not own_result.runs:
+        return empty
+    parent_folds = dict(parent_incumbent.inner_by_fold)
+    fold_b_raw = own_result.runs[0].metrics
+    fold_a_raw = own_result.runs[1].metrics if len(own_result.runs) >= 2 else None
+
+    inner_fold_b: LineageFoldMetrics | None = None
+    parent_fold_b_primary: float | None = None
+    parent_fold_b = parent_folds.get("B")
+    if fold_b_raw is not None and parent_fold_b is not None:
+        inner_fold_b = LineageFoldMetrics(
+            gauc=fold_b_raw.gauc, ndcg_at_5=fold_b_raw.ndcg_at_5, primary=fold_b_raw.primary
+        )
+        parent_fold_b_primary = parent_fold_b.primary
+
+    inner_fold_a: LineageFoldMetrics | None = None
+    parent_fold_a_primary: float | None = None
+    parent_fold_a = parent_folds.get("A")
+    if fold_a_raw is not None and parent_fold_a is not None:
+        inner_fold_a = LineageFoldMetrics(
+            gauc=fold_a_raw.gauc, ndcg_at_5=fold_a_raw.ndcg_at_5, primary=fold_a_raw.primary
+        )
+        parent_fold_a_primary = parent_fold_a.primary
+
+    promoted = (
+        result.incumbent.candidate_id == candidate_id
+        if inner_fold_a is not None and inner_fold_b is not None
+        else None
+    )
+    return _LineageAdmissionMetrics(
+        inner_fold_a=inner_fold_a,
+        inner_fold_b=inner_fold_b,
+        parent_fold_a_primary=parent_fold_a_primary,
+        parent_fold_b_primary=parent_fold_b_primary,
+        promoted=promoted,
+    )
+
+
 def _research_stage_counts(
     *,
     model: ResearchModel | None,
@@ -1870,16 +1946,70 @@ def _prepare_live_lineage_portfolio(
     maximum_iterations: int,
     safe_context_factory: Callable[[tuple[AggregateRecord, ...]], SafeResearchContext],
     continue_check: Callable[[], bool],
+    benchmark_digest: str = "",
+    starter_digest: str = "",
+    source_digest: str = "",
+    lineage_ledger_path: Path | None = None,
+    prior_root_failure_totals: Mapping[str, int] = MappingProxyType({}),
+    prior_family_attempts: Mapping[str, int] = MappingProxyType({}),
+    prior_advisory_records: tuple[AggregateRecord, ...] = (),
 ) -> _LiveLineagePreparation:
-    """Prepare one valid lineage or return an exact, evidence-preserving closure reason."""
+    """Prepare one valid lineage or return an exact, evidence-preserving closure reason.
+
+    ``prior_*`` seeds the circuit breaker and the LLM-visible evidence with cross-run history from
+    the project-wide :class:`~kuairand_agent.campaign.store.ResearchLineageLedger` (see
+    ``_lineage_ledger_location``), so a fresh campaign against the exact same benchmark, starter
+    kit, and trusted source identity does not repeat an already-characterized failure from
+    scratch.  When ``lineage_ledger_path`` is given, every rejection and acceptance this call
+    observes is also durably recorded there for the *next* campaign to inherit.
+
+    ``prior_advisory_records`` only ever widens what the LLM is shown; it is deliberately kept out
+    of the returned ``rejected_records``, which stays scoped to this campaign's own branches so
+    downstream stage counts (``candidates_admitted`` and friends) remain accurate reporting of
+    *this* run rather than a run's-worth of history borrowed from an earlier campaign.
+    """
+
+    if lineage_ledger_path is not None and not (
+        benchmark_digest and starter_digest and source_digest
+    ):
+        raise FullCampaignError(
+            "a research-lineage ledger requires benchmark, starter, and source digests"
+        )
+
+    def record_rejection_evidence(rejection: LiveResearchBranchRejected) -> None:
+        if lineage_ledger_path is None:
+            return
+        with _open_lineage_ledger(lineage_ledger_path) as ledger:
+            ledger.record_rejection(
+                campaign_id=campaign_id,
+                benchmark_digest=benchmark_digest,
+                starter_digest=starter_digest,
+                source_digest=source_digest,
+                candidate_id=rejection.failed_candidate_id,
+                proposal_family=rejection.proposal_family,
+                proposal_signature=rejection.proposal_signature or None,
+                repairs_attempted=rejection.repairs_attempted,
+                root_failure_fingerprint=rejection.root_failure.fingerprint,
+                root_failure_category=rejection.root_failure.category,
+                root_failure_code=rejection.root_failure.code,
+                root_failure_subject=rejection.root_failure.subject,
+                terminal_failure_fingerprint=rejection.terminal_failure.fingerprint,
+                terminal_failure_category=rejection.terminal_failure.category,
+                terminal_failure_code=rejection.terminal_failure.code,
+                terminal_failure_subject=rejection.terminal_failure.subject,
+                diagnostic=rejection.diagnostic,
+            )
+
+    # Admission is recorded with real fold metrics by the caller, once `run_scientific_campaign`
+    # has actually trained this candidate — this function only prepares the lineage.
 
     rejected, previous_journal_digest = _load_rejection_journal(
         generated_root,
         campaign_id=campaign_id,
         maximum_iterations=maximum_iterations,
     )
-    root_failure_totals: dict[str, int] = {}
-    proposal_family_attempts: dict[str, int] = {}
+    root_failure_totals: dict[str, int] = dict(prior_root_failure_totals)
+    proposal_family_attempts: dict[str, int] = dict(prior_family_attempts)
     previous_root_fingerprint: str | None = None
     consecutive_root_failures = 0
     for retained_iteration, retained in enumerate(rejected, start=1):
@@ -1922,7 +2052,7 @@ def _prepare_live_lineage_portfolio(
                 rejected_records=tuple(rejected),
                 branches_attempted=iteration - 1,
             )
-        safe_context = safe_context_factory(tuple(rejected))
+        safe_context = safe_context_factory(prior_advisory_records + tuple(rejected))
         try:
             lineage = prepare_or_rehydrate_live_lineage(
                 campaign_id=campaign_id,
@@ -1945,6 +2075,7 @@ def _prepare_live_lineage_portfolio(
                 provider_error=error,
             )
         except LiveResearchBranchRejected as rejection:
+            record_rejection_evidence(rejection)
             root_fingerprint = rejection.root_failure.fingerprint
             root_failure_total = root_failure_totals.get(root_fingerprint, 0) + 1
             root_failure_totals[root_fingerprint] = root_failure_total
@@ -2101,8 +2232,69 @@ def _run_autonomous_followups(
     first_reflection: Reflection,
     first_reflection_evidence: tuple[str, str, ArtifactRef],
     prior_records: tuple[AggregateRecord, ...],
+    lineage_ledger_path: Path | None = None,
+    prior_advisory_records: tuple[AggregateRecord, ...] = (),
 ) -> _AutonomousFollowupResult:
-    """Continue propose→implement→evaluate→reflect until an exact terminal condition."""
+    """Continue propose→implement→evaluate→reflect until an exact terminal condition.
+
+    ``prior_advisory_records`` carries cross-run lineage-ledger evidence.  It only ever widens the
+    ``campaign_records`` shown to the LLM each iteration; it is deliberately kept out of
+    ``rejected_records`` so this campaign's own stage counts (``candidates_admitted`` and friends)
+    stay accurate reporting of *this* run.
+    """
+
+    def record_rejection_evidence(rejection: LiveResearchBranchRejected) -> None:
+        if lineage_ledger_path is None:
+            return
+        with _open_lineage_ledger(lineage_ledger_path) as ledger:
+            ledger.record_rejection(
+                campaign_id=request.campaign_id,
+                benchmark_digest=request.benchmark_digest,
+                starter_digest=request.starter_manifest_digest,
+                source_digest=request.source_digest,
+                candidate_id=rejection.failed_candidate_id,
+                proposal_family=rejection.proposal_family,
+                proposal_signature=rejection.proposal_signature or None,
+                repairs_attempted=rejection.repairs_attempted,
+                root_failure_fingerprint=rejection.root_failure.fingerprint,
+                root_failure_category=rejection.root_failure.category,
+                root_failure_code=rejection.root_failure.code,
+                root_failure_subject=rejection.root_failure.subject,
+                terminal_failure_fingerprint=rejection.terminal_failure.fingerprint,
+                terminal_failure_category=rejection.terminal_failure.category,
+                terminal_failure_code=rejection.terminal_failure.code,
+                terminal_failure_subject=rejection.terminal_failure.subject,
+                diagnostic=rejection.diagnostic,
+            )
+
+    def record_admission_evidence(
+        lineage: LiveResearchLineage,
+        *,
+        parent_incumbent: IncumbentEvidence,
+        outcome: ScientificCampaignResult,
+    ) -> None:
+        if lineage_ledger_path is None:
+            return
+        metrics = _lineage_admission_metrics(
+            parent_incumbent=parent_incumbent,
+            result=outcome,
+            candidate_id=lineage.candidate_id,
+        )
+        with _open_lineage_ledger(lineage_ledger_path) as ledger:
+            ledger.record_admission(
+                campaign_id=request.campaign_id,
+                benchmark_digest=request.benchmark_digest,
+                starter_digest=request.starter_manifest_digest,
+                source_digest=request.source_digest,
+                candidate_id=lineage.candidate_id,
+                proposal_family=_lineage_proposal_family(lineage.proposal),
+                proposal_signature=_lineage_proposal_signature(lineage.proposal),
+                inner_fold_a=metrics.inner_fold_a,
+                inner_fold_b=metrics.inner_fold_b,
+                parent_fold_a_primary=metrics.parent_fold_a_primary,
+                parent_fold_b_primary=metrics.parent_fold_b_primary,
+                promoted=metrics.promoted,
+            )
 
     result = first_result
     selection = first_selection
@@ -2120,6 +2312,7 @@ def _run_autonomous_followups(
     candidates = list(result.candidates)
     feedback = list(result.public_feedback)
     records = [
+        *prior_advisory_records,
         *prior_records,
         _iteration_record(
             result,
@@ -2130,6 +2323,9 @@ def _run_autonomous_followups(
     rejected_records = list(prior_records)
     iteration = runtime_template.scientific_iteration
     terminal = result.stop_reason
+    proposal_breadth = max(1, request.config.research.proposal_breadth)
+    round_attempt_count = 0
+    pending_admitted_records: list[AggregateRecord] = []
 
     while True:
         if result.convergence.should_stop:
@@ -2178,6 +2374,7 @@ def _run_autonomous_followups(
                 provider="openai",
             )
         except LiveResearchBranchRejected as rejection:
+            record_rejection_evidence(rejection)
             rejected_record = _rejected_lineage_record(
                 rejection,
                 scientific_iteration=iteration,
@@ -2187,6 +2384,7 @@ def _run_autonomous_followups(
             terminal = CampaignStopReason.CANDIDATES_EXHAUSTED
             continue
         candidate_id = lineage.candidate_id
+        parent_incumbent = result.incumbent
         research_ledger, experiment_id = _ensure_lineage_ledger(
             campaign_store=runtime_template.campaign_store,
             lineage=lineage,
@@ -2232,6 +2430,7 @@ def _run_autonomous_followups(
                 initial_launches_used=result.launches_used,
                 initial_elapsed_seconds=result.elapsed_seconds,
             )
+        record_admission_evidence(lineage, parent_incumbent=parent_incumbent, outcome=result)
         candidates.extend(result.candidates)
         feedback.extend(result.public_feedback)
         runtime_template.campaign_store.set_convergence_state(
@@ -2270,14 +2469,29 @@ def _run_autonomous_followups(
             artifacts=runtime_template.artifacts,
             research_model=research_model,
         )
-        records.append(_iteration_record(result, reflection, scientific_iteration=iteration))
-        if result.incumbent.candidate_id == candidate_id:
+        pending_admitted_records.append(
+            _iteration_record(result, reflection, scientific_iteration=iteration)
+        )
+        round_attempt_count += 1
+        promoted = result.incumbent.candidate_id == candidate_id
+        if promoted:
             parent = snapshot_materialized_candidate(
                 lineage.materialized,
                 candidate_id=candidate_id,
             )
+        # A round is up to `proposal_breadth` independently proposed attempts against the same
+        # parent. Each attempt's own reflection is held back from `records` (and therefore from
+        # the *next* attempt's `campaign_records`) until the round concludes, so a same-round
+        # follow-up attempt is proposed from the same starting evidence rather than anchored to a
+        # critique of the attempt immediately before it. Once the round ends — by promotion or by
+        # exhausting its breadth — every attempt's reflection is flushed for later rounds to see.
+        if promoted or round_attempt_count >= proposal_breadth:
+            records.extend(pending_admitted_records)
+            pending_admitted_records = []
+            round_attempt_count = 0
         terminal = result.stop_reason
 
+    records.extend(pending_admitted_records)
     aggregate = ScientificCampaignResult(
         config_digest=scientific_config.digest,
         fallback=fallback,
@@ -2867,6 +3081,42 @@ def _outer_ledger_location(
     ).absolute()
 
 
+def _open_lineage_ledger(path: Path) -> ResearchLineageLedger:
+    """Open the project-wide research-lineage ledger, creating it on first use.
+
+    Unlike the outer-query ledger this carries no hard limit, so opening never fails on a
+    populated ledger: it exists purely to give a fresh campaign typed cross-run evidence about
+    which proposal families and root failures were already characterized against this exact
+    benchmark, starter kit, and trusted source identity.
+    """
+
+    try:
+        if path.exists() or path.is_symlink():
+            return ResearchLineageLedger.open(path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent = path.parent.lstat()
+        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+            raise FullCampaignError("research-lineage ledger parent must be a real directory")
+        return ResearchLineageLedger.create(path)
+    except OSError as exc:
+        raise FullCampaignError("research-lineage ledger is unavailable") from exc
+
+
+def _lineage_ledger_location(
+    *,
+    run_dir: Path,
+    project_root: Path,
+    configured_path: Path | None,
+) -> Path:
+    return (
+        run_dir.parent / "research-lineage-ledger.sqlite3"
+        if configured_path is None
+        else configured_path
+        if configured_path.is_absolute()
+        else project_root / configured_path
+    ).absolute()
+
+
 @dataclass(frozen=True, slots=True)
 class _OuterResumeAuthorization:
     request_digest: str
@@ -3002,6 +3252,7 @@ def run_provider_free_campaign(
     project_root: Path,
     engine: CampaignEngine | None = None,
     outer_ledger_path: Path | None = None,
+    lineage_ledger_path: Path | None = None,
     cancel_event: Event | None = None,
 ) -> FullCampaignOutcome:
     """Run or restart the bounded local campaign through a strict finalization handoff.
@@ -3132,6 +3383,11 @@ def run_provider_free_campaign(
         run_dir=run,
         project_root=root,
         configured_path=outer_ledger_path,
+    )
+    lineage_path = _lineage_ledger_location(
+        run_dir=run,
+        project_root=root,
+        configured_path=lineage_ledger_path,
     )
 
     with CampaignStore.open(
@@ -3427,6 +3683,59 @@ def run_provider_free_campaign(
             )
             candidate_id = SCRIPTED_CANDIDATE_ID
         else:
+            with _open_lineage_ledger(lineage_path) as prior_lineage_ledger:
+                prior_lineage = prior_lineage_ledger.summary(
+                    benchmark_digest=request.benchmark_digest,
+                    starter_digest=request.starter_manifest_digest,
+                    source_digest=request.source_digest,
+                )
+            prior_lineage_advisory_records = tuple(
+                AggregateRecord(
+                    name=f"prior_campaign_lesson_{event.event_id:04d}",
+                    values={
+                        key: value
+                        for key, value in {
+                            "campaign_id": event.campaign_id,
+                            "branch_outcome": event.outcome,
+                            "candidate_id": event.candidate_id,
+                            "proposal_family": event.proposal_family,
+                            "proposal_signature": event.proposal_signature,
+                            "repairs_attempted": event.repairs_attempted,
+                            "root_failure_fingerprint": event.root_failure_fingerprint,
+                            "root_failure_category": event.root_failure_category,
+                            "root_failure_code": event.root_failure_code,
+                            "root_failure_subject": event.root_failure_subject,
+                            "inner_fold_a_gauc": (
+                                None if event.inner_fold_a is None else event.inner_fold_a.gauc
+                            ),
+                            "inner_fold_a_ndcg_at_5": (
+                                None
+                                if event.inner_fold_a is None
+                                else event.inner_fold_a.ndcg_at_5
+                            ),
+                            "inner_fold_a_primary": (
+                                None if event.inner_fold_a is None else event.inner_fold_a.primary
+                            ),
+                            "inner_fold_b_gauc": (
+                                None if event.inner_fold_b is None else event.inner_fold_b.gauc
+                            ),
+                            "inner_fold_b_ndcg_at_5": (
+                                None
+                                if event.inner_fold_b is None
+                                else event.inner_fold_b.ndcg_at_5
+                            ),
+                            "inner_fold_b_primary": (
+                                None if event.inner_fold_b is None else event.inner_fold_b.primary
+                            ),
+                            "parent_fold_a_primary": event.parent_fold_a_primary,
+                            "parent_fold_b_primary": event.parent_fold_b_primary,
+                            "promoted": event.promoted,
+                        }.items()
+                        if value is not None
+                    },
+                )
+                for event in prior_lineage.recent_events
+            )
 
             def remaining_research_seconds() -> float:
                 _check_cancel(cancel_event)
@@ -3504,6 +3813,13 @@ def run_provider_free_campaign(
                     )
                 ),
                 continue_check=continue_live_lineage,
+                benchmark_digest=request.benchmark_digest,
+                starter_digest=request.starter_manifest_digest,
+                source_digest=request.source_digest,
+                lineage_ledger_path=lineage_path,
+                prior_root_failure_totals=prior_lineage.root_failure_totals,
+                prior_family_attempts=prior_lineage.proposal_family_rejection_totals,
+                prior_advisory_records=prior_lineage_advisory_records,
             )
             if preparation.status == "provider_unavailable":
                 if not isinstance(
@@ -3763,6 +4079,27 @@ def run_provider_free_campaign(
                     "campaign cancelled during scientific execution; durable child evidence "
                     "is resumable and no scientific success was published"
                 ) from exc
+        if isinstance(lineage, LiveResearchLineage):
+            metrics = _lineage_admission_metrics(
+                parent_incumbent=fallback_incumbent,
+                result=result,
+                candidate_id=candidate.candidate_id,
+            )
+            with _open_lineage_ledger(lineage_path) as project_lineage_ledger:
+                project_lineage_ledger.record_admission(
+                    campaign_id=request.campaign_id,
+                    benchmark_digest=request.benchmark_digest,
+                    starter_digest=request.starter_manifest_digest,
+                    source_digest=request.source_digest,
+                    candidate_id=lineage.candidate_id,
+                    proposal_family=_lineage_proposal_family(lineage.proposal),
+                    proposal_signature=_lineage_proposal_signature(lineage.proposal),
+                    inner_fold_a=metrics.inner_fold_a,
+                    inner_fold_b=metrics.inner_fold_b,
+                    parent_fold_a_primary=metrics.parent_fold_a_primary,
+                    parent_fold_b_primary=metrics.parent_fold_b_primary,
+                    promoted=metrics.promoted,
+                )
 
         # Candidate callbacks deliberately contain ordinary branch failures inside the
         # scientific loop.  Cancellation is controller intent, however, and the shared Event
@@ -3833,6 +4170,8 @@ def run_provider_free_campaign(
                     reflection_transcript,
                 ),
                 prior_records=rejected_lineage_records,
+                lineage_ledger_path=lineage_path,
+                prior_advisory_records=prior_lineage_advisory_records,
             )
             result = followup.result
             selection = followup.selection

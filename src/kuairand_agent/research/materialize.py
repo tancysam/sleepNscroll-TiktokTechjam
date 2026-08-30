@@ -20,7 +20,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Final, cast
 
 from kuairand_agent.candidate_api.runtime_contract import (
     CANDIDATE_RUNTIME_CONTRACT,
@@ -40,6 +40,7 @@ from kuairand_agent.research.source_policy import (
     DEFAULT_CANDIDATE_SOURCE_POLICY,
     CandidateManifestPolicyError,
 )
+
 ALLOWED_SUFFIXES: Final = frozenset({".py", ".json", ".md"})
 _FORBIDDEN_BASENAMES: Final = frozenset(
     {
