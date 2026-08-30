@@ -12,7 +12,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 9
+PROMPT_VERSION: Final = 10
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -59,22 +59,55 @@ Where the headroom actually is, in the organizers' own priority order:
    (`*__is_click_positive`, `*__is_click_smoothed_rate`, and the same for `is_like`). These are
    new and untested: no candidate has yet used them, and their interaction with the ranking
    objective is unmeasured. DIN/SIM-style interest modelling remains untouched.
-3. Multi-task auxiliaries drawn from the other logged feedback signals.
-4. Watch-time modelling as censored regression (watch time is truncated when a video completes,
-   so a one-sided loss is more faithful than squared error).
-5. Architecture swaps (DeepFM / DCN / xDeepFM). Deprioritised, since capacity is measured flat.
-6. Temporal features and train/evaluation drift.
+3. Architecture swaps (DeepFM / DCN / xDeepFM, or a gradient boosted ranker over the dense
+   columns). The organizers deprioritised this because embedding capacity is measured flat, but
+   that measurement was of FM capacity, not of a different model family.
+4. Temporal drift. The bundle carries `date_offset_from_20220408`; there is no hour-of-day column,
+   so intra-day effects are not reachable and only day-level drift is.
+
+The organizers also rank multi-task auxiliaries and censored watch-time regression highly. DO NOT
+PROPOSE EITHER: they are unreachable in this runtime and a proposal that depends on them cannot be
+implemented. `train_model` receives exactly one binary `targets` vector, so there is no second task
+to train on, and `is_follow`, `is_comment`, `is_forward`, `play_time_ms`, and every stay-time field
+are absent from the feature bundle -- the only engagement signals granted are `is_click` and
+`is_like`, and only as strictly-past history aggregates. You cannot regress a target you are not
+given. This is a property of the runtime, not an oversight to work around.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
-user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive
-row uniformly from GAUC-eligible users, then a negative uniformly from that same user's logged
-negatives, and optimise `softplus(-(s_positive - s_negative))`. Sampling users uniformly, or
-sampling uniformly across all pairs, or sampling unexposed catalogue items, each optimises a
-different quantity than the one being scored.
+user's positive count, and per-user AUC divides by that user's pair count, so an eligible pair
+carries weight proportional to 1/n_negatives_u. Sample a positive row uniformly from the pooled
+positives of GAUC-eligible users, then a negative uniformly from that same user's logged negatives,
+and optimise `softplus(-(s_positive - s_negative))`. Sampling users uniformly, or sampling
+uniformly across all pairs, or sampling unexposed catalogue items, each optimises a different
+quantity than the one being scored.
 
-Slate sizes: median 4 impressions per user, 90th percentile 12. Because most slates are shorter
-than 5, an nDCG@5 top-K truncation is inert for the majority of users; the gain concentrates in
-GAUC-eligible mixed-label users."""
+THE TWO METRICS WEIGHT USERS DIFFERENTLY, AND THIS IS THE MOST EXPLOITABLE FACT IN THE BRIEFING.
+Read the scorer's own shape:
+- GAUC accumulates `npos_u * auc_u` over a denominator of `npos_u`, and only over mixed-label
+  users. A user with 35 positives counts 35 times as much as a user with one.
+- nDCG@5 appends one value per user and divides by the number of users. Every user counts once,
+  including the 27.1% frozen at 0 and the 9.2% frozen at 1.
+
+Measured on the scored period: the heaviest 10% of mixed-label users hold 31.7% of GAUC's weight
+but only 10% of nDCG@5's. So a loss weighted by positive count -- the GAUC-matched scheme above --
+systematically underserves the small-slate users who are a third of nDCG@5's movable mass. The
+primary score is the MEAN of the two, so a purely GAUC-matched objective optimises half of it and
+can lose more on the other half than it gains. That is not hypothetical: a LambdaRank candidate
+measured +0.0089 GAUC and -0.0215 nDCG@5, netting -0.0063 primary. If you propose a ranking
+objective, state explicitly how it weights users, and prefer a blend of positive-count weighting
+and uniform-per-user weighting over either extreme.
+
+Slate sizes on the scored period: median 8 impressions per user, p25 4, p75 15, p90 24, max 160.
+66.2% of users have more than 5 impressions, so the nDCG@5 cutoff is ACTIVE for two thirds of
+users, not inert. What that cutoff rewards:
+- Only positions 1-5 score at all. DCG discounts are 1/log2(i+2): position 1 is worth 1.000,
+  position 5 is worth 0.386, position 6 and beyond are worth exactly nothing.
+- Therefore moving one positive from rank 6 into rank 5 gains more than any amount of reordering
+  below rank 5, and correct ordering deep in a long slate is worth zero to nDCG@5 while still
+  being worth full weight to GAUC.
+- Per-metric headroom, so you can price a trade: GAUC 0.6610 -> 1.0000 is 0.1695 of primary;
+  nDCG@5 0.5282 -> 0.7289 is 0.1004 of primary. GAUC holds more, but nDCG@5 holds over a third
+  and is where recent candidates have given back their GAUC gains."""
 
 _PACKAGES: Final = """Execution environment
 
@@ -101,6 +134,7 @@ parameter set and round-trip were verified to reproduce byte-identical float64 p
 ```python
 params = {
     "objective": "lambdarank", "metric": "ndcg", "ndcg_eval_at": [5],
+    "lambdarank_truncation_level": 5,   # LightGBM defaults to 30; see below
     "deterministic": True, "force_col_wise": True, "num_threads": 1,
     "seed": seed, "bagging_seed": seed, "feature_fraction_seed": seed,
     "data_random_seed": seed, "extra_seed": seed, "objective_seed": seed,
@@ -122,6 +156,13 @@ nondeterministic order and will break the replay gate. `bagging_freq: 0` and
 `feature_fraction: 1.0` remove the two remaining stochastic subsamples. `group_sizes` is the
 run-length count of consecutive equal `user_groups` values, in row order, and must sum to N.
 Never use early stopping against a random split.
+
+`lambdarank_truncation_level` deserves its own note because its default silently optimises the
+wrong thing. `ndcg_eval_at` controls only the printed metric; the OBJECTIVE's cutoff is
+`lambdarank_truncation_level`, which defaults to 30. With a median slate of 8, a default-configured
+LambdaRank therefore computes lambdas over essentially the whole slate -- it optimises full-list
+NDCG, which behaves like AUC, not the truncated nDCG@5 being scored. That is the exact signature a
+previous candidate produced: GAUC up 0.0089, nDCG@5 down 0.0215. Set it to 5 to match the metric.
 
 You have `math`, `json`, `dataclasses`, `typing`, `collections`,
 `itertools`, `functools`, `heapq`, `random`, `hashlib`, `pathlib`, `argparse`, `re`, `stat`.

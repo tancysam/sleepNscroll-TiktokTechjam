@@ -163,7 +163,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v3``."""
 
-    assert PROMPT_VERSION == 9
+    assert PROMPT_VERSION == 10
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -222,6 +222,51 @@ def test_lightgbm_guidance_states_the_two_facts_that_would_fail_a_candidate() ->
         assert parameter in rendered, f"{parameter} is required for the replay gate"
     assert "model_to_string" in rendered, "the Booster must be encoded to satisfy the checkpoint"
     assert "np.uint8" in rendered
+
+
+# The briefing carried slate statistics that were wrong for the scored period and told the agent
+# the nDCG@5 cutoff was inert. Measured on the real test split: median 8, p90 24, and 66.2% of
+# users above the cutoff. These pin the corrected facts so the wrong ones cannot silently return.
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_briefing_states_the_measured_slate_structure(operation: ResearchOperation) -> None:
+    rendered = instructions_for(operation)
+    assert "median 8" in rendered, "the scored-period median slate size is 8, not 4"
+    assert "66.2%" in rendered, "the share of users the nDCG@5 cutoff actually binds on"
+    assert "median 4 impressions" not in rendered, "the retracted training-window figure"
+    assert "inert for the majority" not in rendered, "the retracted truncation claim"
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_briefing_states_the_user_weighting_asymmetry(operation: ResearchOperation) -> None:
+    """GAUC weights by positive count; nDCG@5 gives every user one vote. This drives the trade."""
+
+    rendered = instructions_for(operation)
+    assert "31.7%" in rendered, "the GAUC weight concentration must be quantified"
+    assert "0.386" in rendered, "the position-5 DCG discount makes the top-5 lever concrete"
+    assert "-0.0215" in rendered, "the measured GAUC/nDCG trade must be stated"
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_briefing_rules_out_the_avenues_the_runtime_cannot_express(
+    operation: ResearchOperation,
+) -> None:
+    """Multi-task and censored watch-time are organizer priorities this runtime cannot reach."""
+
+    rendered = instructions_for(operation)
+    assert "DO NOT\nPROPOSE EITHER" in rendered or "DO NOT PROPOSE EITHER" in rendered
+    for absent_field in ("is_follow", "is_comment", "is_forward", "play_time_ms"):
+        assert absent_field in rendered, f"{absent_field} must be named as unavailable"
+    assert "exactly one binary `targets` vector" in rendered
+
+
+def test_lightgbm_guidance_pins_the_objective_cutoff() -> None:
+    """`ndcg_eval_at` sets the printed metric; the objective cutoff is a different parameter."""
+
+    rendered = instructions_for(ResearchOperation.IMPLEMENT)
+    assert "lambdarank_truncation_level" in rendered
+    assert "defaults to 30" in rendered, "the default is the trap; state it"
 
 
 def test_feature_authority_states_the_measured_cost_of_an_embedding_table() -> None:
