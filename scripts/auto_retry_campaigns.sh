@@ -14,11 +14,12 @@ CONFIG_PATH=${1:-"$PROJECT_ROOT/configs/full-pure.toml"}
 QUALIFICATION_RUN_DIR=${2:-"$PROJECT_ROOT/runs/wp3-official-qualification"}
 RUN_DIR_PREFIX=${3:-"$PROJECT_ROOT/runs/auto-retry"}
 MAX_ATTEMPTS=${4:-5}
-MIN_OUTER_QUERIES_REMAINING=${5:-1}
+# Retained for interface compatibility; the ration is per campaign, so there is no cross-attempt
+# budget to floor on and this value is no longer consulted.
+MIN_OUTER_QUERIES_REMAINING=${5:-0}
 
 # Repeatedly launches fresh, independent campaigns against the same config until one selects a
-# generated candidate over the baseline, a hard safety cap is reached, or the project-wide
-# outer-validation budget gets too low to spend safely.
+# generated candidate over the baseline, or a hard safety cap is reached.
 #
 # Each campaign is its own honestly-converged search (organizer epsilon/patience is frozen and
 # enforced at config-parse time -- this script cannot and does not loosen it). Running several is
@@ -26,11 +27,15 @@ MIN_OUTER_QUERIES_REMAINING=${5:-1}
 # around convergence. Cross-run memory (the project-wide research-lineage ledger) only compounds
 # across these attempts while the trusted controller source is unchanged between them.
 #
-# The project-wide outer-query ledger (runs/outer-query-ledger.sqlite3) is scoped by benchmark,
-# dataset, and scorer digest only -- it does NOT reset between attempts, unlike the lineage
-# ledger, and is not renewed by anything this script can do. Once it is exhausted, no future
-# campaign against this data can ever get a candidate outer-confirmed again, so this script always
-# checks the real remaining count before spending another attempt, rather than assuming budget.
+# The outer-validation ration is per campaign (plan.md 12.2), so each attempt starts with its own
+# allowance and there is no cross-attempt budget for this script to gate on. The append-only
+# project ledger still records every query ever made, and this script reports its size before each
+# attempt so the cumulative number of public-validation looks stays visible rather than implicit.
+#
+# That visibility matters. Running many campaigns and then reporting the best of them is selection
+# over many looks at public validation, which is not the same thing as one honestly converged
+# search. Each attempt here is an independent random restart and its result should be read as one
+# of N, not as a single measurement.
 #
 # A campaign that exits nonzero (a real failure, not a converged baseline fallback) stops the loop
 # immediately for human review, rather than burning further attempts against a live bug.
@@ -47,9 +52,9 @@ OUTER_LEDGER="$PROJECT_ROOT/runs/outer-query-ledger.sqlite3"
 LOG_FILE="${RUN_DIR_PREFIX}-log.jsonl"
 mkdir -p "$(dirname "$LOG_FILE")"
 
-outer_queries_remaining() {
+outer_queries_logged() {
   if [ ! -f "$OUTER_LEDGER" ]; then
-    echo 6
+    echo 0
     return
   fi
   uv run --locked python - "$OUTER_LEDGER" <<'PY'
@@ -59,8 +64,7 @@ from kuairand_agent.campaign.store import OuterQueryLedger
 
 ledger = OuterQueryLedger.open(sys.argv[1], read_only=True)
 try:
-    projection = ledger.projection()
-    print(projection.max_queries - len(projection.queries))
+    print(len(ledger.projection().queries))
 finally:
     ledger.close()
 PY
@@ -76,15 +80,11 @@ print(json.load(sys.stdin).get('selected_status', 'unknown'))
 attempt=0
 while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
   attempt=$((attempt + 1))
-  remaining=$(outer_queries_remaining)
-  if [ "$remaining" -lt "$MIN_OUTER_QUERIES_REMAINING" ]; then
-    echo "auto-retry: stopping before attempt $attempt -- only $remaining outer-validation queries remain (floor $MIN_OUTER_QUERIES_REMAINING)" >&2
-    exit 0
-  fi
+  logged=$(outer_queries_logged)
 
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   run_dir="${RUN_DIR_PREFIX}-${timestamp}"
-  echo "auto-retry: attempt $attempt/$MAX_ATTEMPTS -> $run_dir (outer queries remaining before this attempt: $remaining)" >&2
+  echo "auto-retry: attempt $attempt/$MAX_ATTEMPTS -> $run_dir (public-validation queries logged project-wide so far: $logged; this attempt starts with its own ration)" >&2
 
   stdout_file=$(mktemp)
   set +e
