@@ -145,7 +145,12 @@ def test_seed_keeps_mutable_model_code_out_of_stable_protocol_entrypoint() -> No
     assert "def predict_scores(" not in entrypoint
     assert "def train_model(" in model
     assert "def predict_scores(" in model
-    assert len(model.encode("utf-8")) < len(entrypoint.encode("utf-8"))
+    # The entrypoint must own no model state either: the split is about WHERE the science lives,
+    # not about how much of it there is. A byte-size comparison used to stand in for this and
+    # stopped holding when the parent became a real factorization machine rather than a toy
+    # logistic model -- the mutable surface grew past the wrapper, which is the split working.
+    for owned_by_the_model in ("np.random", "embedding", "learning_rate", "epochs"):
+        assert owned_by_the_model not in entrypoint, owned_by_the_model
 
 
 def test_seed_train_predict_commands_are_deterministic_and_protocol_valid(

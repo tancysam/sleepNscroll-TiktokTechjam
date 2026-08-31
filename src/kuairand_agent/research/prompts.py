@@ -20,7 +20,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 14
+PROMPT_VERSION: Final = 15
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -201,9 +201,17 @@ feature columns, so 33 standardized continuous aggregates shared a latent space 
 codes. The control crosses only its categorical fields. Restricting the interaction to the
 identity codes and keeping the causal aggregates as separate additive first-order terms scored
 0.5745 standalone against a control of 0.5754 — a deficit of about one sigma, down from four to
-twelve. Start from that structure. Two further measurements from the same run: pointwise logistic
-loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
-collapsed it to 0.5630, so do not replace the loss.
+twelve. Two further measurements from the same run: pointwise logistic loss produced those 0.5745
+results, and switching the identical scorer to a pairwise objective collapsed it to 0.5630, so do
+not replace the loss.
+
+YOU ALREADY INHERIT THAT STRUCTURE. The trusted parent is that model: an identity-code
+factorization machine over standardized aggregates, trained with Adam over shuffled minibatches
+and ensembled across five deterministic child seeds, scoring 0.5746869 standalone on the Fold B
+screen. It was a plain logistic scorer until recently, which is why the records show candidate
+after candidate rebuilding the base and landing near 0.5698 rather than testing its own idea. You
+do not have to rebuild any of it, and you should not: tune it through config.json, or add
+something to it.
 
 The cheapest remaining way to cross the control is SEED ENSEMBLING, and every number below is
 measured on this exact benchmark rather than argued. The five qualified seeds of the official FM
@@ -430,15 +438,26 @@ _WORKED_EXAMPLE_TEMPLATE: Final = """Worked example
 The parent `model_impl.py` contains, among other definitions:
 
 ```python
-def train_model(features, targets, user_groups, config, seed):
-    # Fixed-step standardized logistic model, deterministic full-batch updates.
-    normalized = (features - mean) / scale
-    weights = np.zeros(features.shape[1], dtype=np.float64)
-    for _ in range(epochs):
-        error = _sigmoid(normalized @ weights + bias, clip) - targets
-        weights -= learning_rate * ((normalized.T @ error) / row_count + l2 * weights)
-    return {"weights": weights, "feature_mean": mean, "feature_scale": scale}
+def _train_member(features, targets, user_groups, config, seed):
+    # Identity-code factorization machine: dense term over the aggregates, second-order
+    # interaction over the trailing identity codes only, Adam over shuffled minibatches.
+    codes = categorical_codes(features, category_count)
+    dense = features[:, : features.shape[1] - category_count]      # codes are NOT magnitudes
+    for _ in range(epochs):                                        # 8, not 64
+        for batch in minibatches(order, batch_size):               # 65536
+            scores = block @ weights + bias + fm_interaction_scores(tables, batch_codes)
+            ...                                                    # Adam on every parameter
 ```
+
+Three things about that are load-bearing and were each measured. Adam rather than a fixed step:
+an identity row appears in about 43 of 1.1M training rows, so under a fixed step its gradient is
+four orders of magnitude smaller than a dense weight's and the embedding never moves. Eight
+epochs with 1e-4 embedding L2 rather than more: at 256 epochs with weaker decay the same
+structure collapses by 76 sigma. And the dense block EXCLUDES the code columns, because a linear
+term over a categorical code is meaningless.
+
+`train_model` wraps that in five deterministically seeded members and `predict_scores` averages
+their within-user percentiles, which is worth +0.00070 over one member.
 
 Note the third argument. `user_groups` is the trusted per-row user identity, and the benchmark
 ranks strictly within a user, so it is what any ranking objective must group by. The pointwise

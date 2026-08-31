@@ -1,1 +1,1 @@
-{"candidate_family":"deterministic_logistic_seed","epochs":64,"l2":0.001,"learning_rate":0.25,"logit_clip":40.0,"schema_version":1}
+{"adam_beta1":0.9,"adam_beta2":0.999,"adam_epsilon":1e-08,"batch_size":65536,"candidate_family":"identity_fm_seed_ensemble","category_count":5,"dense_l2":0.0001,"embedding_init":0.01,"embedding_l2":0.0001,"epochs":8,"learning_rate":0.02,"logit_clip":35.0,"max_members":5,"rank":8,"schema_version":1}
