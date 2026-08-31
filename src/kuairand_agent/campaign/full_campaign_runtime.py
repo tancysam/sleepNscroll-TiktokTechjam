@@ -35,6 +35,13 @@ from kuairand_agent.baselines.fold_controls import (
     FoldScoringContext,
     build_fold_scoring_context,
 )
+from kuairand_agent.campaign.analysis import (
+    AnalysisError,
+    AnalysisKind,
+    AnalysisQuery,
+    TrainAnalysisInputs,
+    run_requested_analyses,
+)
 from kuairand_agent.campaign.budgets import AdmissionReason, LaunchCategory, WorkPhase
 from kuairand_agent.campaign.candidate_journal import (
     CampaignStoreCandidateJournal,
@@ -1530,6 +1537,66 @@ def _measured_primary(
     return primary, delta, "inner_fold"
 
 
+def _train_analysis_inputs(
+    data: CampaignDataPlane,
+    features: ProductionFeatureBundle,
+) -> TrainAnalysisInputs:
+    """Bind the training arrays an analysis may read, and only those.
+
+    Built once at the call site where the feature bundle is in scope, so the train-only property is
+    visible at the boundary rather than relying on the executor to be handed the right thing. The
+    prefix matrix is the training half of the outer build; no validation or final-period array is
+    reachable from the value this returns.
+    """
+
+    prefix = features.outer_and_final.prefix
+    return TrainAnalysisInputs(
+        feature_names=tuple(prefix.feature_names),
+        feature_values=np.asarray(prefix.values, dtype=np.float64),
+        labels=np.asarray(data.outer_train_labels, dtype=np.float64),
+        user_ids=tuple(data.outer_train_inputs.user_id),
+    )
+
+
+def _answered_analyses(
+    inputs: TrainAnalysisInputs | None,
+    reflection: Reflection,
+) -> tuple[AggregateRecord, ...]:
+    """Answer the questions a reflection asked, for the next iteration's context.
+
+    A malformed question is reported back as a record rather than raised: the model should learn
+    to ask a better one, not lose the campaign. Requests are re-validated here through
+    ``AnalysisQuery`` even though the response parser already checked their shape, because the
+    vocabulary and the train-only guarantee belong to the analysis module rather than to the
+    response contract.
+    """
+
+    if inputs is None or not reflection.analysis_requests:
+        return ()
+    queries: list[AnalysisQuery] = []
+    rejected: list[AggregateRecord] = []
+    for index, raw in enumerate(reflection.analysis_requests, start=1):
+        try:
+            queries.append(
+                AnalysisQuery(
+                    kind=AnalysisKind(str(raw.get("kind"))),
+                    feature=str(raw.get("feature")),
+                    second_feature=(
+                        None if raw.get("second_feature") is None else str(raw["second_feature"])
+                    ),
+                    buckets=int(cast(int, raw.get("buckets", 5))),
+                )
+            )
+        except (AnalysisError, ValueError) as error:
+            rejected.append(
+                AggregateRecord(
+                    f"requested_analysis_{index:02d}_rejected",
+                    {"reason": str(error)[:200]},
+                )
+            )
+    return (*rejected, *run_requested_analyses(inputs, queries))
+
+
 def _candidate_config(materialized: object) -> Mapping[str, object] | None:
     """Read a materialized candidate's ``config.json`` as a mapping, or ``None``.
 
@@ -2598,6 +2665,7 @@ def _run_autonomous_followups(
     lineage_ledger_path: Path | None = None,
     evaluation_digest: str = "",
     prior_advisory_records: tuple[AggregateRecord, ...] = (),
+    analysis_inputs: TrainAnalysisInputs | None = None,
 ) -> _AutonomousFollowupResult:
     """Continue propose→implement→evaluate→reflect until an exact terminal condition.
 
@@ -2897,6 +2965,7 @@ def _run_autonomous_followups(
             artifacts=runtime_template.artifacts,
             research_model=research_model,
         )
+        pending_admitted_records.extend(_answered_analyses(analysis_inputs, reflection))
         pending_admitted_records.append(
             _iteration_record(
                 result,
@@ -4641,6 +4710,7 @@ def run_provider_free_campaign(
             followup = _run_autonomous_followups(
                 request=request,
                 data=data,
+                analysis_inputs=_train_analysis_inputs(data, features),
                 runtime_template=runtime,
                 scientific_config=scientific_config,
                 fallback=fallback_incumbent,

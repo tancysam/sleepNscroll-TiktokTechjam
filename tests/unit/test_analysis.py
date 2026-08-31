@@ -11,9 +11,10 @@ a bad question is evidence for the next iteration, not a dead campaign.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
-from typing import Any, cast
 
 from kuairand_agent.campaign.analysis import (
     MAX_ANALYSIS_REQUESTS,
@@ -150,3 +151,63 @@ def test_the_number_of_questions_per_iteration_is_bounded() -> None:
     records = run_requested_analyses(_inputs(), (query,) * (MAX_ANALYSIS_REQUESTS + 3))
 
     assert len(records) == MAX_ANALYSIS_REQUESTS
+
+
+def test_a_reflections_question_becomes_a_record_for_the_next_iteration() -> None:
+    """The loop-facing seam: a reflection asks, the controller answers, the proposer sees it."""
+
+    import kuairand_agent.campaign.full_campaign_runtime as runtime
+    from kuairand_agent.research.schemas import Reflection
+
+    reflection = Reflection(
+        response_id="reflect-1",
+        summary="s",
+        recommendation="propose_next",
+        lessons=("l",),
+        analysis_requests=(
+            {
+                "kind": "within_user_interaction",
+                "feature": "item_signal",
+                "second_feature": "user_constant",
+                "buckets": 5,
+            },
+        ),
+    )
+
+    records = runtime._answered_analyses(_inputs(), reflection)
+
+    assert len(records) == 1
+    assert "within_user_interaction" in records[0].name
+    assert "within_user_corr_product" in dict(records[0].values)
+
+
+def test_a_reflection_that_asks_nothing_costs_nothing() -> None:
+    import kuairand_agent.campaign.full_campaign_runtime as runtime
+    from kuairand_agent.research.schemas import Reflection
+
+    reflection = Reflection(
+        response_id="reflect-1", summary="s", recommendation="propose_next", lessons=("l",)
+    )
+
+    assert runtime._answered_analyses(_inputs(), reflection) == ()
+    assert runtime._answered_analyses(None, reflection) == ()
+
+
+def test_an_unsupported_query_kind_is_reported_not_raised() -> None:
+    """A vocabulary the executor does not implement must not end a campaign."""
+
+    import kuairand_agent.campaign.full_campaign_runtime as runtime
+    from kuairand_agent.research.schemas import Reflection
+
+    reflection = Reflection(
+        response_id="reflect-1",
+        summary="s",
+        recommendation="propose_next",
+        lessons=("l",),
+        analysis_requests=({"kind": "read_the_labels", "feature": "item_signal"},),
+    )
+
+    records = runtime._answered_analyses(_inputs(), reflection)
+
+    assert len(records) == 1
+    assert records[0].name.endswith("_rejected")
