@@ -162,6 +162,10 @@ def _optional_digest(value: object, name: str) -> str | None:
     return None if value is None else _digest(value, name)
 
 
+def _optional_finite(value: object, name: str) -> float | None:
+    return None if value is None else _float(value, name)
+
+
 def _weight_from_json(value: object, name: str) -> tuple[float, float]:
     raw = _list(value, name)
     if len(raw) != 2:
@@ -589,6 +593,11 @@ class FoldBFusionSelectionEvidence:
     selected_weights: tuple[float, float]
     selected_prediction_digest: str
     selected_fusion_digest: str
+    #: Spearman rank correlation between this model's ordering and the official control's, from
+    #: fusion (the two members' percentile vectors). It is what tells the model WHY it lost: near
+    #: 1 means it rebuilt the control worse, low means it is genuinely different but weak. No
+    #: train-only analysis request can reach it, because it needs both validation orderings.
+    member_rank_correlation: float | None = None
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -658,6 +667,7 @@ class FoldBFusionSelectionEvidence:
             "selected_weights": list(self.selected_weights),
             "selected_prediction_digest": self.selected_prediction_digest,
             "selected_fusion_digest": self.selected_fusion_digest,
+            "member_rank_correlation": self.member_rank_correlation,
             "selection": "maximum_primary_then_grid_order",
         }
 
@@ -883,6 +893,8 @@ def _scientific_evidence_from_json(value: object) -> ScientificRunEvidence:
             "resources",
             "replay_verified",
             "failure_fingerprint",
+            "standalone_primary",
+            "control_primary",
         },
     )
     if mapping["schema_version"] != 1:
@@ -960,6 +972,12 @@ def _scientific_evidence_from_json(value: object) -> ScientificRunEvidence:
         failure_fingerprint=_optional_digest(
             mapping["failure_fingerprint"], "evidence.failure_fingerprint"
         ),
+        standalone_primary=_optional_finite(
+            mapping.get("standalone_primary"), "evidence.standalone_primary"
+        ),
+        control_primary=_optional_finite(
+            mapping.get("control_primary"), "evidence.control_primary"
+        ),
     )
     if _canonical_json(evidence.manifest()) != _canonical_json(mapping):
         raise GeneratedScientificRunnerError("record.evidence is not canonical")
@@ -1002,6 +1020,7 @@ def _fusion_selection_from_json(value: object) -> FoldBFusionSelectionEvidence:
             "selected_prediction_digest",
             "selected_fusion_digest",
             "selection",
+            "member_rank_correlation",
         },
     )
     if (
@@ -1028,6 +1047,10 @@ def _fusion_selection_from_json(value: object) -> FoldBFusionSelectionEvidence:
         selected_fusion_digest=_digest(
             mapping["selected_fusion_digest"],
             "record.fusion_selection.selected_fusion_digest",
+        ),
+        member_rank_correlation=_optional_finite(
+            mapping.get("member_rank_correlation"),
+            "record.fusion_selection.member_rank_correlation",
         ),
     )
     if _canonical_json(result.manifest()) != _canonical_json(mapping):
@@ -1730,6 +1753,7 @@ class DurableGeneratedScientificRunner:
                 selected_weights=selected_point.weights,
                 selected_prediction_digest=selected_point.prediction_digest,
                 selected_fusion_digest=selected_point.fusion_digest,
+                member_rank_correlation=first_fusion.member_rank_correlation,
             )
             scorer_runtime_seconds = math.fsum(item[0].scorer_runtime_seconds for item in evaluated)
         self._raise_if_cancelled()
@@ -1808,6 +1832,15 @@ class DurableGeneratedScientificRunner:
                 disk_bytes=max(item.peak_workspace_bytes for item in executions),
             ),
             replay_verified=True,
+            # ``metrics`` above is the fused primary. These carry the model's own score and the
+            # control's so the screen can judge the model rather than the blend it was rescued
+            # into; ``None`` whenever this run was not fused at all.
+            standalone_primary=(
+                None if fusion_selection is None else fusion_selection.standalone_primary
+            ),
+            control_primary=(
+                None if fusion_selection is None else fusion_selection.control_primary
+            ),
         )
         record = GeneratedScientificRunRecord(
             request_digest=request.digest,

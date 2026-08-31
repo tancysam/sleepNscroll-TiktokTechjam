@@ -179,6 +179,11 @@ class ScientificCampaignConfig:
     max_scientific_iterations: int
     launches_already_used: int
     screen_margin: float = 0.0
+    #: How far the MODEL may fall below the official control standalone and still be worth a Fold A
+    #: launch. Zero disables the check, which is the historical behaviour. Requiring an outright
+    #: standalone win would reject every candidate this project has produced, including the best
+    #: one at -0.0009, so this is a tolerance rather than a bar.
+    standalone_tolerance: float = 0.0
     elapsed_seconds_at_start: float = 0.0
     wall_clock_seconds: int = HARD_WALL_CLOCK_SECONDS
     finalization_reserve_seconds: int = DEFAULT_FINALIZATION_RESERVE_SECONDS
@@ -209,6 +214,9 @@ class ScientificCampaignConfig:
         margin = _finite_nonnegative(self.screen_margin, "screen_margin")
         if margin > 1.0:
             raise ScientificCampaignError("screen_margin must be at most one")
+        tolerance = _finite_nonnegative(self.standalone_tolerance, "standalone_tolerance")
+        if tolerance > 1.0:
+            raise ScientificCampaignError("standalone_tolerance must be at most one")
         if type(self.wall_clock_seconds) is not int or not (
             60 <= self.wall_clock_seconds <= HARD_WALL_CLOCK_SECONDS
         ):
@@ -246,6 +254,7 @@ class ScientificCampaignConfig:
             "campaign_digest": self.campaign_digest,
             "fold_dates": {name: list(values) for name, values in FOLD_DATES.items()},
             "screen_margin": self.screen_margin,
+            "standalone_tolerance": self.standalone_tolerance,
             "matched_seeds": list(self.matched_seeds),
             "max_scientific_iterations": self.max_scientific_iterations,
             "max_launches": self.max_launches,
@@ -565,6 +574,12 @@ class ScientificRunEvidence:
     resources: ResourceEvidence
     replay_verified: bool
     failure_fingerprint: str | None = None
+    #: ``metrics`` above is the rank-FUSED primary. These two are the model's own score and the
+    #: official control's on the same rows, so the screen can judge the model rather than the
+    #: blend. A candidate 4.7 sigma below the control standalone cleared a tightened Fold B screen
+    #: because the blend it was selected into edged the parent by 0.000153.
+    standalone_primary: float | None = None
+    control_primary: float | None = None
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -583,6 +598,10 @@ class ScientificRunEvidence:
             _digest(self.failure_fingerprint, "failure_fingerprint")
         if self.metrics is None and self.failure_fingerprint is None:
             raise ScientificCampaignError("failed run evidence requires a failure fingerprint")
+        for name in ("standalone_primary", "control_primary"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not float or not math.isfinite(value)):
+                raise ScientificCampaignError(f"{name} must be a finite float or None")
         object.__setattr__(
             self,
             "digest",
@@ -605,6 +624,8 @@ class ScientificRunEvidence:
             "resources": self.resources.manifest(),
             "replay_verified": self.replay_verified,
             "failure_fingerprint": self.failure_fingerprint,
+            "standalone_primary": self.standalone_primary,
+            "control_primary": self.control_primary,
         }
 
 
@@ -948,6 +969,19 @@ def _invoke_runner(
     return evidence, None, None
 
 
+def _standalone_shortfall(evidence: ScientificRunEvidence) -> Decimal | None:
+    """How far the model itself sits below the official control, or ``None`` if not disclosed.
+
+    Positive means the model is weaker. ``None`` whenever the runner did not report both figures,
+    so a runner that predates the disclosure keeps the historical behaviour rather than being
+    silently rejected.
+    """
+
+    if evidence.standalone_primary is None or evidence.control_primary is None:
+        return None
+    return Decimal(str(evidence.control_primary)) - Decimal(str(evidence.standalone_primary))
+
+
 def _effective_gates(evidence: ScientificRunEvidence) -> GateEvidence:
     """Bind the explicit replay fact into the selector's structural gate vector."""
 
@@ -1204,6 +1238,7 @@ def run_scientific_campaign(
             continue
         elapsed_seconds += evidence.resources.wall_seconds
         parent_fold_b = dict(incumbent.inner_by_fold)["B"]
+        standalone_shortfall = _standalone_shortfall(evidence)
         passed = (
             evidence.metrics is not None
             and not _effective_gates(evidence).failures
@@ -1213,6 +1248,14 @@ def run_scientific_campaign(
                 or _primary(evidence.metrics) - _primary(parent_fold_b)
                 > Decimal(str(config.screen_margin))
             )
+            # The screen above reads the FUSED primary, so a model far weaker than the control can
+            # pass on a blend the selector rescued. Fold A and three outer seeds then get spent on
+            # it. This is the same judgement applied to the model itself.
+            and (
+                candidate.diversity_root
+                or standalone_shortfall is None
+                or standalone_shortfall <= Decimal(str(config.standalone_tolerance))
+            )
         )
         if not passed:
             # A candidate whose fold metrics are bit-identical to its parent's did not score
@@ -1220,12 +1263,20 @@ def run_scientific_campaign(
             # the research model its idea was beaten when in fact its idea never ran, which are
             # opposite lessons. Identical metrics are strong evidence of identical predictions
             # rather than proof of them, so the reason is named for what was observed.
-            reason = (
-                "fold_b_no_measurable_effect"
-                if evidence.metrics is not None
-                and _metrics_identical(evidence.metrics, parent_fold_b)
-                else "fold_b_screen_failed"
-            )
+            # Naming the cause matters as much here: "your blend lost" and "your model was too
+            # weak to be worth confirming" are different lessons, and only one of them is true.
+            if (
+                evidence.metrics is not None
+                and standalone_shortfall is not None
+                and standalone_shortfall > Decimal(str(config.standalone_tolerance))
+            ):
+                reason = "fold_b_standalone_below_control"
+            elif evidence.metrics is not None and _metrics_identical(
+                evidence.metrics, parent_fold_b
+            ):
+                reason = "fold_b_no_measurable_effect"
+            else:
+                reason = "fold_b_screen_failed"
             results.append(
                 CandidateCampaignResult(
                     candidate=candidate,

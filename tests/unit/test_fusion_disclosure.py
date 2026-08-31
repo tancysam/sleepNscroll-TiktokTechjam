@@ -152,6 +152,7 @@ def test_disclosure_is_empty_rather_than_wrong_when_no_fold_b_selection_exists()
         "fold_b_control_primary": None,
         "fusion_weights_selected": None,
         "fusion_model_discarded": None,
+        "fusion_rank_correlation_with_control": None,
         "fusion_note": None,
     }
 
@@ -193,3 +194,74 @@ def test_the_screen_margin_is_a_measured_sigma_not_zero() -> None:
     # still lost Fold A by more than they won. This margin is not a fix for Fold B overfitting.
     assert FOLD_B_SCREEN_MARGIN < 0.000590
     assert FOLD_B_SCREEN_MARGIN < 0.000344
+
+
+def test_the_standalone_tolerance_admits_the_best_candidate_and_rejects_the_worst() -> None:
+    """The Fold B screen reads the FUSED primary, so weak models passed on a rescued blend.
+
+    sol5 iteration-01 scored 0.570702 standalone against a control of 0.575424 -- 4.7 sigma down --
+    and still cleared a screen tightened to one sigma, because its 25/75 blend beat the parent by
+    0.000153. It then spent a Fold A launch and three outer seeds.
+
+    An outright standalone win is the wrong bar: it would reject every candidate this project has
+    produced, including run 16 at 0.00089 below the control, which is the structure the briefing
+    now recommends building on.
+    """
+
+    from kuairand_agent.contract import MEASURED_SEED_SIGMA, STANDALONE_TOLERANCE
+
+    assert STANDALONE_TOLERANCE == 6 * MEASURED_SEED_SIGMA
+    assert STANDALONE_TOLERANCE < 0.004722, "sol5 iteration-01 must be rejected"
+    assert STANDALONE_TOLERANCE > 0.000890, "run 16, the best on record, must be admitted"
+
+
+def test_rank_correlation_separates_rebuilt_the_control_from_diverse_but_weak() -> None:
+    """One scalar, and no train-only analysis request can reach it."""
+
+    import numpy as np
+
+    from kuairand_agent.candidates.fusion import _rank_correlation
+
+    ordering = np.array([0.1, 0.5, 0.9, 0.3, 0.7])
+    assert _rank_correlation(ordering, ordering) == 1.0, "must not exceed 1.0 by float error"
+    assert _rank_correlation(ordering, 1.0 - ordering) == -1.0
+    assert _rank_correlation(ordering, np.ones(5)) is None, "a constant member has no correlation"
+
+
+def test_the_prompt_prices_trades_against_the_measured_sigma() -> None:
+    """0.0008 alone made the model discount real effects: it is 2.5x the sigma we measure."""
+
+    from kuairand_agent.contract import MEASURED_SEED_SIGMA, PUBLISHED_SEED_SIGMA
+    from kuairand_agent.research.prompts import instructions_for
+    from kuairand_agent.research.schemas import ResearchOperation
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert f"{MEASURED_SEED_SIGMA:g}" in rendered
+    assert f"{PUBLISHED_SEED_SIGMA:g}" in rendered
+    assert "fusion_rank_correlation_with_control" in rendered
+
+
+def test_the_prompt_states_the_real_thread_budget() -> None:
+    """Stated by hand as one, understating the budget four-fold against the shipped runner."""
+
+    import tomllib
+    from pathlib import Path
+
+    from kuairand_agent.contract import CANDIDATE_THREADS
+    from kuairand_agent.research.prompts import instructions_for
+    from kuairand_agent.research.schemas import ResearchOperation
+
+    config = tomllib.loads(Path("configs/full-pure.toml").read_text(encoding="utf-8"))
+    assert config["runner"]["threads"] == CANDIDATE_THREADS, (
+        "constant must track the shipped config"
+    )
+    assert f"{CANDIDATE_THREADS} CPU threads" in instructions_for(ResearchOperation.PROPOSE)
+
+
+def test_reflect_is_told_to_spend_every_analysis_request() -> None:
+    """They are the only free data access the model has, and none has ever been used."""
+
+    from kuairand_agent.research.prompts import instructions_for
+    from kuairand_agent.research.schemas import ResearchOperation
+
+    assert "Spend all" in instructions_for(ResearchOperation.REFLECT)

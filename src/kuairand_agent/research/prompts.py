@@ -7,6 +7,12 @@ from typing import Final
 
 from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
+from kuairand_agent.contract import (
+    CANDIDATE_THREADS,
+    MEASURED_SEED_SIGMA,
+    PUBLISHED_SEED_SIGMA,
+    STANDALONE_TOLERANCE,
+)
 from kuairand_agent.research.proposal_families import REOPENABLE_REASONS
 from kuairand_agent.research.schemas import ResearchOperation
 from kuairand_agent.research.source_policy import (
@@ -26,7 +32,7 @@ features. The protected organizer evaluator, attempt policy, and promotion polic
 change. The request.runtime_contract object is the authoritative executable interface; do not
 infer a different interface from a proposal, filename, or prior model convention."""
 
-_BENCHMARK: Final = """Benchmark briefing
+_BENCHMARK_TEMPLATE: Final = """Benchmark briefing
 
 Task: rank each user's own logged impressions. This is within-user ranking over an existing
 impression list, not retrieval over a catalogue.
@@ -164,9 +170,22 @@ campaign:
   that measures YOUR model. Read it first, and compare it to `fold_b_control_primary`.
 
 To date every generated candidate in this project has scored BELOW the official FM control
-standalone, by 0.003 to 0.010 primary, against a seed-to-seed sigma of 0.0008. The blend has been
-hiding that. Your target is to beat `fold_b_control_primary` at the 100/0 point. Fusion can then
-only add to a model that is already competitive; it cannot rescue one that is not.
+standalone, by 0.003 to 0.010 primary. The blend has been hiding that. Your target is to beat
+`fold_b_control_primary` at the 100/0 point. Fusion can then only add to a model that is already
+competitive; it cannot rescue one that is not -- and a model more than $STANDALONE_TOLERANCE below
+the control is now refused before it reaches Fold A.
+
+Two sigmas, and using the wrong one will make you discard a real effect as noise. The organizers
+publish $PUBLISHED_SIGMA seed-to-seed, and their convergence epsilon of 0.002 is about 2.5 of
+those. On our own platform the same five qualified seeds measure $MEASURED_SIGMA, 2.5x tighter.
+Price your trades against $MEASURED_SIGMA; quote $PUBLISHED_SIGMA only when reasoning about the
+organizers' stopping rule.
+
+`fusion_rank_correlation_with_control` tells you WHY you lost, which the primary alone cannot.
+It is the rank correlation between your ordering and the control's. Near 1.0 means you rebuilt
+the control and did it slightly worse -- the direction is the problem, so change the mechanism.
+Low means your ordering is genuinely different but weaker -- the direction is live, so keep it
+and fix strength. Those call for opposite next moves.
 
 The scoring structure that closed most of that gap is MEASURED, not a suggestion. Every candidate
 that scored 0.003 to 0.010 below the control built one factorization-machine interaction over ALL
@@ -277,14 +296,14 @@ worth nothing, so spend a few lines on these bounds."""
 # The proposer was choosing an axis without being told which libraries exist or what the training
 # budget is, so "keep it within remaining resource evidence" was an instruction it could not
 # follow, and "as many configurations as its runtime allows" withheld the number that decides it.
-_ENVIRONMENT_FACTS: Final = """Resource budget and environment
+_ENVIRONMENT_FACTS_TEMPLATE: Final = """Resource budget and environment
 
 Available: `numpy` (import as `np`) and `lightgbm` 4.7.0 (verified importable in the sandbox), plus
 the Python standard library minus the forbidden import roots supplied in the request.
 `scikit-learn`, `pandas`, `scipy` and `torch` are NOT installed.
 
 Your budget, so you can price a proposal instead of guessing at it: each training launch gets
-1800 seconds of wall clock and a single CPU thread, over roughly 1.14 million training rows. That
+1800 seconds of wall clock and $THREADS CPU threads, over roughly 1.14 million training rows. That
 is the number that decides how large an internal grid you can afford. A five-member ensemble of a
 linear/FM scorer fits inside it comfortably; a grid of twenty deep boosted models does not.
 
@@ -295,6 +314,18 @@ before you name anything. Rejected: any key whose underscore-separated tokens in
 `evaluation_metric`, `evaluation_score` or `recall_50`. Any string VALUE naming an official
 metric is rejected too. The evaluator alone may name a score; you report numbers under neutral
 names such as `selected_members`, `inner_score`, `inner_score_by_size` or `guard_margin`."""
+
+# Rendered from the constants the controller actually enforces, so the model can never be priced
+# against a sigma, a tolerance or a thread count that no longer matches the runner. The thread
+# count was previously stated by hand as one, understating the budget four-fold in exactly the
+# direction that discourages the internal grids the briefing asks for.
+_ENVIRONMENT_FACTS: Final = _ENVIRONMENT_FACTS_TEMPLATE.replace("$THREADS", str(CANDIDATE_THREADS))
+
+_BENCHMARK: Final = (
+    _BENCHMARK_TEMPLATE.replace("$PUBLISHED_SIGMA", f"{PUBLISHED_SEED_SIGMA:g}")
+    .replace("$MEASURED_SIGMA", f"{MEASURED_SEED_SIGMA:g}")
+    .replace("$STANDALONE_TOLERANCE", f"{STANDALONE_TOLERANCE:.6f}")
+)
 
 _PACKAGES_TAIL: Final = """Execution environment
 
@@ -550,7 +581,10 @@ next experiment using the typed recommendation vocabulary.
 You may also ask up to four questions of the TRAINING data, in analysis_requests. The trusted
 controller answers them over training rows only and puts the scalars in the next iteration's
 context, so this is the one way you can look at the data rather than at summaries chosen for you.
-It costs no iteration. Ask questions whose answer would change your next proposal:
+It costs no iteration, and no reflection in this project's history has ever used one. Spend all
+four every time: an unasked question is a free measurement discarded, and the cost of a question
+whose answer you turn out not to need is zero. Ask questions whose answer would change your next
+proposal:
 
 - {"kind": "within_user_interaction", "feature": A, "second_feature": B} reports the within-user
   correlation of A, of B, and of their product with long_view. Use it before building a cross:
@@ -625,6 +659,7 @@ never been run."""
 _FEATURE_AUTHORITY: Final = _FEATURE_AUTHORITY_TEMPLATE.replace(
     "$CODE_NAMES", ", ".join(f"`{name}`" for name in ID_CODE_FEATURE_NAMES)
 )
+
 
 _SECTIONS: Final = {
     # PROPOSE receives the feature-authority grant because the proposal is where an axis is

@@ -134,7 +134,12 @@ from kuairand_agent.campaign.store import (
 )
 from kuairand_agent.candidates.fusion import FUSION_WEIGHT_GRID
 from kuairand_agent.config import ResearchConfig
-from kuairand_agent.contract import benchmark_digest, verify_starter_kit
+from kuairand_agent.contract import (
+    MEASURED_SEED_SIGMA,
+    STANDALONE_TOLERANCE,
+    benchmark_digest,
+    verify_starter_kit,
+)
 from kuairand_agent.data.canonical import (
     CanonicalInputs,
     ProtectedTargets,
@@ -1633,7 +1638,7 @@ _RECORD_CONFIG_MAX_CHARS: Final = 600
 #: This does NOT address Fold B overfitting: the two largest Fold B gains in the ledger (+0.00059,
 #: +0.00034) clear this margin and still lost Fold A by more than they won.  It only stops the
 #: churn below the noise floor.
-FOLD_B_SCREEN_MARGIN: Final = 0.000316
+FOLD_B_SCREEN_MARGIN: Final = MEASURED_SEED_SIGMA
 
 
 def _bounded_config_json(config: Mapping[str, object] | None) -> str | None:
@@ -1724,6 +1729,7 @@ def _fusion_disclosure(
             "fold_b_control_primary": None,
             "fusion_weights_selected": None,
             "fusion_model_discarded": None,
+            "fusion_rank_correlation_with_control": None,
             "fusion_note": None,
         }
     standalone = selection.standalone_primary
@@ -1756,6 +1762,12 @@ def _fusion_disclosure(
         # otherwise never closes the harshest verdict of all -- the selector threw the model out
         # and the record then reads as a tie with the baseline.
         "fusion_model_discarded": selection.model_was_discarded,
+        # The one number that says WHY it lost rather than only that it lost.
+        "fusion_rank_correlation_with_control": (
+            None
+            if selection.member_rank_correlation is None
+            else round(selection.member_rank_correlation, 4)
+        ),
         "fusion_note": note,
     }
 
@@ -4581,6 +4593,7 @@ def run_provider_free_campaign(
             max_scientific_iterations=request.config.benchmark.max_iterations,
             launches_already_used=launches_at_start,
             screen_margin=FOLD_B_SCREEN_MARGIN,
+            standalone_tolerance=STANDALONE_TOLERANCE,
             elapsed_seconds_at_start=float(elapsed_at_start),
             wall_clock_seconds=request.config.benchmark.wall_clock_seconds,
             finalization_reserve_seconds=(request.config.runner.finalization_reserve_seconds),

@@ -4357,8 +4357,15 @@ class ResearchLineageLedger:
         terminal_failure_code: str,
         terminal_failure_subject: str,
         diagnostic: str,
+        remedy: str | None = None,
     ) -> None:
-        """Append one pre-admission rejection observed by a live research campaign."""
+        """Append one pre-admission rejection observed by a live research campaign.
+
+        ``remedy`` is the controller-authored advice for this failure class, from
+        ``campaign.failure_remedies``. Carrying it here is what makes a solved crash class stay
+        solved: without it a later campaign reads category and code and re-derives the fix, which
+        is the cross-run form of the wasted-iteration problem.
+        """
 
         campaign = _text(campaign_id, "campaign_id")
         benchmark = _digest(benchmark_digest, "benchmark_digest")
@@ -4373,7 +4380,12 @@ class ResearchLineageLedger:
         root_fingerprint = _digest(root_failure_fingerprint, "root_failure_fingerprint")
         terminal_fingerprint = _digest(terminal_failure_fingerprint, "terminal_failure_fingerprint")
         bounded_diagnostic = _text(diagnostic, "diagnostic")[:2000]
-        metadata_json = _json_object({}, "lineage-event metadata")
+        # The remedy is a module constant chosen by a controller-owned marker, never candidate
+        # text, so it is safe to carry across runs and back into a later prompt.
+        metadata_json = _json_object(
+            {} if remedy is None else {"remedy": _text(remedy, "remedy")[:2000]},
+            "lineage-event metadata",
+        )
         with self._transaction(write=True) as connection:
             connection.execute(
                 """INSERT INTO lineage_events(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from numbers import Integral
@@ -143,6 +144,27 @@ class FusionResult:
     alignment_digest: str
     fusion_digest: str
     phase: DataPhase
+    #: Pearson correlation of the two members' within-user percentile vectors, which is Spearman
+    #: on their raw scores because percentiles ARE the ranks.  It is the one number that separates
+    #: "you rebuilt the control, worse" (near 1) from "you are genuinely different but weak"
+    #: (low), and no train-only analysis request can reach it because it needs both members'
+    #: validation predictions.  ``None`` for a degenerate vector with no variance.
+    member_rank_correlation: float | None = None
+
+
+def _rank_correlation(first: Float64Vector, second: Float64Vector) -> float | None:
+    """Pearson on percentile vectors. ``None`` when either side is constant."""
+
+    first_centred = first - first.mean()
+    second_centred = second - second.mean()
+    denominator = float(np.linalg.norm(first_centred) * np.linalg.norm(second_centred))
+    if not math.isfinite(denominator) or denominator == 0.0:
+        return None
+    value = float(np.dot(first_centred, second_centred) / denominator)
+    if not math.isfinite(value):
+        return None
+    # Floating point can put an exactly-identical pair a few ulp outside [-1, 1].
+    return max(-1.0, min(1.0, value))
 
 
 def normalize_within_user_percentiles(
@@ -265,6 +287,7 @@ def fuse_ranked_predictions(
         alignment_digest=first.alignment_digest,
         fusion_digest=hashlib.sha256(payload).hexdigest(),
         phase=phase,
+        member_rank_correlation=_rank_correlation(first.scores, second.scores),
     )
 
 

@@ -317,6 +317,29 @@ BENCHMARK_CONTRACT: Final = BenchmarkContract(
     convergence=_FROZEN_CONVERGENCE,
 ).validate()
 
+#: Seed-to-seed primary standard deviation as the ORGANIZERS published it. Their epsilon of 0.002
+#: is derived from this as roughly 2.5 sigma, so it is the figure to quote whenever the
+#: convergence rule is being explained.
+PUBLISHED_SEED_SIGMA: Final = 0.0008
+#: Seed-to-seed primary standard deviation as WE measured it, over the five qualified official-FM
+#: seeds on our own platform (docs/RESULTS.md 3.4). It is 2.5x tighter than the published figure,
+#: so pricing a trade against 0.0008 discounts real effects as noise. This is the figure to use
+#: for our own screens and for telling a candidate how large an effect must be to be believed.
+MEASURED_SEED_SIGMA: Final = 0.000316
+
+#: How far a candidate may sit below the official control STANDALONE and still earn a Fold A
+#: launch.  Six measured sigma.  The Fold B screen reads the rank-fused primary, so without this a
+#: model far weaker than the control passes whenever the selector rescues it into a blend.  An
+#: outright standalone win would reject every candidate this project has produced, including its
+#: best at 0.00089 below, so this is a tolerance and not a bar.
+STANDALONE_TOLERANCE: Final = 6 * MEASURED_SEED_SIGMA
+
+#: CPU threads a candidate training launch receives.  Mirrors ``[runner] threads`` in the shipped
+#: config; a test pins the two together.  The prompt quotes it so a proposal can be priced, and it
+#: was previously stated as one, understating the budget four-fold in the direction that
+#: discourages the internal grids the briefing asks for.
+CANDIDATE_THREADS: Final = 4
+
 
 def benchmark_manifest() -> dict[str, object]:
     """Return a new JSON-compatible copy of the frozen benchmark manifest."""
