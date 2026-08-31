@@ -108,11 +108,24 @@ with the identity codes; the organizer FM crosses only categorical fields. Restr
 interaction to the identity codes and keeping the aggregates as additive first-order terms moved
 the deficit from **−4σ…−12σ to −1.12σ**. Not a bigger model — a better-specified one.
 
-*Then we killed two of our own hypotheses.* Giving candidates user identity at prediction time was
-structurally correct and **did not close the gap**. Letting a candidate ensemble itself came out
-**flat**. We measured why: averaging the five official FM seeds on raw scores is worth +0.0000772,
-on within-user rank percentiles +0.0005664. **86% of the ensembling gain needs an operation our
-candidates cannot perform**, because prediction receives no user grouping.
+*Then we killed two of our own hypotheses, and later had to retract one of the kills.* Giving
+candidates user identity at prediction time was structurally correct and **did not close the gap**.
+Letting a candidate ensemble itself came out **flat**, and we measured why: averaging the five
+official FM seeds on raw scores is worth +0.0000772, on within-user rank percentiles +0.0005664, so
+86% of the ensembling gain is the normalisation. We concluded candidates could not perform it,
+because prediction receives no user grouping — **and that conclusion was wrong.** The absent
+capability is `user_groups`; `user_id_code` is a column of the feature matrix and arrives at
+prediction time like any other feature. Grouping by it recovers 96.2% of the gain. Our own briefing
+had told four campaigns the good version was impossible, and they had done as they were told.
+
+**The instruction surface, not the model, was the binding constraint** — and that pattern held five
+separate times. Each was a place where guidance and enforcement said different things and
+enforcement won silently: a diagnostics naming rule that discarded four consecutive successful
+training runs without telling the model which key was rejected; a screen that judged the rank-fused
+blend and so admitted a model 4.7σ below the control; a circuit breaker that closed a direction
+after one loss while the briefing told the model one loss proves nothing; column names in the
+prompt that had never existed; and a novelty directive that pushed the agent away from the one
+structure the records showed was strongest.
 
 **That is the finding we would carry to another project: an agent's capability boundary is a design
 parameter, not an implementation detail.** Ours gives a candidate a feature matrix and nothing else
@@ -185,6 +198,23 @@ have.** A candidate was promoted at +0.0002715, or 0.34 of one seed standard dev
 the same method rather than reporting it. Three measurements: **+0.34σ, −0.03σ, +0.36σ** — mean
 +0.00018 against an ε of 0.002. Had we shipped the first as a win, our own next run would have
 contradicted it four hours later.
+
+**What those campaigns were actually measuring was our seed, not the task.** They all started from
+a fixed-step logistic scorer, and the candidates they produced scored 0.5693, 0.5674 and 0.5724
+standalone — bracketing that parent's own 0.5698. Each was spending its single scientific iteration
+rebuilding the base rather than testing its hypothesis. The trusted parent is now the identity-code
+factorization machine the records already showed was strongest, at **0.5746869**, which moves the
+starting point from 17.98σ below the official control to **2.33σ**.
+
+We rebuilt it from a *configuration* recorded in the cross-run ledger, because the source of the
+run that produced it had been deleted along with its run directory — the ledger keeps
+configurations, not implementations. A blocking acceptance test refused four rebuilds before
+accepting one at +0.49σ above the measurement it claims to reproduce; without it, every later
+comparison would have silently meant "versus an unverified reimplementation". The retention hole is
+closed: candidate source is now archived before anything is pruned, at 244 KB against a 4.4 GB run.
+
+This is still not a result that clears ε. What changed is that the next campaign measures the
+benchmark rather than our own starting point.
 
 Reported honestly, best first:
 

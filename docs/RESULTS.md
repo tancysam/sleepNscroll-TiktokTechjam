@@ -463,6 +463,72 @@ rather than only on the machine that built it; and it establishes the local base
 candidate produced on that machine must be compared against -- see section 6.4, because the two
 platforms do not agree to the last bit.
 
+### 3.4a Promoting the trusted parent, and the measurement that gates it
+
+Every campaign through sol6 started from a fixed-step logistic scorer and none improved on it.
+The three candidates produced after the instruction-surface fixes scored **0.5693, 0.5674 and
+0.5724** standalone on the Fold B screen, bracketing the parent's own **0.5698351**: they were
+spending their one scientific iteration rebuilding the base, badly, before the hypothesis on top
+of it could be measured. That is a finding about the seed, not about the task, and it invalidated
+the reading that "candidates land nowhere near the control".
+
+The structure that closed most of the gap was already measured -- run 16's identity-code
+factorization machine, §3.3a -- but its source did not survive its run directory. What did
+survive is its family's *configuration*, in the cross-run ledger's `candidate_config_json`. The
+parent was rebuilt from campaign `de711dca`'s promoted `deterministic_fm_seed_ensemble` recipe:
+Adam at 0.02 with the standard betas, minibatch 65536, eight epochs, rank 8, embedding init 0.01,
+1e-4 L2 on dense weights and embeddings, logit clip 35, five deterministically seeded members
+averaged on within-user percentiles.
+
+| model | Fold B standalone | vs control |
+|---|---|---|
+| logistic parent (the previous seed) | 0.5698351 | −17.98σ |
+| identity FM, hand-wired, full batch | 0.5700869 | −17.6σ |
+| sol6 candidate-02, recorded SGD recipe, run verbatim | 0.5724103 | −9.54σ |
+| de711dca Adam recipe, single member | 0.5739816 | −4.56σ |
+| **de711dca Adam recipe, five members** | **0.5746869** | **−2.33σ** |
+| run 16, the target | 0.5745312 | −2.83σ |
+| official FM control | 0.5754240 | — |
+
+`parent_acceptance_probe.py` is the gate and it is blocking: a promoted parent that does not
+reproduce run 16 within one measured sigma is refused, because otherwise every later
+`parent_fold_b_primary` would mean "versus an unverified reimplementation". It refused four
+configurations before accepting this one at **+0.49σ above run 16**. The best measurement in this
+project's history is therefore reproduced from its recorded configuration alone; the lost source
+was never needed.
+
+Three failures preceded it, all in the first hand-wired attempt, and each is now a comment in
+`candidate_seed/model_impl.py`:
+
+1. **Fixed step instead of Adam.** An identity row appears in ~43 of 1.1M training rows, so its
+   gradient is four orders of magnitude below a dense weight's; the embedding never left its
+   initialization and the FM scored 0.0001 *below* the plain logistic model.
+2. **More training instead of less.** At 256 epochs with weaker decay the same structure
+   collapses to 0.5513793, a 76σ regression. Eight epochs at 1e-4 embedding L2 is the overfit
+   control, and the recorded recipe inverted is a good way to find that out.
+3. **Identity codes in the dense term.** The working implementations all compute
+   `dense_count = features.shape[1] - len(codes)`. A linear weight on a categorical code is
+   meaningless.
+
+Because promoting a parent changes what every recorded verdict means -- "lost a full inner-fold
+evaluation" means lost to *that* parent's lineage -- the candidate-seed digest is now part of
+`evaluation_digest`. Prior family verdicts expire exactly when the parent changes and never when
+unrelated controller code does.
+
+### 3.4b Retention: the ledger keeps configurations, not implementations
+
+`prune` has always protected `generated-source`. That protects it from `prune`. It does not
+protect it from reclaiming disk by hand, which is what happened when the volume reached 100% with
+a campaign still writing: **129 candidate source trees existed across the run directories and two
+survived.** Recovering the FM recipe then depended entirely on configurations happening to be in
+the ledger.
+
+The cost of preventing that is nil. Generated source is **244 KB against a 4.4 GB run**, five
+thousandths of one percent; the bulk is regenerable feature cache. `archive_generated_source`
+now mirrors every run's candidate code into `runs/archive/` before `prune` removes anything,
+idempotently and without overwriting, and a test asserts the archive survives the run directory
+being deleted by hand.
+
 ### 3.5 Defects found by running live, and fixed
 
 Robustness is judged on how the agent handles difficulty, not on whether it meets any. All five

@@ -450,6 +450,36 @@ Three caveats we went looking for and are reporting against ourselves:
 What the runs do demonstrate is that the loop runs end to end without human intervention,
 converges under the frozen rule, and emits an organizer-valid submission every time.
 
+### The trusted parent, and what the earlier runs were actually measuring
+
+Every campaign above started from a fixed-step logistic scorer, and none improved on it. The three
+candidates produced after the instruction-surface fixes scored **0.5693, 0.5674 and 0.5724**
+standalone on the Fold B screen, bracketing that parent's own **0.5698** — they were spending their
+single scientific iteration rebuilding the base rather than testing their own hypothesis. So
+"candidates land nowhere near the control" was a finding about the seed, not about the task.
+
+The trusted parent is now the identity-code factorization machine that the records already showed
+was strongest: a second-order interaction over the identity codes only, causal aggregates kept as
+additive first-order terms, Adam over shuffled minibatches, five deterministically seeded members
+averaged on within-user percentiles.
+
+| model | Fold B standalone | vs control |
+|---|---|---|
+| logistic parent (previous seed) | 0.5698351 | −17.98σ |
+| **identity-FM parent (current seed)** | **0.5746869** | **−2.33σ** |
+| run 16, the best prior measurement | 0.5745312 | −2.83σ |
+| official FM control | 0.5754240 | — |
+
+It was rebuilt from a *configuration* recorded in the cross-run ledger, because the source of the
+run that produced it had been deleted with its run directory. `parent_acceptance_probe.py` gates
+the promotion and refused four configurations before accepting this one at +0.49σ above run 16 —
+without that gate every later `parent_fold_b_primary` would have meant "versus an unverified
+reimplementation". Details, including the three ways the first rebuild failed, are in
+[`docs/RESULTS.md`](docs/RESULTS.md) §3.4a.
+
+This is still **not** a result that clears ε, and the parent remains 2.33σ below the control. What
+changed is that the next campaign measures the task instead of the seed.
+
 ### The submitted artifact
 
 ```sh
@@ -467,8 +497,15 @@ hash-pinned organizer source. The number reproduced exactly through two independ
 and that it does not clear ε.
 
 Members are combined on within-user rank percentiles, not raw scores. That choice is worth
-+0.0004891 (`python3 ensemble_mode_probe.py`) — and it is precisely the operation a *candidate*
-cannot perform, because prediction receives no `user_groups`. See Limitations.
++0.0004891 (`python3 ensemble_mode_probe.py`), and it carries most of the ensembling effect:
+averaging raw scores is worth +0.0000772 against +0.0005664 for percentiles.
+
+**A candidate can do this too, and the claim that it could not was wrong.** `user_groups` is a
+training-only capability, but `user_id_code` is a *column of the feature matrix*, so it reaches
+`predict_scores` like any other feature. Grouping by that code instead of the true user id scores
+0.6025848 — **+0.0005478 over the best single seed, 96.2% of the ceiling above** — with the
+unknown-identity slot (1.59% of validation rows) costing −0.0000186. The briefing told candidates
+the opposite for four campaigns; the trusted parent now performs it.
 
 GPU-hours consumed: **0.00** — every configuration is CPU-only. Total provider spend across every
 run to date: **$29.27** for **2,996,874 tokens** over **141 attempts** (130 returned a usage
@@ -489,10 +526,14 @@ measured rather than argued:
 1. **No user identity at prediction time**, so no user×item crosses — the term the baseline FM
    draws most of its ordering power from. We added `user_id_code` (bundle 37 → 38 columns, user
    vocabulary 26,211). **The hypothesis was falsified:** the gap stayed at −5σ.
-2. **No `user_groups` at prediction time**, so no within-user rank normalisation. This is why a
-   candidate that ensembles itself gains nothing: on the five official FM seeds, raw-score
-   averaging is worth +0.0000772 while rank averaging is worth +0.0005664. **86% of the ensembling
-   gain requires an operation the seam denies.** Reproduce with `python3 ensemble_mode_probe.py`.
+2. **No `user_groups` at prediction time**, so no within-user rank normalisation — **RETRACTED.**
+   The measurement stands: on the five official FM seeds, raw-score averaging is worth +0.0000772
+   while rank averaging is worth +0.0005664, so 86% of the ensembling gain is the normalisation.
+   The conclusion did not. The absent capability is `user_groups`; `user_id_code` is a *column of
+   the feature matrix* and reaches `predict_scores` like any other feature. Grouping by it scores
+   0.6025848 — 96.2% of the ceiling — with the unknown slot costing −0.0000186. We told candidates
+   this was impossible for four campaigns and they obeyed. Reproduce both with
+   `python3 ensemble_mode_probe.py`.
 3. **No early stopping on the scored split** — which the baseline *does* get.
    `baselines/starter_fm.py:701-708` keeps the best of up to 40 epochs measured on the split it
    then reports, and the published 0.6016 has the same property (`baseline.py:88`). Our candidate
