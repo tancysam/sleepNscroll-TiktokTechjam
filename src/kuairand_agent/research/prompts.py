@@ -153,6 +153,13 @@ That is a factor of about 278, and it is the most likely reason a one sigma defi
 change to features, capacity and loss. The organizers separately measured that neither features nor
 capacity is the bottleneck, which is consistent.
 
+The control's exact constants are known, so do not derive them from a scaling rule. It uses rank
+k = 16, learning rate 0.001, L2 1e-6, batch 8192, at most 40 epochs, and early-stopping patience 4,
+with Adam betas 0.9 and 0.999 and epsilon 1e-8. Those are measured working values for this
+optimiser on this data. Start from them rather than from a heuristic; a full-batch step size such
+as 0.05 is several times too large once you are taking thousands of updates, and Adam already
+normalises away most of the batch-size effect on gradient magnitude that such rules try to correct.
+
 You may fix this and it stays byte-exact reproducible, because the control does exactly the same
 thing: draw one permutation per epoch from `numpy.random.default_rng(seed)`, iterate fixed-size
 slices of it, and keep Adam's two moment arrays alongside your parameters. Match the control's
@@ -242,6 +249,18 @@ drive the Adam second moment to a value that flattens every later update, or pus
 magnitudes the scorer cannot recover from, and you will not see it until the run is over. The
 control clips the sigmoid argument but never the gradient, so this costs one line and protects work
 you cannot repeat.
+
+One data layout choice removes most of the remaining timeout risk and shrinks the code at the same
+time. Rather than holding five separate embedding tables and looping over them in Python on every
+step, pack the five identity codes into ONE index space and hold ONE table. Add a fixed per column
+offset to each code, so column f contributes `code_f + offset_f` where the offsets are the
+cumulative sum of the per column vocabulary sizes, then allocate a single table of
+`(sum of vocabulary sizes, rank)`. A batch lookup is then one fancy index, `table[batch_codes]`,
+producing `(B, F, rank)`, and the whole interaction is
+`0.5 * ((E.sum(1) ** 2).sum(1) - (E ** 2).sum((1, 2)))` with no loop over fields at all. The
+gradient scatter is likewise one `np.add.at` into one array. This is exactly how the control is
+built, it turns five lookups and five scatters per step into one of each, and it deletes the per
+field Python loop where the broadcast mistakes above tend to happen.
 
 Two things that look like improvements here and are not. Reshuffle every epoch rather than once
 before the loop, which is what the control does; permuting the index array costs about ten
