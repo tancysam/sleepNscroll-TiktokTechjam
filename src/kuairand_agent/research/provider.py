@@ -875,9 +875,12 @@ class OpenAIChatCompletionsModel:
             "n": 1,
             "store": False,
             "stream": False,
-            "tools": [],
-            "tool_choice": "none",
-            "parallel_tool_calls": False,
+            # No tool is ever offered to this model, and an empty ``tools`` list carries no
+            # meaning on its own. ``tool_choice`` and ``parallel_tool_calls`` alongside it do:
+            # OpenAI-backed endpoints reject the combination outright with
+            # ``400 'tool_choice' is only allowed when 'tools' are specified``, which failed every
+            # propose call of two campaigns against api.tokenrouter.com. They are omitted rather
+            # than set, because the value they were carrying was the API default anyway.
         }
         output_limit = self.config.max_output_tokens
         if context_limits is not None:
@@ -921,12 +924,12 @@ class OpenAIChatCompletionsModel:
             # Chat Completions defaults and are not advertised by otherwise compatible strict-
             # schema endpoints, so sending them can incorrectly eliminate every route.
             #
-            # ``tools`` and ``tool_choice`` deliberately survive the scrub.  They were the obvious
-            # next suspects for the 404 that eliminated every route, so they were measured against
-            # the live endpoint: a strict ``json_schema`` request returns 200 with them, without
-            # them, with either one alone, and with ``require_parameters`` off.  The 404 was an
-            # account-level data policy, not this payload.  Do not remove them on suspicion.
-            for defaulted_parameter in ("n", "store", "stream", "parallel_tool_calls"):
+            # ``tools`` and ``tool_choice`` were measured here against a 404 that eliminated every
+            # route and were correctly cleared of causing it; that finding stands.  They are no
+            # longer sent at all, for a different reason established later against a different
+            # host: an empty ``tools`` list with ``tool_choice`` set is rejected outright by
+            # OpenAI-backed endpoints.  The scrub below therefore no longer needs to consider them.
+            for defaulted_parameter in ("n", "store", "stream"):
                 payload.pop(defaulted_parameter, None)
             payload["provider"] = {
                 "allow_fallbacks": True,

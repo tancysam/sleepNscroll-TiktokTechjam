@@ -198,8 +198,8 @@ def test_propose_uses_chat_completions_schema_and_records_redacted_usage(
     assert payload["model"] == "gpt-5.4"
     assert payload["reasoning_effort"] == "high"
     assert payload["store"] is False
-    assert payload["tools"] == []
-    assert payload["tool_choice"] == "none"
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
     assert payload["max_completion_tokens"] == 4096
     assert payload["messages"][0]["role"] == "system"
     assert payload["messages"][1]["role"] == "user"
@@ -267,8 +267,11 @@ def test_gateway_payload_uses_gateway_reasoning_contract(
         assert "store" not in payload
         assert "stream" not in payload
         assert "parallel_tool_calls" not in payload
-        assert payload["tools"] == []
-        assert payload["tool_choice"] == "none"
+        # No tool is offered, and an empty tools list with tool_choice set is rejected by
+        # OpenAI-backed endpoints, which failed every propose call of two campaigns.
+        assert "tools" not in payload
+        assert "tool_choice" not in payload
+        assert "parallel_tool_calls" not in payload
         assert payload["provider"] == {
             "allow_fallbacks": True,
             "require_parameters": True,
@@ -279,7 +282,7 @@ def test_gateway_payload_uses_gateway_reasoning_contract(
         assert payload["n"] == 1
         assert payload["store"] is False
         assert payload["stream"] is False
-        assert payload["parallel_tool_calls"] is False
+        assert "parallel_tool_calls" not in payload
         assert "provider" not in payload
 
 
