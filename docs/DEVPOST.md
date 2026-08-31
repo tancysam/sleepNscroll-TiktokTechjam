@@ -40,7 +40,94 @@ the measured number. The model then reflects on the trusted result and chooses w
 **The model proposes; code decides.** No metric in this system is ever self-reported. That single
 rule is what makes the run log trustworthy evidence rather than a transcript of claims.
 
+It is also not sufficient, which is the next section. Every metric here was computed by trusted
+code and every digest verified — and the number the agent was handed still did not mean what the
+agent thought it meant.
+
 ## What we think is interesting about it
+
+**Our agent was being lied to by its own evaluation harness, and we caught it by auditing the
+harness instead of the agent.**
+
+For three campaigns the records showed generated candidates landing at almost exactly the
+baseline's score. Several came back *bit-identical* to it. We wrote that up as a finding about the
+task — with a median slate of four impressions and only 63.7% of users GAUC-eligible, there are
+genuinely few distinct orderings available, so different models plausibly induce the same one. It
+was a tidy, and completely wrong, explanation.
+
+The controller rank-fuses every candidate's predictions with the official FM baseline over a fixed
+five-point weight grid, picks the best blend on an inner screen, and freezes it. The score written
+into the record is the *blend's*. When the selector picks weight `0.0` for the model, it discards
+the model and scores the baseline's own prediction vector — so identical metrics are a certainty,
+not a coincidence. The proof is a digest: `scored_prediction_digest` is the same value
+`41629b9c856e1921…` in every such case, and never equals the raw generated prediction.
+
+Reading the grid point the selector *didn't* choose gave us each candidate's own score for the
+first time. Every generated candidate we had ever run was **4σ to 12σ below the baseline
+standalone**. We had not been narrowly missing an improvement for three campaigns; we had never
+been in contention, and fusion had been substituting the baseline's score for ours the whole time.
+
+Two causes, both structural:
+
+- **No user identity at prediction time.** Candidates received user grouping during training and a
+  bare feature matrix at prediction. They could not evaluate a user-conditioned term when it
+  mattered, which rules out the user×video and user×author crosses that are where a factorization
+  machine's ranking power actually lives. We were asking the agent to beat a model while
+  withholding that model's main mechanism.
+- **The agent was never told fusion existed.** The word appeared nowhere in its briefing, and the
+  primary returned to its reflection step was the blend's. One iteration recorded in its own
+  reasoning that a direction *"successfully measured 0.5754240304, matching official_fm_fold_B"*
+  and dropped it — reading "my model was thrown away" as "my model tied the baseline." It then
+  reasoned correctly from a false premise, which is the failure mode you cannot debug by reading
+  the model's output.
+
+The lesson generalises past this competition. We built elaborate guarantees that the agent could
+not tamper with its evaluator — hash-pinned scorer, no filesystem, no label access — and every one
+of them held. What we did not check was whether the evaluator was telling the agent the truth. A
+feedback channel that silently floors a bad result at the baseline's score is not an integrity
+violation; nothing is compromised, every digest verifies, and the agent's reasoning is impeccable
+on the numbers it is given. It is simply wrong, and it is invisible from inside the loop. **An
+agent's feedback signal deserves the same adversarial scrutiny as its permissions.**
+
+Both are fixed, both are one commit each, and the diagnostic that found it ships in the repo as
+`fusion_audit.py` so any reviewer can rerun it against our recorded campaigns.
+
+**What happened next is the part we are most pleased with, and it is one discovery, one confirmed
+fix, and two honest negatives.**
+
+*The fix changed how the agent reasons.* Same iteration slot, consecutive runs. Before: *"recency
+weighting successfully measured 0.5754240304, matching official_fm_fold_B; recency weighting is
+therefore excluded."* After: *"the parent scores 0.5713044 standalone against the 0.575424 Fold B
+control."* The first is a model reasoning correctly from a false premise — the failure you cannot
+debug by reading its output, because the output is impeccable. The second is the same model with a
+truthful signal.
+
+*Then the model got substantially better.* Every candidate to that point crossed all 38 feature
+columns in one factorization-machine interaction, so 33 continuous aggregates shared a latent space
+with the identity codes; the organizer FM crosses only categorical fields. Restricting the
+interaction to the identity codes and keeping the aggregates as additive first-order terms moved
+the deficit from **−4σ…−12σ to −1.12σ**. Not a bigger model — a better-specified one.
+
+*Then we killed two of our own hypotheses.* Giving candidates user identity at prediction time was
+structurally correct and **did not close the gap**. Letting a candidate ensemble itself came out
+**flat**. We measured why: averaging the five official FM seeds on raw scores is worth +0.0000772,
+on within-user rank percentiles +0.0005664. **86% of the ensembling gain needs an operation our
+candidates cannot perform**, because prediction receives no user grouping.
+
+**That is the finding we would carry to another project: an agent's capability boundary is a design
+parameter, not an implementation detail.** Ours gives a candidate a feature matrix and nothing else
+at prediction time — drawn that way for good isolation reasons, and it silently capped the
+achievable score in three separate ways: no user-conditioned terms, no within-user normalisation,
+and no early stopping on the scored split, which the baseline itself *does* get
+(`starter_fm.py:701-708` keeps the best of 40 epochs measured on the split it then reports; the
+published 0.6016 has the same property). We could not have found any of it from the agent's
+transcripts. We found it by auditing what the agent was allowed to see.
+
+**A code path that only runs on success accumulates defects invisibly.** Our promotion path went
+unexecuted for twelve campaigns. Each time it finally ran it exposed a latent bug — most recently a
+comparison of the organizer's float32 primary against our own float64 recomputation at
+`abs_tol=1e-15`, **2.98e-8 apart, a single float32 unit in the last place**, which stranded the
+first campaign ever to both promote a candidate and publish a bundle. Fixed and regression-tested.
 
 **We deliberately did not use an agent framework.** No LangChain, no LiteLLM, no orchestration
 library, not even the `openai` SDK. Provider calls are `urllib.request` from the standard library
@@ -87,31 +174,40 @@ install cannot silently change the execution profile.
 
 ## Honest status
 
-**Sixteen live autonomous campaigns have run** against `openai/gpt-5.6-sol`; twelve completed end
-to end and emitted a full organizer-valid submission (170,588 rows, checker return code 0, replay
-verified). **Every completed campaign recorded zero manual interventions.** Total live spend:
-1.63M tokens, roughly $9.57, and **0.00 GPU-hours** — every configuration is CPU-only.
+**Seventeen campaigns, ten of them reaching a terminal `COMPLETED` state under the organizers' own
+frozen rule (ε = 0.002, patience 3), with zero manual interventions in every single one.** The last five
+executed every generated candidate they produced — 22/22, 21/21, 22/22, 15/15 and 15/15 subprocess
+executions with empty stderr. Bundles are organizer-valid: 170,588 rows, checker return code 0,
+replay verified.
 
-**No generated candidate has beaten the baseline by more than noise.** One candidate cleared every
-gate the pipeline has, including outer matched-seed validation, at +0.00052 on Fold A — real,
-reproducible, and an order of magnitude below the organizers' ε = 0.002. **We do not claim it as
-an improvement.** Hidden-test performance is unknown and unclaimed; only the organizers measure it.
+**We do not claim an improvement over the baseline, and the reason is the most useful result we
+have.** A candidate was promoted at +0.0002715, or 0.34 of one seed standard deviation. We reran
+the same method rather than reporting it. Three measurements: **+0.34σ, −0.03σ, +0.36σ** — mean
++0.00018 against an ε of 0.002. Had we shipped the first as a win, our own next run would have
+contradicted it four hours later.
 
-What we did learn is why. The agent proposed a training-objective change in sixteen consecutive
-campaigns, and we spent the day assuming that was a defect in the agent. It was not. Enforcing
-cross-run memory, pruning 57% of the proposal prompt, and widening the feature bundle from 28 to
-66 columns each changed nothing, because the cause was in our own prompt: the PROPOSE operation
-never received the execution-environment section, so the proposer had no information about its own
-implementation authority, while the briefing it did receive ranks the objective as "the single
-largest known opportunity" and lists feature breadth under measured dead ends. The model was
-following our instructions precisely. That is the same constraint-transmission defect we had
-already found in reverse — code rejected for rules it was never told — and we would not have found
-either without running the system live and reading what it was actually sent.
+Reported honestly, best first:
 
-Four production defects were found this way and fixed, each root-caused from a real failure with a
-regression test confirmed to fail without the fix. Full detail, including what is not demonstrated,
-is in [`docs/RESULTS.md`](RESULTS.md), and the measurement behind the memory finding is in
-[`docs/agent-memory-experiment.md`](agent-memory-experiment.md).
+| Result | Public validation | vs organizer 0.6016 | Provenance |
+|---|---:|---:|---|
+| **Five-seed rank ensemble of the organizer FM** (submitted) | **0.6026034** | **+0.0010** | controller-side, **not agent-generated** |
+| Shipped fallback `official-fm-fallback-seed-4` | 0.6020371 | +0.0004 | best-of-five **selected on this split** |
+| Best agent candidate, fused | 0.6017246 | +0.0001 | within noise, 75% organizer FM by weight |
+| Best agent candidate, **scored alone** | 0.5745312 vs control 0.5754240 | **−1.12σ** | our model, honestly measured |
+
+Every caveat in that table is one we went looking for. The submitted ensemble is real and
+reproducible — `python3 build_ensemble_submission.py` regenerates it from already-qualified
+checkpoints with no new training, and the organizers' own checker passes it — but it is an
+engineering property of *their* baseline, not our agent doing research, and it is below our own
+materiality threshold. The shipped fallback's margin is a selection effect. The agent's headline
+number is a blend. **And our agent, scored on its own, still does not beat the baseline** — though
+it is now within about one standard deviation of a reference that gets to early-stop on the split
+it is scored on, which our candidates structurally cannot.
+
+We would rather hand a judge four rows with their provenance than one row without it.
+
+Hidden-test performance is organizer-computed and is neither known nor claimed. Full detail,
+including a section on what is *not* demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).
 
 We would rather report a small honest number than a large unverifiable one.
 
@@ -129,7 +225,7 @@ We would rather report a small honest number than a large unverifiable one.
 
 | | |
 |---|---|
-| **OpenAI-compatible Chat Completions**, two profiles | A frozen main/fallback provider chain over `POST {base_url}/chat/completions` with strict JSON-schema structured outputs and a configured reasoning effort. Both profiles are selected by environment (`INFERENCE_MAIN_MODEL` / `INFERENCE_FALLBACK_MODEL`), so the chain is model-agnostic; runs to date have used `deepseek/deepseek-v4-pro-0813` and `openai/gpt-5.6-sol` served via OpenRouter and TokenRouter. A terminal typed failure switches to the fallback exactly once and stays there, so a known-bad endpoint is not retried for every later operation. Called directly over `urllib.request` — no vendor SDK and no agent framework. Each profile carries its own dedicated credential variable and its own pinned pricing block, and per-call input, cached-input, output, reasoning and total tokens are recorded, with cost derived from pricing pinned in configuration rather than inferred at runtime. Measured across sixteen live campaigns on the `gpt-5.6-sol` profile: 1,634,466 tokens for roughly $9.57. Choosing an open-weights model behind a provider chain, rather than a frontier model behind one endpoint, was a deliberate cost and availability decision. |
+| **OpenAI-compatible Chat Completions**, two profiles | A frozen main/fallback provider chain over `POST {base_url}/chat/completions` with strict JSON-schema structured outputs, called directly over `urllib.request` — no vendor SDK and no agent framework. Early campaigns (runs 01–07) ran `deepseek/deepseek-v4-pro-0813`; the scored campaigns (runs 09–14) ran `openai/gpt-5.6-sol` as the main profile with `openai/gpt-5.6-terra` in the fallback slot. A terminal typed failure switches to the fallback exactly once and stays there, so a known-bad endpoint is not retried for every later operation. Each profile carries its own dedicated credential variable and its own pinned pricing block, and per-call input, cached-input, output, reasoning and total tokens are recorded. |
 | Zenodo | One-time hash-verified dataset acquisition (record 10439422). Not called at runtime. |
 
 No other network access exists anywhere in the system. Generated candidate code cannot reach the
@@ -167,10 +263,5 @@ trained on, joined with, or pre-trained against any dataset outside KuaiRand-Pur
 
 - [`README.md`](../README.md) — overview, setup, reproduction, limitations, contributions
 - [`docs/RESULTS.md`](RESULTS.md) — results, run logs, resource accounting, integrity analysis
-- [`docs/agent-memory-experiment.md`](agent-memory-experiment.md) — what the agent was pointed at
-  and why: the cross-run memory measurement, its negative result, and the enforcement experiment
-- [`docs/run-logs/`](run-logs/) — the per-iteration run-log deliverable (hypothesis, code diff,
-  resulting metrics, error and recovery events), emitted by
-  `kuairand-agent iteration-log --run-dir <run>` in Markdown or JSONL
 - [`plan.md`](../plan.md) — full architecture and design rationale
 - [`docs/research/`](research/) — primary-source verification and implementation-readiness research

@@ -8,10 +8,8 @@ from kuairand_agent.campaign.pure_features import (
     PURE_AGGREGATE_SPECS,
     PureFeatureError,
     build_pure_feature_pair,
-    code_cardinalities,
     concat_canonical_inputs,
     estimated_matrix_bytes,
-    fit_code_vocabulary,
     split_feature_matrix,
     subset_canonical_inputs,
     subset_values,
@@ -74,8 +72,17 @@ def test_id_codes_are_fitted_on_prefix_rows_and_send_unseen_identities_to_the_un
     assert set(prefix_codes[:, 0].tolist()) == {0.0, 1.0, 2.0, 3.0}
     assert query_codes[:, 0].tolist() == [4.0, 4.0]
     assert query_codes[:, 1].tolist() == [2.0, 2.0]
-    for column, cardinality in zip(range(2), pair.code_cardinalities[1:3], strict=True):
-        assert (query_codes[:, column] < cardinality).all()
+
+    # The user column is the reason this block exists at prediction time: user_groups is a
+    # training-only capability, so a query-row user code is the only user identity a candidate
+    # ever sees when it scores.  Query users u1 and u2 are both in the prefix, so they keep their
+    # fitted codes rather than collapsing onto the unknown slot.
+    user = names.index("user_id_code")
+    assert sorted(set(pair.prefix.values[:, user].tolist())) == [0.0, 1.0]
+    assert pair.query.values[:, user].tolist() == [0.0, 1.0]
+
+    for name, cardinality in zip(names[-5:], pair.code_cardinalities, strict=True):
+        assert (pair.query.values[:, names.index(name)] < cardinality).all()
 
 
 def test_id_code_vocabulary_is_order_independent_for_simultaneous_events() -> None:
@@ -202,9 +209,9 @@ def test_feature_pair_has_frozen_schema_and_strict_past_query_state() -> None:
 
     assert pair.prefix.row_count == 2
     assert pair.query.row_count == 2
-    # 1 global prior + 3 per aggregate spec + 5 static + 5 identity codes.
-    assert pair.prefix.feature_count == 1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + 5
-    assert pair.prefix.feature_names[-5:] == ID_CODE_FEATURE_NAMES
+    assert pair.prefix.feature_count == (
+        1 + 3 * len(PURE_AGGREGATE_SPECS) + 5 + len(ID_CODE_FEATURE_NAMES)
+    )
     assert pair.prefix.feature_names == pair.query.feature_names
     assert "duration_at_least_18_seconds" in pair.query.feature_names
     assert all("row_id" not in name for name in pair.query.feature_names)
@@ -325,40 +332,3 @@ def test_matrix_size_admission_is_exact_and_validated() -> None:
     assert estimated_matrix_bytes(1_000, 33) == 264_000
     with pytest.raises(PureFeatureError):
         estimated_matrix_bytes(0, 33)
-
-
-def test_identity_codes_do_not_depend_on_row_order() -> None:
-    """Codes must be a pure function of the value set, or exact replay breaks.
-
-    Assigning codes in first-appearance order made the features depend on how equal-timestamp rows
-    happened to be ordered, which the builder's permutation-invariance contract forbids.
-    """
-
-    forward = _inputs(times=(10, 20, 30, 40))
-    reversed_rows = CanonicalInputs(
-        user_id=tuple(reversed(forward.user_id)),
-        video_id=tuple(reversed(forward.video_id)),
-        date=tuple(reversed(forward.date)),
-        duration_ms=tuple(reversed(forward.duration_ms)),
-        tab=tuple(reversed(forward.tab)),
-        author_id=tuple(reversed(forward.author_id)),
-        time_ms=tuple(reversed(forward.time_ms)),
-    )
-
-    left = fit_code_vocabulary(forward)
-    right = fit_code_vocabulary(reversed_rows)
-
-    assert left == right
-    assert code_cardinalities(left) == code_cardinalities(right)
-
-
-def test_identity_cardinalities_reserve_one_unk_slot_per_field() -> None:
-    inputs = _inputs(times=(10, 20, 30, 40))
-
-    vocabularies = fit_code_vocabulary(inputs)
-    cardinalities = code_cardinalities(vocabularies)
-
-    # user, video, author, tab, duration_bucket -- each +1 for UNK.
-    assert len(cardinalities) == 5
-    assert cardinalities == tuple(len(vocabulary) + 1 for vocabulary in vocabularies)
-    assert cardinalities[0] == 3  # two distinct users plus UNK

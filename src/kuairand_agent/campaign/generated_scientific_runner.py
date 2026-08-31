@@ -621,6 +621,35 @@ class FoldBFusionSelectionEvidence:
             _manifest_digest(b"kuairand-fold-b-fusion-selection-v1\0", self.manifest()),
         )
 
+    def _point(self, weights: tuple[float, float]) -> FusionGridPointEvidence | None:
+        return next((point for point in self.points if point.weights == weights), None)
+
+    @property
+    def standalone_primary(self) -> float | None:
+        """The generated model's own primary, scored with the control weighted out.
+
+        This is the only number that measures the candidate rather than the blend.  The primary
+        that reaches selection, reflection and the report is the *selected* grid point, which is
+        frequently mostly or entirely the official FM control, so a candidate that is far worse
+        than the control still reports a score close to it.
+        """
+
+        point = self._point((1.0, 0.0))
+        return None if point is None else float(point.metrics.primary)
+
+    @property
+    def control_primary(self) -> float | None:
+        """The official FM control's own primary, i.e. the grid point that discards the model."""
+
+        point = self._point((0.0, 1.0))
+        return None if point is None else float(point.metrics.primary)
+
+    @property
+    def model_was_discarded(self) -> bool:
+        """True when selection kept none of the generated model's ordering."""
+
+        return self.selected_weights == (0.0, 1.0)
+
     def manifest(self) -> dict[str, object]:
         return {
             "schema_version": GENERATED_SCIENTIFIC_RUNNER_SCHEMA_VERSION,

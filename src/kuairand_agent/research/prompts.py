@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final
 
+from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.research.schemas import ResearchOperation
 from kuairand_agent.research.source_policy import (
@@ -62,11 +63,20 @@ candidate_primary is a real measurement:
   against a baseline that learns a per-identity embedding table. They lacked the capacity to
   reorder anything, which is the most likely reason the objective looked inert.
 
-What changed: the feature matrix now carries categorical identity codes for video, author, tab and
-duration bucket, listed in method card
+What changed: the feature matrix now carries categorical identity codes for user, video, author,
+tab and duration bucket, listed in method card
 controller_causal_feature_bundle.categorical_code_columns_csv. A candidate can now learn
 per-identity embeddings the way the baseline does, and combine them with the causal aggregate
 columns the baseline never sees. Capacity is no longer the constraint it was.
+
+The user code is new and it is the important one. Until now no user identity reached prediction
+time at all: user_groups is a training-only capability and the prediction request carries the
+feature matrix and nothing else, so no candidate could evaluate a user-conditioned term when it
+scored. That ruled out user-by-video and user-by-author crosses, which is where the baseline FM
+gets most of its ordering power, and it is the most likely reason every candidate so far has
+scored below the baseline standalone. Note the distinction the organizers measured: a user-side
+FIRST-ORDER term is worth exactly zero because it is constant within a user, but a user EMBEDDING
+crossed with an item embedding varies across that user's rows and can reorder them.
 
 Where the headroom is. These are all reachable from your interface and all worth covering; the
 campaign has few iterations, so prefer a direction the records show has not been measured yet
@@ -97,6 +107,60 @@ NOT reachable from your interface. Do not propose these, they cannot be implemen
   from the feature bundle. The only engagement signals granted are `is_click` and `is_like`, and
   only as strictly-past history aggregates.
 - Anything using the randomized exposure log. It is blocked by the field policy.
+
+How your score is actually computed, which changes what the campaign records mean. Your
+predictions are never scored alone. The controller rank-normalises them within each user, does the
+same to the official FM baseline's predictions, and scores five fixed blends of the two: 100/0,
+75/25, 50/50, 25/75 and 0/100, model first. The Fold B screen picks whichever blend scores highest
+and freezes that weight for every later fold and seed. `candidate_primary` in campaign_records is
+that BLEND's score, not your model's.
+
+Three consequences, and every one of them has already misled a previous iteration of this
+campaign:
+- A `candidate_primary` exactly equal to the official FM control means the 0/100 blend won, i.e.
+  the selector threw your model away entirely. That is the harshest possible verdict. It has
+  repeatedly been misread in these records as "flat" or "matched the baseline". It is neither.
+- A `candidate_primary` close to the baseline usually means the 25/75 blend won, so roughly three
+  quarters of that number is the baseline's ordering and not yours.
+- `candidate_standalone_primary` in campaign_records is the 100/0 point. That is the only field
+  that measures YOUR model. Read it first, and compare it to `fold_b_control_primary`.
+
+To date every generated candidate in this project has scored BELOW the official FM control
+standalone, by 0.003 to 0.010 primary, against a seed-to-seed sigma of 0.0008. The blend has been
+hiding that. Your target is to beat `fold_b_control_primary` at the 100/0 point. Fusion can then
+only add to a model that is already competitive; it cannot rescue one that is not.
+
+The scoring structure that closed most of that gap is MEASURED, not a suggestion. Every candidate
+that scored 0.003 to 0.010 below the control built one factorization-machine interaction over ALL
+feature columns, so 33 standardized continuous aggregates shared a latent space with the identity
+codes. The control crosses only its categorical fields. Restricting the interaction to the
+identity codes and keeping the causal aggregates as separate additive first-order terms scored
+0.5745 standalone against a control of 0.5754 — a deficit of about one sigma, down from four to
+twelve. Start from that structure. Two further measurements from the same run: pointwise logistic
+loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
+collapsed it to 0.5630, so do not replace the loss.
+
+The cheapest remaining way to cross the control is SEED ENSEMBLING, and its effect size on this
+exact benchmark is already measured. The five qualified seeds of the official FM score 0.6014695,
+0.6017609, 0.6010903, 0.6015031 and 0.6020371 on public validation; averaging all five scores
+0.6026034, which beats every individual seed including the luckiest. Seed-to-seed sigma is 0.0008
+and averaging removes most of it. That is a larger effect than any modelling change in this
+project's history, and it is available to you inside a single candidate:
+
+- Derive N child seeds deterministically from the `seed` argument you are given, so replay stays
+  byte exact. N = 5 is the measured point.
+- Train N copies of the SAME scorer on the SAME data and store every parameter set in the
+  checkpoint under indexed names.
+- In `predict_scores`, average the N members' scores.
+
+One constraint that will otherwise break this: `predict_scores` receives the feature matrix and
+the checkpoint and NOTHING ELSE. There is no `user_groups` at prediction time, so you cannot rank
+normalise within a user there. Average the raw scores or logits instead. That is valid here
+because every member shares one architecture, one standardisation and one training set, so their
+scales are directly comparable.
+
+This is a variance-reduction change, not a new architecture. Hold the scorer fixed and wrap it in
+a loop. It is a few extra lines, not a bigger model.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, and per-user AUC divides by that user's pair count, so an eligible pair
@@ -236,7 +300,7 @@ capability loading, checkpoint and prediction file I/O, and the command line. `t
 returns a dict of named finite NumPy arrays and `predict_scores` returns one finite array;
 the wrapper serializes both."""
 
-_WORKED_EXAMPLE: Final = """Worked example
+_WORKED_EXAMPLE_TEMPLATE: Final = """Worked example
 
 `candidate.py` is a protected runtime wrapper and must never be returned. The science lives in
 `model_impl.py`, whose four functions are the mutable interface: `validate_config`, `train_model`,
@@ -268,7 +332,7 @@ checkpoint validators are where branches are lost, not where score is won.
 The parent already provides four tested helpers. Call them; do not reimplement them.
 
 ```python
-codes = categorical_codes(features, 4)          # trailing identity columns, as int64
+codes = categorical_codes(features, $CODE_COUNT)          # trailing identity columns, as int64
 sizes = [embedding_table_size(code) for code in codes]   # per fold, never a constant
 tables = [rng.normal(0.0, 0.02, (size, rank)) for size in sizes]
 interaction = fm_interaction_scores(tables, codes)       # (N,) second-order FM term
@@ -315,6 +379,13 @@ Contrast, each of these is REJECTED:
 - Declaring `["train_model"]` after editing only its docstring. Docstrings are stripped first.
 - Declaring `["model_impl.py:train_model"]`. Qualified names never match; use the bare name.
 - Adding `sampling.py` with the new logic but never importing it. Unreachable code is invisible."""
+# Substituted rather than interpolated: this block contains dict literals, so an f-string would
+# have to escape them.  The count is derived because it has already drifted once: the identity
+# block went from four columns to five and this example kept saying four, which would have told a
+# candidate to slice off the trailing four and silently treat user_id_code as a magnitude.
+_WORKED_EXAMPLE: Final = _WORKED_EXAMPLE_TEMPLATE.replace(
+    "$CODE_COUNT", str(len(ID_CODE_FEATURE_NAMES))
+)
 
 
 _OPERATION: Final = {
@@ -554,10 +625,12 @@ def _runtime_contract_constraints() -> str:
             (
                 "- The trailing columns named in method card "
                 "controller_causal_feature_bundle.categorical_code_columns_csv are integer-valued "
-                "CATEGORICAL CODES, not magnitudes. They identify the video, author, tab and "
-                "duration bucket. Embed them (an embedding table or FM latent factors indexed by "
-                "the code); using them as continuous numbers is meaningless and will not rank. "
-                "Every other column is a genuine continuous feature."
+                "CATEGORICAL CODES, not magnitudes. There are "
+                f"{len(ID_CODE_FEATURE_NAMES)} of them "
+                f"({', '.join(ID_CODE_FEATURE_NAMES)}) and that card is authoritative; never "
+                "infer the count from an example. Embed them (an embedding table or FM latent "
+                "factors indexed by the code); using them as continuous numbers is meaningless "
+                "and will not rank. Every other column is a genuine continuous feature."
             ),
             (
                 "- Each fold fits its own code vocabulary, so table sizes differ per run. Size "

@@ -63,6 +63,9 @@ def test_pair_round_trip_is_byte_deterministic_and_float64_exact(tmp_path: Path)
     assert first.manifest_sha256 == second.manifest_sha256
     assert first.manifest() == second.manifest()
     assert first.npz_sha256 == "61fdf1ce3ca7add3d950670dec87ed8f1b0e45c4276ee9ebfe3dbd8be7ae8c6f"
+    # The manifest embeds ID_CODE_FEATURE_NAMES, so this golden moves whenever the declared code
+    # block changes.  The npz golden above does not, because these synthetic matrices carry none
+    # of those columns; a change to both would mean the array payload moved too.
     assert (
         first.manifest_sha256 == "c0c7e665b09ab48e769962a2d90263757491d94a6ae9970a7132760a8702d274"
     )

@@ -58,16 +58,17 @@ _STATIC_FEATURE_NAMES: Final = (
 # these carry the identity itself, so a candidate can learn a per-identity embedding the way the
 # organizer FM does instead of only reweighting summaries.
 #
-# ``user_id_code`` is included deliberately, and the argument for excluding it is worth recording
-# because it is half right.  A user-constant FIRST-ORDER term cannot reorder a within-user ranking,
-# which is the organizers' own measured result.  But the organizer baseline is an FM, and its
-# dominant term is the interaction <v_user, v_video>, which varies across a user's slate and does
-# reorder it.  Dropping the user code would therefore remove the ability to express the very
-# architecture a candidate is asked to beat.  The trusted ``user_groups`` vector is not a
-# substitute: the runtime contract directs candidates to use it for grouping "without treating it
-# as a feature", so it cannot legitimately index an embedding table.  Carrying the column is
-# permissive -- a candidate that does not want 26k embedding rows simply ignores it -- whereas
-# withholding it is a capability the candidate cannot opt into.
+# ``user_id`` leads the block.  It was previously omitted on the grounds that a user-constant term
+# cannot reorder a within-user ranking, and that candidates already hold user identity through the
+# trusted user_groups vector.  Both premises were too narrow.  The organizers measured that purely
+# user-side *first-order* terms contribute exactly zero; a user *embedding* is a second-order term,
+# and the user-by-video and user-by-author crosses it enables are where the organizer FM gets its
+# ordering power.  And user_groups is a training-only capability: the prediction request carries a
+# feature matrix and nothing else (candidate_api/runtime_contract.py prediction_request_fields), so
+# without this column a candidate cannot evaluate any user-conditioned term at prediction time.
+#
+# The four original codes remain the trailing four columns, so code that slices a fixed trailing
+# width is unaffected by this addition.
 ID_CODE_FEATURE_NAMES: Final = (
     "user_id_code",
     "video_id_code",

@@ -147,23 +147,63 @@ largest available opportunity.
 
 ### 3.3 Live autonomous campaigns
 
-Four live-provider campaigns completed end to end on 2026-08-30, all against
-`openai/gpt-5.6-sol` with a configured failover slot. Each terminated on `converged` under the
-frozen rule (epsilon 0.002, patience 3) with **zero manual interventions**, and each published a
-verified submission bundle.
+Nine live-provider campaigns ran on 2026-08-30 and 2026-08-31, all against `openai/gpt-5.6-sol`
+with a configured failover slot, each under the frozen rule (epsilon 0.002, patience 3) and each
+with **zero manual interventions**. Seven reached a terminal `COMPLETED` state; runs 13 and 15
+converged and then stranded in finalization on the latent defects described below.
 
-| Run | Iterations | Candidates that executed | Reached outer validation | Selected | Terminal reason | Cost |
+| Run | Iterations | Candidates that executed | Reached outer validation | Selected | Terminal state | Cost |
 |---|---:|---:|---:|---|---|---:|
 | `maki-overnight-09` | 3 | **3** | 2 | `official-fm-fallback-seed-4` | converged | $0.68 |
 | `maki-overnight-10` | 3 | 1 | 0 | `official-fm-fallback-seed-4` | converged | $1.82 |
 | `maki-overnight-11` | 3 | 0 | 0 | `official-fm-fallback-seed-4` | converged | $2.31 |
 | `maki-overnight-12` | 3 | 0 | 0 | `official-fm-fallback-seed-4` | converged | $1.93 |
+| `maki-overnight-13` | 3 | **3** | 3 | `candidate-01` (`promoted_unconfirmed`) | converged, **no bundle** | $2.21 |
+| `maki-overnight-14` | 3 | **3** | 3 | `official-fm-fallback-seed-4` | converged | $1.69 |
+| `maki-overnight-15` | 3 | **3** | 3 | `candidate-01` (`validation_improved`) | **stranded `FINALIZING`** | $1.44 |
+| `maki-overnight-16` | 3 | **3** | 0 | `official-fm-fallback-seed-4` | converged | $1.52 |
+| `maki-overnight-17` | 3 | **3** | 0 | `official-fm-fallback-seed-4` | converged | $1.58 |
 
-**No generated candidate has beaten the baseline, and the fallback shipped in every run.** All
-four published a byte-identical submission, SHA-256 `e12746ae…`, so the submitted artifact never
-regressed across the series.
+**No generated candidate has beaten the baseline by a material margin, and the fallback shipped in
+seven of nine runs.** Those seven published a byte-identical submission, SHA-256 `e12746ae…`, so
+the submitted artifact never regressed across the series.
 
-The best generated result remains run 09, measured on matched outer seeds 0/1/2:
+**Run 15 is the only campaign that produced an agent-generated submission** (SHA-256
+`c98d7cd6…`, `selection.status = validation_improved`, organizer checker rc=0). It is nonetheless
+**unusable**, for the same structural reason as run 13 — see §3.3c. Runs 16 and 17 are the only
+bundles whose recorded source digest matches the repository as submitted; every earlier bundle
+replays only at its own older commit (see the table in `README.md`).
+
+Runs 16 and 17 spent **zero** outer-validation queries: no candidate cleared the inner gate, so the
+rationed outer budget was never drawn on. That is the three-tier gate behaving as designed, not a
+failure.
+
+Runs 13 and 15 are the only promotions, and neither published a usable bundle. Run 13's candidate
+scored 0.6017118 against an incumbent of 0.6014403, a delta of +0.0002715 that does not clear ε, so
+the controller recorded it as `promoted_unconfirmed` on its own arithmetic (`selector.py:456`).
+Finalization then failed on a ledger-export identity check that had never executed before, and the
+bundle is permanently unrecoverable: finalization verifies the working tree still hashes to the
+digest recorded at campaign creation, so the only source that could finalize run 13 is the source
+containing the bug. Deleting the losing candidates' evidence would satisfy the old check and
+fabricate the audit trail. The scores survive in `runs/maki-overnight-13/production/`.
+
+**The same method was run three times, and the margin changed sign**, which is why none of the
+three is reported as an improvement:
+
+| Run | Candidate-01 outer mean | Delta vs incumbent | In sigma |
+|---|---:|---:|---:|
+| `maki-overnight-13` | 0.6017118 | +0.0002715 | +0.34σ |
+| `maki-overnight-14` | 0.6014124 | −0.0000278 | −0.03σ |
+| `maki-overnight-15` | 0.6017246 | +0.0002844 | +0.36σ |
+
+Mean delta across the three is **+0.00018** against ε = 0.002; with n = 3 the standard error of the
+mean is ±0.00046, so it is not distinguishable from zero. Run 13 was above the incumbent on both
+inner folds and all three outer seeds, which is exactly how a 0.34σ margin looks before it is
+replicated. Had run 13's number been reported as a win, run 14 would have contradicted it four
+hours later. See §3.3a: all three figures are fusion blends, so none
+is a measurement of the generated model in the first place.
+
+For reference, run 09's outer results on the same matched seeds 0/1/2:
 
 | Model | Outer primary (mean of seeds 0, 1, 2) | Delta vs incumbent |
 |---|---:|---:|
@@ -172,22 +212,218 @@ The best generated result remains run 09, measured on matched outer seeds 0/1/2:
 | `candidate-03` metric-matched pairwise FM | 0.6011940 | −0.0002462 |
 
 Both sit well inside the baseline's own 0.0008 seed-to-seed standard deviation and are therefore
-statistically indistinguishable from it, not improvements and not meaningful regressions.
+statistically indistinguishable from it, not improvements and not meaningful regressions. Like
+every outer figure in this section they are fusion blends rather than measurements of the generated
+model; §3.3a gives the standalone scores.
 
-**Execution rate, not modelling ambition, was the binding constraint.** Candidate implementations
-at or under roughly 260 lines executed 3 for 3 in run 09; of the eight written at over 580 lines in
+**Execution rate was the binding constraint, and it is now solved.** Candidate implementations at
+or under roughly 260 lines executed 3 for 3 in run 09; of the eight written at over 580 lines in
 runs 10 to 12, none executed. Nine post-baseline candidates failed in three classes: within-user
 pair-sampling index arithmetic (3), mixing an `(N,)` accumulator with an `(N, rank)` one inside
 hand-written factorization-machine interaction maths (3), and a non-scalar checkpoint entry read by
 the candidate's own `training_diagnostics` (2). One executed cleanly. All three classes are
 recorded per-iteration in each run's `production/candidate-control/*/stderr.log`.
 
-A separate observation, seen three times across runs 09 and 10: a generated candidate produced
-predictions that were *rank-identical* to the official FM within every scored user slate, giving
-bit-identical GAUC and nDCG@5. Run 10's `candidate-03` did this with 59,816 distinct prediction
-values across 61,315 rows, so it is not a degenerate or constant-score artifact. With a median
-slate of four impressions and only 63.7% of users GAUC-eligible, distinct models can and do induce
-the same within-user ordering.
+After tested helpers for those three classes were added to the candidate seed (`f66e364`), the
+last five campaigns executed **every candidate they produced**: 22/22, 21/21, 22/22, 15/15 and
+15/15 subprocess executions, zero failures, empty stderr throughout. Execution reliability is no
+longer the limiting factor; §3.3c is.
+
+#### Retracted: the "rank-identical to the official FM" observation
+
+An earlier version of this section reported that generated candidates were independently producing
+predictions rank-identical to the official FM within every scored slate, and offered it as a
+finding about the task's limited number of distinct orderings. **That was wrong, and the mistake is
+worth more than the claim was.**
+
+Candidate predictions are never scored alone. Each is rank-normalised within user and blended with
+the official FM control across the fixed five-point `FUSION_WEIGHT_GRID`; the Fold B screen selects
+the best-scoring blend and freezes that weight for Fold A and every outer seed. The recorded
+primary is the *blend's*. When the selector chooses `(0.0, 1.0)` it discards the generated model
+entirely and scores the FM control's own percentile vector, which makes identical metrics a
+certainty rather than a coincidence.
+
+The evidence is a digest, not an argument: `scored_prediction_digest` equals the byte-identical
+value `41629b9c856e1921…` in all four such occurrences (run 09 ×1, run 10 ×1, run 14 ×2) and never
+equals `raw_prediction_logical_digest`. The "59,816 distinct values" check had been run against the
+raw generated vector, which is not the vector that was scored.
+
+#### 3.3a What the candidates actually scored
+
+Reading the `(1.0, 0.0)` grid point recovers each candidate's own score. Reproduce with
+`python3 fusion_audit.py <run-id>`.
+
+| Run | candidate alone | official FM control alone | gap | in sigma |
+|---|---:|---:|---:|---:|
+| `maki-overnight-09` | 0.5671 / 0.5682 / 0.5684 | 0.5754240304231644 | −0.0070 to −0.0083 | −8.7σ to −10.4σ |
+| `maki-overnight-10` | 0.5654 | 0.5754240304231644 | −0.0100 | −12.6σ |
+| `maki-overnight-13` | 0.5713 / 0.5708 / 0.5720 | 0.5754240304231644 | −0.0034 to −0.0046 | −4.3σ to −5.8σ |
+| `maki-overnight-14` | 0.5704 / 0.5688 / 0.5703 | 0.5754240304231644 | −0.0050 to −0.0066 | −6.3σ to −8.3σ |
+| `maki-overnight-15` | 0.5713 / 0.5713 / 0.5707 | 0.5754240304231644 | −0.0041 to −0.0047 | −5.2σ to −5.9σ |
+| **`maki-overnight-16`** | **0.5745312 / 0.5745072** / 0.5630 | 0.5754240304231644 | **−0.00089 / −0.00092** | **−1.12σ / −1.15σ** |
+| `maki-overnight-17` | 0.5740230 / 0.5736019 / 0.5681 | 0.5754240304231644 | −0.0014 to −0.0074 | −1.75σ to −9.2σ |
+
+**No generated candidate this project has executed has scored above the official FM control
+standalone.** The outer figures of 0.6013 to 0.6017 reported above and in §3.2 are blends weighted
+75% to 100% toward the official FM, so they were never measuring our models. Any result in this
+document that describes a candidate as "matching" or "indistinguishable from" the baseline should
+be read with that in mind.
+
+**Run 16 closed most of the deficit, and the mechanism is the reportable part.** Every candidate up
+to that point built a single factorization-machine interaction over *all* feature columns, so 33
+standardized continuous aggregates shared a latent space with the identity codes. The organizer FM
+crosses only its categorical fields. Restricting the interaction to the identity codes, keeping the
+aggregates as additive first-order terms, and training under pointwise logistic loss moved the gap
+from −4σ…−12σ to **−1.12σ**. Two further measurements from the same run: the 0.5745 results came
+from pointwise logistic loss, and switching the identical scorer to a pairwise objective collapsed
+it to 0.5630 — consistent with the twelve-cell sweep in §3.2. **The loss function was not the
+lever; the interaction structure was.**
+
+#### 3.3c Three structural limits of the candidate seam, and two falsified hypotheses
+
+`prediction_request_fields` in `candidate_api/runtime_contract.py` carries the feature matrix and
+the checkpoint and nothing else. Three consequences follow, and each was measured rather than
+inferred:
+
+1. **No user identity at prediction time.** `user_groups` is a training-only capability, so a
+   candidate could not evaluate any user-conditioned term while scoring — ruling out the
+   user-by-video and user-by-author crosses that supply most of the baseline FM's ordering power.
+   Commit `4aa6a25` added `user_id_code` (bundle 37 → 38 columns, user vocabulary 26,211, 1.59% of
+   validation rows on the unknown slot). **This hypothesis is falsified:** run 15 stayed at −5.15σ.
+   The change was structurally correct and did not close the gap.
+2. **No within-user rank normalisation at prediction time**, for the same reason. This is why
+   run 17's internal five-member seed ensemble came out flat — 0.5740230 against run 16's
+   0.5745312, a 0.6σ difference that is inside noise. `ensemble_mode_probe.py` measures the cause
+   on the five qualified official FM seeds: averaging on raw scores is worth **+0.0000772** while
+   averaging on within-user rank percentiles is worth **+0.0005664**. **86% of the ensembling gain
+   is the rank normalisation**, and a candidate cannot perform it. **Second hypothesis falsified**,
+   with the mechanism identified rather than guessed at.
+3. **No early stopping on the scored split.** `baselines/starter_fm.py:701-708` keeps the epoch
+   scoring best *on the split it is then reported on*, over up to 40 epochs. The published 0.6016
+   has the same property (`baseline.py:88`, `if va['primary'] > best`). Our candidate never sees
+   that split and gets one shot, so the residual ~1σ is measured against a reference holding an
+   advantage the seam denies it.
+
+The agent-side levers are therefore exhausted, and the reason is demonstrated rather than assumed.
+None of the three is reachable by changing the briefing.
+
+A fourth cause was informational rather than structural: **the agent was never told fusion
+existed.** `prompts.py` did not contain the word, and the primary returned to reflection was the
+blend's. Run 14 iteration-03 recorded in its own method attribution that recency weighting
+*"successfully measured 0.5754240304, matching official_fm_fold_B"* and excluded the direction on
+that basis, when its model had in fact been discarded. Commit `8124607` exposes
+`candidate_standalone_primary` and `fold_b_control_primary` in `campaign_records`. The effect is
+visible in the next run's reasoning: run 15 iteration-03 instead wrote that its parent *"scores
+0.5713044 standalone against the 0.575424 Fold B control"* — a measured before-and-after on the
+agent's own reasoning, produced by one fix.
+
+#### A confounder in the run series: run 11 failed over mid-campaign
+
+Reconstructed from every `production/provider-attempt-journal/*.json` across all seventeen runs.
+The model actually called, per run:
+
+| Runs | Model | Calls |
+|---|---|---:|
+| 01–07 | `deepseek/deepseek-v4-pro-0813` | 53 |
+| 09, 10, 12–17 | `openai/gpt-5.6-sol` | 77 |
+| **11** | **`openai/gpt-5.6-sol` ×9 and `openai/gpt-5.6-terra` ×2** | 11 |
+
+141 attempts in total, matching the accounting in §4. **Run 11 is the only campaign that crossed the
+failover boundary**, and the provider chain is sticky by design, so two of its operations were
+served by a different model than the other nine. Run 11 is also one of the campaigns in which
+**zero of three candidates executed**.
+
+We are not claiming the failover caused that; run 12 executed zero of three without any failover,
+and §3.3a identifies implementation size as the variable that actually tracked execution. But a
+mid-campaign model switch is a silent change of experimental conditions, and run 11 should be read
+as a confounded observation rather than a clean one. It is recorded here because it was found by
+sweeping every journal in the series rather than the run under investigation, and because nothing
+in the campaign record flags it at the point of use.
+
+#### Three latent defects on the promotion path, each found only when the agent succeeded
+
+The promotion path — what happens when a generated candidate actually wins — went unexecuted for
+twelve campaigns, because every earlier run either shipped the fallback or failed before reaching
+it. Each time it did run, it exposed a defect that had been latent since it was written.
+
+1. **Run 13, ledger export.** Attributed every retained run to the *selected* candidate's source
+   and config digest; run 13 held seven runs across three distinct source digests. Fixed in
+   `e758693`. The bundle is permanently unrecoverable: finalization verifies the working tree still
+   hashes to the digest recorded at campaign creation, so the only source that could finalize run
+   13 is the source containing the bug.
+2. **Run 15, float32 versus float64 primary.** `_derive_bundle_status` compared the declared
+   representative primary against the matched-seed row using `abs_tol=1e-15` — exact float
+   equality. The two values were `0.6016490459442139` and `0.6016490757465363`, **2.98e-8 apart, a
+   single float32 ulp**. GAUC and nDCG@5 matched bit for bit; only the derived mean differed,
+   because the organizer evaluator is float32-sensitive
+   (`scoring/protected.py`, `score_with_encoded_labels`) while the reconstruction recomputes in
+   float64. The codebase already absorbed this artifact 160 lines earlier — `_manifest_metrics`
+   checks the same property with `abs_tol=2e-7` — so two checks on one quantity disagreed about
+   tolerance and the stricter one had never been reached. Fixed in `8978b4b` with a named tolerance
+   applied at that one site and to `primary` only; GAUC and nDCG@5 still compare exactly, which is
+   what proves the difference is confined to the derived mean.
+3. **Run 15's bundle is unusable at every commit.** `replay_final_bundle` calls
+   `_verify_closed_bundle` *before* the current-source check. At HEAD the bundle check now passes
+   and the source check fails; at run 15's own commit `8124607` the float32 defect is still present
+   and the bundle check fails. Both doors are shut, exactly as for run 13.
+
+The pattern is the reportable part: **a code path that executes only on success accumulates
+defects invisibly.** Ours produced three, each surfacing the first time its branch ran, over three
+separate campaigns. Every one was found by reading the whole run rather than the failing traceback.
+
+#### 3.3b Seed-ensemble headroom in the baseline itself
+
+Measured offline from artifacts already in `runs/maki-qualification`; no training, no campaign, no
+provider calls. Reproduce with `python3 seed_ensemble_probe.py`.
+
+| Model | Public validation primary | vs organizer 0.6016 |
+|---|---:|---:|
+| FM seed 0 / 1 / 2 / 3 / 4 | 0.6014695 / 0.6017609 / 0.6010903 / 0.6015031 / 0.6020371 | — |
+| mean of the five single-seed scores | 0.6015722 | −0.0000278 |
+| five-seed **raw score** mean | 0.6021143 | +0.0005143 |
+| **five-seed within-user rank ensemble** | **0.6026034355** | **+0.0010034** |
+
+The ensemble beats every individual seed including the luckiest, and beats the organizer baseline
+by +0.0010. It uses all five seeds, so unlike a best-of-N result it carries no selection effect,
+and the gain is a systematic variance reduction rather than a favourable draw.
+
+The raw-score row is not filler: it is the operation a *candidate* is limited to (§3.3c), and the
+gap between the two rows — **+0.0004891, or 0.61σ** — is the part of the gain that requires
+within-user rank normalisation. Reproduce with `python3 ensemble_mode_probe.py`.
+
+**This is a shipped artifact, not only a measurement.** `build_ensemble_submission.py` regenerates
+it end to end in roughly twelve minutes:
+
+```sh
+python3 build_ensemble_submission.py            # writes ensemble-submission/{submission.csv,provenance.json}
+cd kuairand-starter-kit && python submit.py ../ensemble-submission/submission.csv \
+    --data_dir ../.data/KuaiRand-Pure/data --split test --check      # returns 0
+```
+
+It performs **no new training**. Every member is an already-qualified organizer FM run from
+`runs/maki-qualification`; each checkpoint is verified against the digest recorded at qualification,
+the shared encoding is verified across all five rather than assumed, and inference runs through the
+hash-pinned organizer source rather than a reimplementation. The validation primary reproduced
+**exactly** through two independent code paths — the saved `validation-predictions.npy` files and
+the pinned organizer source. Organizer checker: `rc=0`, 170,588 rows.
+
+Two caveats stated plainly, and repeated in `ensemble-submission/provenance.json` so they travel
+with the artifact. It is **below our own materiality threshold of ε = 0.002**, so it is not a
+material improvement. And it is a **controller-side ensemble of the organizers' own baseline with
+itself — not an agent-generated result.**
+
+Related: the shipped `official-fm-fallback-seed-4` was chosen as `best.seed` over the five
+(`qualification.py:1080`), so its 0.6020371 is a best-of-five estimate selected on the split it is
+reported on. That is the same selection effect this document criticises in §3.2, and it should be
+read as such rather than as a clean margin over the baseline.
+
+A replay recipe and backend for shipping this ensemble through finalization
+(`OfficialFMSeedEnsembleReplayRecipe`, `OfficialFMSeedEnsembleReplayBackend`) are wired into the
+parser and the backend factory and covered by tests, but **no finalization path produces one yet.**
+Completing that route requires teaching the bundle status check about ensemble provenance without
+weakening its forgery resistance: the baseline branch of `_derive_bundle_status` pins the summary
+to exactly `{"seeds": [4], "representative_seed": 4, …}`. Declaring `seeds: [4]` for a five-model
+ensemble would have been the cheap way through and would have fabricated the audit trail.
 
 ### 3.4 Independent qualification on a second platform
 
@@ -277,7 +513,27 @@ each run's `production/provider-attempt-journal/`. Reasoning tokens are billed a
 | `maki-overnight-10` | 9 | 116,097 | 70,792 | 186,889 | $1.82 |
 | `maki-overnight-11` | 11 | 149,934 | 88,222 | 238,156 | $2.31 |
 | `maki-overnight-12` | 10 | 135,560 | 72,551 | 208,111 | $1.93 |
-| **Total** | **92** | **1,087,621** | **877,678** | **1,965,299** | **$20.84** |
+| `maki-overnight-13` | 12 | 195,915 | 75,419 | 271,334 | $2.21 |
+| `maki-overnight-14` | 10 | 142,624 | 59,611 | 202,235 | $1.69 |
+| `maki-overnight-15` | 9 | 132,596 | 49,480 | 182,076 | $1.44 |
+| `maki-overnight-16` | 9 | 129,277 | 54,140 | 183,417 | $1.52 |
+| `maki-overnight-17` | 9 | 135,948 | 56,565 | 192,513 | $1.58 |
+| **Total** | **141** | **1,823,981** | **1,172,893** | **2,996,874** | **$29.27** |
+
+Of the 1,172,893 output tokens, **854,988 are reasoning tokens** — 73% of all output. That is the
+price of leaving reasoning enabled, which is not optional here: with thinking disabled the model
+stopped writing code and returned 18-character stubs, with `import numpy as np` written into
+`config.json`. It is also why `max_output_tokens` is 65536 and the request timeout is 600 seconds.
+
+Regenerate this table with `python3 token_accounting.py`, which recomputes every figure from the
+journals. Two counting notes so the two reconcile: the **Calls** column counts every attempt,
+while the tool counts only the 130 that returned a usage block — 11 attempts errored before
+returning one, and contribute zero tokens either way. And the tool deliberately does not compute
+spend: the cost column comes from the frozen pricing block in `configs/`, not from the provider's
+self-reported upstream cost, so it stays reproducible rather than dependent on a rate card that
+can change. Per-run spend is read from each bundle's `report.md`
+(`estimated API cost USD=`); the reconstruction reproduces the previously published $20.83 through
+run 12 and $24.73 through run 14 exactly.
 
 Runs 02 and 08 made calls that returned no usage and are counted at zero. Runs 01 to 08 predate
 the survivability fixes and produced only truncated candidate stubs; their spend is included
@@ -306,8 +562,20 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 | `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
 | `maki-overnight-09` | 0 | Converged with no human action after launch. |
 | `maki-overnight-10` | 0 | Converged with no human action after launch. |
-| `maki-overnight-11` | 0 | Converged with no human action after launch. |
+| `maki-overnight-11` | 0 | Converged with no human action after launch. Its provider chain failed over mid-campaign, which is an automatic recovery rather than an intervention; see §3.3. |
 | `maki-overnight-12` | 0 | Converged with no human action after launch. |
+| `maki-overnight-13` | 0 | Converged with no human action after launch. Finalization then failed on a latent defect, which is a software fault and not a human action; no human altered the campaign. |
+| `maki-overnight-14` | 0 | Converged with no human action after launch. |
+| `maki-overnight-15` | 0 | 22/22 executions, promoted a candidate, then stranded at `FINALIZING` on the float32 defect below. Again a software fault, not an intervention. |
+| `maki-overnight-16` | 0 | 15/15 executions, `COMPLETED`, empty stderr throughout. |
+| `maki-overnight-17` | 0 | 15/15 executions, `COMPLETED`, empty stderr throughout. |
+
+**Zero manual interventions across all seventeen campaigns**, including the six that were killed
+mid-flight before the survivability work landed. Runs 01, 04, 05, 07 and 08 still read `RUNNING` in
+their campaign databases: that field is written at launch and only overwritten at a terminal state,
+so a killed process leaves it stale. No process survives; `pgrep` finds none. Those directories are
+retained because their provider journals are the source of roughly a third of the token accounting
+above.
 
 ## 5. Evaluation integrity
 
@@ -341,18 +609,24 @@ the mechanisms are testable rather than promised.
 
 Stated plainly, because the gap matters more than the architecture:
 
-1. **No improvement over the baseline has been demonstrated.** Four live campaigns converged and
-   every one selected the official-FM fallback. The best generated candidate reached outer primary
-   0.6012030 against an incumbent of 0.6014403, inside the baseline's own 0.0008 seed-to-seed
-   standard deviation. We have not shown a validation-primary delta above ε = 0.002, and the
-   pairwise direction was additionally swept to convergence over twelve configurations without
-   beating the baseline in any of them (§3.2).
-2. **Candidate execution, not modelling, is the current bottleneck.** Across runs 10 to 12 only one
-   of nine generated candidates executed at all; the rest raised before evaluation. Three failure
-   classes are catalogued in §3.3. A crash inside `train_model` currently ends a branch outright:
-   the repair loop covers pre-execution static gates only, so runtime defects get no fix attempt.
-   That is the clearest known structural gap in the loop.
-3. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
+1. **No agent-generated improvement over the baseline has been demonstrated.** The best generated
+   candidate scored alone reaches 0.5745312 against a control of 0.5754240, still −1.12σ. Its best
+   fused outer figure, 0.6017246 against an incumbent of 0.6014403, is +0.36σ and was replicated to
+   +0.34σ, −0.03σ, +0.36σ across three runs — mean +0.00018 against ε = 0.002. The pairwise
+   direction was additionally swept to convergence over twelve configurations without beating the
+   baseline in any of them (§3.2).
+2. **The +0.0010 submission is not an agent result.** It is a controller-side five-seed ensemble of
+   the organizers' own FM with itself (§3.3b). It is real, reproducible and organizer-validated,
+   and it is still below ε = 0.002. It must never be described as the agent beating the baseline.
+3. **The candidate seam capped what was achievable, in three measured ways** (§3.3c): no user
+   identity and no `user_groups` at prediction time, and no early stopping on the scored split
+   which the baseline itself receives. Two of our own hypotheses for closing the gap were falsified
+   by measurement rather than abandoned.
+4. **A crash inside `train_model` still ends a branch outright.** The repair loop covers
+   pre-execution static gates only, so runtime defects get no fix attempt. With execution now at
+   3-of-3 for five consecutive campaigns this is no longer the binding constraint, but it remains
+   the clearest structural gap in the loop.
+5. **Hidden-test performance is unknown and unclaimed.** It is measured once, by the organizers.
 
 ### 6.4 Bit-exact replay is platform-bound
 
