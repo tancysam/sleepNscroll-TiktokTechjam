@@ -210,6 +210,25 @@ on a `.reshape(())` value. Second, factorization machine scoring must keep its s
 summing an `(N, k)` embedding block against an `(N,)` vector raises a broadcast error. Keep every
 per row term `(N,)` and every latent term `(N, k)`, and reduce with an explicit `axis=1`.
 
+Mini batch mechanics, since moving off full batch introduces exactly two new ways to fail. First,
+do not allocate a full gradient buffer inside the step loop. A previous candidate wrote
+`grad = np.zeros_like(table)` once per table per step, which is free at twenty full batch steps and
+is about 28,000 allocations of several megabytes at 5,570 mini batch steps across five tables,
+against a wall clock timeout on your training subprocess. Allocate outside the loop and zero only
+what the batch touched, or accumulate into a preallocated buffer, and keep the sparse scatter for
+the embedding gradient. Second, the final batch of an epoch is ragged: 1,141,112 rows at batch 8192
+leaves a last slice of 4,216, so any array you size to the batch size rather than to the length of
+the slice you actually took will raise on the last iteration of every epoch. Size every per batch
+array from the slice itself.
+
+Two things that look like improvements here and are not. Reshuffle every epoch rather than once
+before the loop, which is what the control does; permuting the index array costs about ten
+milliseconds against a hundred and forty batches of arithmetic, and shuffling once correlates the
+gradient sequence across epochs. And a separate learning rate for the continuous aggregate columns
+is unnecessary under Adam, whose per parameter second moment already equalises dense continuous
+features against sparsely updated embedding rows; that adjustment only matters under a fixed step
+optimiser.
+
 Vectorised within-user negative sampling, which has now crashed two candidates. Both wrote the
 statistics correctly and then indexed the flattened negative array wrongly, raising IndexError
 inside train_model and losing the whole iteration. If you group rows by user, you must keep three
