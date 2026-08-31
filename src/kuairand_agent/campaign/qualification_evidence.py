@@ -492,8 +492,13 @@ def _canonical_split_identities(
         "protected_scorer_only"
     ):
         raise QualificationEvidenceError("qualification train/validation target policy changed")
+    # ``CanonicalFinalSplit`` is structurally incapable of carrying targets and therefore omits
+    # both target-shaped keys from its current manifest.  Accept missing/``None`` and the exact
+    # legacy ``"none"`` sentinel retained by older sound qualification receipts.  Every other
+    # access claim and every non-null digest still fails closed.
+    final_target_access = final.get("target_access")
     if (
-        final.get("target_access") != "none"
+        (final_target_access is not None and final_target_access != "none")
         or final.get("target_digest") is not None
         or _require_positive_int(final.get("row_count"), "final split row count")
         != expectations.final_row_count

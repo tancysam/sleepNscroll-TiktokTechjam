@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -26,6 +27,14 @@ from kuairand_agent.contract import (
     DATASET_ARCHIVE_MD5,
     DATASET_ARCHIVE_SHA256,
     STARTER_FILE_SHA256,
+    SplitName,
+)
+from kuairand_agent.data.canonical import (
+    OUTCOME_FIELDS,
+    CanonicalAlignment,
+    CanonicalFinalSplit,
+    CanonicalInputs,
+    OutcomeAccessTrace,
 )
 
 _STARTER = "1" * 64
@@ -93,6 +102,34 @@ def _published_fm_metrics() -> dict[str, float]:
     raise AssertionError("frozen contract omitted official FM")
 
 
+def _canonical_final_manifest() -> dict[str, object]:
+    inputs = CanonicalInputs(
+        user_id=("final-user-0", "final-user-1", "final-user-2"),
+        video_id=("final-video-0", "final-video-1", "final-video-2"),
+        date=(20220429, 20220429, 20220429),
+        duration_ms=(1_000.0, 2_000.0, 3_000.0),
+        tab=("0", "1", "2"),
+        author_id=("author-0", "author-1", "author-2"),
+        time_ms=(1, 2, 3),
+    )
+    return CanonicalFinalSplit(
+        name=SplitName.TEST,
+        inputs=inputs,
+        alignment=CanonicalAlignment(
+            split=SplitName.TEST,
+            row_id=(0, 1, 2),
+            user_id=inputs.user_id,
+            video_id=inputs.video_id,
+        ),
+        outcome_trace=OutcomeAccessTrace(
+            split=SplitName.TEST,
+            row_count=3,
+            parsed_fields=(),
+            skipped_fields=OUTCOME_FIELDS,
+        ),
+    ).manifest()
+
+
 def _snapshot() -> dict[str, object]:
     splits = [
         {
@@ -111,18 +148,7 @@ def _snapshot() -> dict[str, object]:
             "target_digest": _VALID_TARGETS,
             "outcome_access": {"parsed_cell_count": 4, "skipped_values_recorded": False},
         },
-        {
-            "name": "test",
-            "row_count": _FINAL_ROWS,
-            "inputs_digest": "a" * 64,
-            "target_access": "none",
-            "target_digest": None,
-            "outcome_access": {
-                "parsed_cell_count": 0,
-                "skipped_cell_count": 33,
-                "skipped_values_recorded": False,
-            },
-        },
+        _canonical_final_manifest(),
     ]
     final_trace = {
         "row_count": _FINAL_ROWS,
@@ -453,6 +479,115 @@ def _resign_root_artifact_index(root: Path) -> None:
         if path.is_file() and path != root / "manifest.json"
     ]
     _write_json(root / "manifest.json", _signed(body))
+
+
+def _rewrite_snapshots(
+    root: Path,
+    transform: Callable[[dict[str, object]], None],
+) -> None:
+    snapshot_path = root / "verification" / "snapshot-first.json"
+    snapshot = cast(dict[str, object], json.loads(snapshot_path.read_text(encoding="ascii")))
+    transform(snapshot)
+    _write_json(snapshot_path, snapshot)
+    _write_json(root / "verification" / "snapshot-second.json", snapshot)
+    manifest = cast(dict[str, object], json.loads((root / "manifest.json").read_text()))
+    manifest["qualification_input_digest"] = _digest(snapshot)
+    _write_json(root / "manifest.json", manifest)
+    _resign_root_artifact_index(root)
+
+
+def _final_snapshot_split(snapshot: dict[str, object]) -> dict[str, object]:
+    canonical = cast(dict[str, object], snapshot["canonical_manifest"])
+    splits = cast(list[object], canonical["splits"])
+    matches = [
+        cast(dict[str, object], item)
+        for item in splits
+        if isinstance(item, dict) and item.get("name") == "test"
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_accepts_real_canonical_final_split_without_target_shape(tmp_path: Path) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+    snapshot = cast(
+        dict[str, object],
+        json.loads((root / "verification" / "snapshot-first.json").read_text()),
+    )
+    final = _final_snapshot_split(snapshot)
+
+    assert "target_access" not in final
+    assert "target_digest" not in final
+    load_official_fm_qualification(root, expectations=_expectations())
+
+
+def test_accepts_explicit_null_final_target_shape(tmp_path: Path) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+
+    def add_null_target_shape(snapshot: dict[str, object]) -> None:
+        final = _final_snapshot_split(snapshot)
+        final["target_access"] = None
+        final["target_digest"] = None
+
+    _rewrite_snapshots(root, add_null_target_shape)
+
+    load_official_fm_qualification(root, expectations=_expectations())
+
+
+def test_accepts_legacy_none_final_target_access(tmp_path: Path) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+
+    def add_legacy_target_sentinel(snapshot: dict[str, object]) -> None:
+        final = _final_snapshot_split(snapshot)
+        final["target_access"] = "none"
+        final["target_digest"] = None
+
+    _rewrite_snapshots(root, add_legacy_target_sentinel)
+
+    load_official_fm_qualification(root, expectations=_expectations())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("target_access", "training"),
+        ("target_access", "protected_scorer_only"),
+        ("target_access", "NONE"),
+        ("target_access", []),
+        ("target_access", {}),
+        ("target_access", False),
+        ("target_access", 0),
+        ("target_digest", "f" * 64),
+    ),
+)
+def test_rejects_non_null_final_target_shape(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+
+    def add_target_claim(snapshot: dict[str, object]) -> None:
+        _final_snapshot_split(snapshot)[field] = value
+
+    _rewrite_snapshots(root, add_target_claim)
+
+    with pytest.raises(QualificationEvidenceError, match="final split exposed target capability"):
+        load_official_fm_qualification(root, expectations=_expectations())
+
+
+def test_rejects_parsed_final_outcomes_with_target_free_shape(tmp_path: Path) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+
+    def add_parsed_final_outcome(snapshot: dict[str, object]) -> None:
+        final = _final_snapshot_split(snapshot)
+        outcome = cast(dict[str, object], final["outcome_access"])
+        outcome["parsed_cell_count"] = 1
+
+    _rewrite_snapshots(root, add_parsed_final_outcome)
+
+    with pytest.raises(QualificationEvidenceError, match="final outcomes were materialized"):
+        load_official_fm_qualification(root, expectations=_expectations())
 
 
 def test_loads_exact_matching_seed_public_evidence_and_fallback(tmp_path: Path) -> None:
