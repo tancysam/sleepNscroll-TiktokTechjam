@@ -141,6 +141,49 @@ twelve. Start from that structure. Two further measurements from the same run: p
 loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
 collapsed it to 0.5630, so do not replace the loss.
 
+THIS CAMPAIGN IS A POSITIVE CONTROL. Your entire task is to reproduce the official FM control
+EXACTLY, using its field set and nothing else, and to report how close you get. You are not being
+asked to improve on it. Read the whole of this paragraph before proposing anything.
+
+Why. Roughly thirty generated candidates across nine campaigns have now been scored. The best is
+0.5745 standalone against the 0.5754240304 control, and NOTHING has ever exceeded it. Every single
+addition tried has made the score worse: seed ensembling 0.5740, frequency-aware regularisation
+0.5681, a pairwise objective 0.5630, metric-matched row weighting 0.5575, an exponential moving
+average 0.5555. A previous campaign also matched the control's optimiser exactly, taking about
+5,570 mini-batch Adam updates instead of about 20 full-batch ones, and reached only 0.5735, WORSE
+than the cruder loop. The direction of that evidence is unambiguous: this scorer is saturated and
+extra machinery only injects variance. So do not add machinery. Subtract it.
+
+What to build, exactly:
+- Use ONLY the five identity code columns. DROP every continuous causal aggregate column. The codes
+  are the TRAILING five columns of the feature matrix: compute `cont_dim = features.shape[1] - 5`
+  and take `features[:, cont_dim:]`. Slicing the LEADING five columns would keep aggregates and
+  discard every identity field, which is the exact inverse of this experiment.
+- One packed embedding table over all five codes with per-field offsets, rank 16, initialised
+  `rng.normal(0.0, 0.01, (total_rows, 16))` in float32. Float64 is a deviation from the control,
+  not an improvement on it.
+- Pointwise logistic loss, L2 1e-6 folded INTO the gradient before the Adam step, exactly as the
+  control does rather than decoupled.
+- Mini-batch Adam, batch 8192, learning rate 0.001, betas 0.9 and 0.999, epsilon 1e-8, at most 40
+  epochs, early stopping patience 4. ONE `numpy.random.default_rng(seed)` created before the epoch
+  loop, used for the initialisation and for a fresh permutation each epoch.
+- Clip the sigmoid ARGUMENT at plus or minus 30, which is what the control does. Do not clip at a
+  tighter bound.
+- Iterate `range(0, n, batch)` and keep the ragged final batch; 1,141,112 rows at batch 8192 leaves
+  a final slice of 4,216. Do not drop it, and size every per batch array from the slice length.
+
+What NOT to build, because each is already measured as a loss: no exponential moving average, no
+metric-matched row weighting, no warmup, no decoupled weight decay, no frequency-aware
+regularisation, no learning-rate schedule, no multi-seed averaging inside the candidate, and no
+extra features. If you find yourself adding a component, you have misread this instruction.
+
+Report the standalone number honestly. Reaching about 0.5754 means the aggregate columns were the
+cost. Landing near 0.5745 means the residual is the control's own advantage of keeping its best of
+forty epochs measured on the split it is then scored on, which you are denied. Both are valuable
+results and neither is a failure.
+
+The paragraph that follows is retained for context and is NOT your task this campaign.
+
 THE REMAINING GAP IS OPTIMISATION, NOT MODELLING, AND IT IS THE FIRST THING TO FIX. The control
 trains with MINI-BATCH ADAM: batch size 8192, up to 40 epochs, the row order reshuffled every epoch
 from a seeded generator, Adam moments with bias correction, and early stopping with patience 4. On
