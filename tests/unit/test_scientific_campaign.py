@@ -305,12 +305,47 @@ def test_callback_failure_is_charged_but_cannot_displace_replayable_fallback() -
 
     assert result.candidates[0].outcome is CandidateOutcome.CALLBACK_FAILED
     assert result.candidates[0].runs == ()
+    # The reason must carry the exception MESSAGE, not only its class name. It becomes
+    # campaign_records[].candidate_reason, the only account of the crash the research model ever
+    # sees, and a campaign once spent all six of its iterations guessing at a defect it had been
+    # told nothing about beyond the bare string "CandidateExecutionError".
+    assert result.candidates[0].reason == (
+        "callback_failed:RuntimeError: ordinary isolated candidate failure"
+    )
     assert result.incumbent == result.fallback == _fallback()
     assert result.launches_used == 7
     assert result.convergence.completed_iterations == 1
     # Rejected: no eligible outer primary, so it is unmeasured rather than non-material.
     assert result.convergence.non_material_streak == 0
     assert result.convergence.unmeasured_streak == 1
+
+
+def test_callback_failure_reason_is_bounded_and_survives_an_empty_message() -> None:
+    def noisy(_: ScientificRunRequest) -> ScientificRunEvidence:
+        raise RuntimeError("x" * 10_000)
+
+    loud = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate("broken"),),
+        runner=noisy,
+        outer_ledger=_Ledger(),
+    )
+    reason = loud.candidates[0].reason
+    assert reason.startswith("callback_failed:RuntimeError: xxx")
+    assert len(reason) <= len("callback_failed:") + 4_000
+
+    def silent(_: ScientificRunRequest) -> ScientificRunEvidence:
+        raise RuntimeError
+
+    quiet = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate("broken"),),
+        runner=silent,
+        outer_ledger=_Ledger(),
+    )
+    assert quiet.candidates[0].reason == "callback_failed:RuntimeError"
 
 
 def test_three_rejected_screens_do_not_stop_a_fourth_candidate() -> None:

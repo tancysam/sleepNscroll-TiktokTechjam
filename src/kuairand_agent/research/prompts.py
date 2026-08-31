@@ -234,13 +234,23 @@ on a `.reshape(())` value. Second, factorization machine scoring must keep its s
 summing an `(N, k)` embedding block against an `(N,)` vector raises a broadcast error. Keep every
 per row term `(N,)` and every latent term `(N, k)`, and reduce with an explicit `axis=1`.
 
-Mini batch mechanics, since moving off full batch introduces exactly two new ways to fail. First,
-do not allocate a full gradient buffer inside the step loop. A previous candidate wrote
-`grad = np.zeros_like(table)` once per table per step, which is free at twenty full batch steps and
-is about 28,000 allocations of several megabytes at 5,570 mini batch steps across five tables,
-against a wall clock timeout on your training subprocess. Allocate outside the loop and zero only
-what the batch touched, or accumulate into a preallocated buffer, and keep the sparse scatter for
-the embedding gradient. Second, the final batch of an epoch is ragged: 1,141,112 rows at batch 8192
+Mini batch mechanics. WRITE THE CONTROL'S LOOP, DO NOT INVENT ONE. Every candidate in the previous
+campaign crashed before evaluation, six for six, while trying to build a clever sparse update. The
+control's inner step is about fifteen lines and is known to work on exactly this data in roughly
+forty seconds, so mirror its shape: allocate a FULL SIZE zero gradient buffer for the table on
+every step, scatter the batch's contribution into it with `np.add.at`, fold L2 into that gradient,
+then apply Adam to the WHOLE array. Reallocating a full size zero buffer each step is what the
+control does and it is fast enough; do not optimise it away. In particular do NOT extract unique
+row indices. `np.unique` over a two dimensional code array returns flat indices, and using them to
+index Adam moment arrays shaped like the table is the single most common way this has crashed. The
+shape safe whole array update is both correct and sufficient.
+
+Run one batch before you run the loop. Take the first slice, do one forward pass and one backward
+pass, and assert every shape you depend on. A failure there is cheap, deterministic and reported
+with its message, where a failure on epoch nineteen costs the whole iteration.
+
+Two further ways the transition fails. First, the final batch of an epoch is ragged:
+1,141,112 rows at batch 8192
 leaves a last slice of 4,216, so any array you size to the batch size rather than to the length of
 the slice you actually took will raise on the last iteration of every epoch. Size every per batch
 array from the slice itself. Third, clip your gradients before the parameter update, for example

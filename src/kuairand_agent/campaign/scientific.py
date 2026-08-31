@@ -41,6 +41,9 @@ MIN_FINALIZATION_RESERVE_SECONDS: Final = 600
 DEFAULT_FINALIZATION_RESERVE_SECONDS: Final = 3_600
 MATCHED_SEEDS: Final = (0, 1, 2)
 SAFE_REPORTING_PRECISION: Final = 4
+# The executor caps its own failure diagnostic at 4096 characters; this bounds what a candidate
+# controlled exception message can add to a campaign record even if that ever changes.
+_MAX_CALLBACK_REASON_CHARS: Final = 4_000
 FOLD_DATES: Final = {
     "A": (20220408, 20220415, 20220416, 20220418),
     "B": (20220408, 20220418, 20220419, 20220421),
@@ -923,7 +926,15 @@ def _invoke_runner(
     except ScientificCampaignCancelled:
         raise
     except Exception as exc:
-        return None, type(exc).__name__
+        # Keep the message, not only the class name.  The executor already builds a bounded
+        # diagnostic naming the failing operation and the underlying exception, and this reason
+        # reaches the research model as campaign_records[].candidate_reason.  Returning only
+        # type(exc).__name__ meant a model asked to repair a crash was told only the class name;
+        # a whole campaign then burned all six of its iterations guessing at a defect it had
+        # never been shown.
+        detail = str(exc).strip()
+        reason = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+        return None, reason[:_MAX_CALLBACK_REASON_CHARS]
     return evidence, None
 
 
