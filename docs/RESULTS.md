@@ -47,6 +47,41 @@ misread — **the ceiling is 0.8645, not 1.0.**
 FM seed-to-seed standard deviation is **0.0008**, which is what makes ε = 0.002 (≈2.5σ) the
 organizers' convergence threshold.
 
+## 2a. Which task this project optimizes, and why
+
+The supplied material carries **two incompatible benchmark definitions**: `click` with
+NDCG@10/Recall@50, and `long_view` with GAUC/nDCG@5. This was identified before implementation
+began — `docs/research/autonomous-ml-agent-primary-sources.md` (2026-08-27) names it as blocking
+issue 1, and `implementation-readiness-research.md` records it as organizer question 1, *"Does the
+delivered long_view + GAUC/nDCG@5 kit supersede every conflicting click + NDCG@10/Recall@50
+statement?"* No organizer answer was obtained. Everything in this document optimizes the kit's
+definition, and the reasoning is recorded here rather than left implicit.
+
+**The problem statement defers to the kit.** It says the exact label definition and K values are
+pinned in the Starter Kit, which makes the kit authoritative by the statement's own terms.
+
+**The kit is unambiguous and hash-verified.** `kuairand-starter-kit/evaluate.py` — the sole scoring
+authority, never modified or reimplemented — declares in its header `相关性标签: long_view (原生列,
+0/1)` and `指标: GAUC, nDCG@5 (主分 = 两者的平均)`, and `evaluate()` computes exactly that. All seven
+starter files verify against the pinned manifest in `contract.py`.
+
+**The statement's metrics are degenerate on the kit's data, and the kit's are not.** Measured over
+the scored period: 25,877 users, median 8 impressions each, and only **279 users (1.1%) with more
+than 50 impressions.** Recall@50 over logged impressions would therefore be 1.0 for 98.9% of users,
+and NDCG@10 is near-degenerate at a median slate of 8. The kit's nDCG@5 is an active cutoff for
+66.2% of users. A metric set that cannot discriminate on the split it is scored over is not the
+metric set for that split — so the statement's metrics describe a different task shape (catalogue
+retrieval over 7,551 items) rather than a different label on this one.
+
+**Residual risk, stated plainly.** This is inference from the artifacts, not organizer
+confirmation. If the intended task is `click` with NDCG@10/Recall@50 over the catalogue, every
+score in this document retargets: the target vector, the scorer, the baseline qualification, and
+the briefing's measured facts all change. The architecture does not — the trusted controller,
+candidate protocol, sandbox, ledger and feature bundle are metric-agnostic, and `is_click` history
+is already carried in the causal bundle. The residue of the earlier reading is still visible in
+`candidate_api/protocol.py`, which blacklists `recall_50` as an official metric key; that line
+dates to the initial commit and is not independent evidence of the target.
+
 ## 3. Results
 
 ### 3.1 Scripted full-data campaign — `runs/scripted-full-data-20260828`

@@ -21,7 +21,7 @@ ensemble_mode_probe.py: rank averaging scores 0.6026034 while raw score averagin
 ordering and the members do not share a score scale.
 
 No new training happens here. Every member is an already-qualified organizer FM run from
-runs/maki-qualification, each checkpoint is verified against the digest recorded at qualification,
+the local qualification run, each checkpoint is verified against the digest recorded at qualification,
 and inference runs through the hash-pinned organizer source rather than a reimplementation.
 
 Offline and read-only with respect to the repository: it writes only the output directory it is
@@ -54,7 +54,10 @@ from kuairand_agent.scoring.protected import Alignment, ProtectedScorer, SplitId
 from kuairand_agent.scoring.submission import AlignmentRow, write_submission
 
 SEEDS = (0, 1, 2, 3, 4)
-QUALIFICATION = Path("runs/maki-qualification")
+# The qualification run that produced the five verified official-FM seeds. maki-qualification
+# was the Linux x86-64 team member's copy and is not present in this checkout; the local
+# equivalent carries the same five seeds with their own recorded digests.
+QUALIFICATION = Path("runs/wp3-official-qualification")
 PUBLISHED_BASELINE_VALIDATION = 0.6016
 
 

@@ -497,7 +497,8 @@ cd kuairand-starter-kit && python submit.py ../ensemble-submission/submission.cs
 ```
 
 A five-seed within-user rank ensemble of the official FM, scoring **0.6026034355** on public
-validation. It performs **no new training**: every member is an already-qualified organizer FM run
+validation. Built and organizer-checked at the current commit: 170,588 rows, `submit.py --check`
+returns 0, submission SHA-256 `7e6dc8b1f21d5a08…`, starter manifest `91f8f98098c40caf…`. It performs **no new training**: every member is an already-qualified organizer FM run
 from `runs/maki-qualification`, each checkpoint is verified against its qualification digest, the
 shared encoding is verified across all five rather than assumed, and inference runs through the
 hash-pinned organizer source. The number reproduced exactly through two independent code paths.
