@@ -16,7 +16,7 @@ from kuairand_agent.campaign.controller import (
     CampaignCreateRequest,
     CampaignEngine,
 )
-from kuairand_agent.campaign.convergence import ConvergenceState
+from kuairand_agent.campaign.convergence import MAX_UNMEASURED_STREAK, ConvergenceState
 from kuairand_agent.campaign.full_campaign import (
     FullCampaignCancelled,
     FullCampaignError,
@@ -630,11 +630,17 @@ def _drive_autonomous_followups(
     )
 
 
-def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
+def test_autonomous_followup_driver_keeps_proposing_past_three_rejections(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A rejected branch costs one iteration; the loop continues to exact convergence."""
+    """A rejected branch costs one iteration and the loop keeps going.
+
+    None of these iterations produces an eligible outer primary, so none of them is an observation
+    of the frozen ``delta > epsilon`` comparison. They used to increment the non-material streak
+    anyway, which ended the campaign at three under the label ``converged`` while it still held
+    most of its budget. The loop now runs until the unmeasured limit and reports that honestly.
+    """
 
     def reject_the_second_branch(iteration: int) -> None:
         if iteration == 2:
@@ -651,18 +657,22 @@ def test_autonomous_followup_driver_keeps_proposing_until_exact_convergence(
     )
     result = driven.result
 
-    assert driven.prepared_iterations == [2, 3, 4]
-    assert driven.cursor_history == [(1, 7), (2, 8)]
-    assert driven.context_record_counts == [1, 2, 3]
-    assert result.iterations_completed == 4
-    assert result.result.convergence.completed_iterations == 3
+    assert driven.prepared_iterations == [2, 3, 4, 5, 6, 7]
+    assert driven.cursor_history == [(1, 7), (2, 8), (3, 9), (4, 10), (5, 11)]
+    assert driven.context_record_counts == [1, 2, 3, 4, 5, 6]
+    assert result.iterations_completed == 7
+    assert result.result.convergence.completed_iterations == 6
+    assert result.result.convergence.unmeasured_streak == MAX_UNMEASURED_STREAK
+    assert result.result.convergence.non_material_streak == 0
     assert result.result.convergence.should_stop is True
-    assert result.result.launches_used == 9
-    assert result.result.stop_reason is CampaignStopReason.CONVERGED
+    # Nothing was ever measured, so this must not be reported as a plateau.
+    assert result.result.convergence.converged is False
+    assert result.result.launches_used == 12
+    assert result.result.stop_reason is CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
     assert len(result.rejected_records) == 1
     assert result.rejected_records[0].values["root_failure_code"] == "branch_rejected"
-    assert len(driven.store.convergence_manifests) == 2
-    assert driven.engine.status_calls == 3
+    assert len(driven.store.convergence_manifests) == 5
+    assert driven.engine.status_calls == 6
 
 
 @pytest.mark.parametrize(

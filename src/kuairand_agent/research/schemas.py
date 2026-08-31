@@ -1156,6 +1156,15 @@ class ImplementationRequest:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentResultSummary:
+    """One completed experiment as the model sees it when reflecting.
+
+    ``primary`` is the *blend's* score, never the model's own: every candidate prediction is rank
+    fused with the official FM control on a frozen five-point weight grid.  The four fusion fields
+    carry what that blend actually did, so reflection can tell "was discarded" apart from "matched
+    the baseline".  They default to ``None`` because fixture and scripted paths have no fusion
+    selection to disclose.
+    """
+
     tier: str
     status: str
     gauc: float
@@ -1164,6 +1173,10 @@ class ExperimentResultSummary:
     runtime_seconds: float
     peak_memory_mb: float
     execution_failed: bool = False
+    candidate_standalone_primary: float | None = None
+    fold_b_control_primary: float | None = None
+    fusion_weights_selected: str | None = None
+    fusion_note: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.tier, "experiment_result.tier", identifier=True)
@@ -1190,6 +1203,21 @@ class ExperimentResultSummary:
         ):
             if _finite_number(value, f"experiment_result.{name}") < 0:
                 raise SchemaValidationError(f"experiment_result.{name} cannot be negative")
+        for fusion_name, fusion_metric in (
+            ("candidate_standalone_primary", self.candidate_standalone_primary),
+            ("fold_b_control_primary", self.fold_b_control_primary),
+        ):
+            if fusion_metric is None:
+                continue
+            bounded = _finite_number(fusion_metric, f"experiment_result.{fusion_name}")
+            if not 0.0 <= bounded <= 1.0:
+                raise SchemaValidationError(f"experiment_result.{fusion_name} must be in [0, 1]")
+        for text_name, text_value in (
+            ("fusion_weights_selected", self.fusion_weights_selected),
+            ("fusion_note", self.fusion_note),
+        ):
+            if text_value is not None:
+                _text(text_value, f"experiment_result.{text_name}")
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -1201,6 +1229,10 @@ class ExperimentResultSummary:
             "runtime_seconds": self.runtime_seconds,
             "peak_memory_mb": self.peak_memory_mb,
             "execution_failed": self.execution_failed,
+            "candidate_standalone_primary": self.candidate_standalone_primary,
+            "fold_b_control_primary": self.fold_b_control_primary,
+            "fusion_weights_selected": self.fusion_weights_selected,
+            "fusion_note": self.fusion_note,
         }
 
 

@@ -140,6 +140,10 @@ class CandidateOutcome(StrEnum):
 class CampaignStopReason(StrEnum):
     CANDIDATES_EXHAUSTED = "candidates_exhausted"
     CONVERGED = "converged"
+    # Consecutive iterations produced no eligible outer primary at all.  Distinct from CONVERGED,
+    # which is a claim that measured results plateaued; reporting this as convergence would assert
+    # a plateau nobody measured.
+    CANDIDATES_NOT_PROMOTABLE = "candidates_not_promotable"
     ITERATION_CAP = "iteration_cap"
     LAUNCH_CAP = "launch_cap"
     FINALIZATION_RESERVE = "finalization_reserve"
@@ -1122,7 +1126,11 @@ def run_scientific_campaign(
 
     for candidate in candidates:
         if convergence.should_stop:
-            stop_reason = CampaignStopReason.CONVERGED
+            stop_reason = (
+                CampaignStopReason.CONVERGED
+                if convergence.converged
+                else CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+            )
             break
         if convergence.completed_iterations >= config.max_scientific_iterations:
             stop_reason = CampaignStopReason.ITERATION_CAP
@@ -1522,7 +1530,11 @@ def run_scientific_campaign(
         convergence = convergence.update_after_iteration(float(eligible_outer_primary_decimal))
 
     if stop_reason is CampaignStopReason.CANDIDATES_EXHAUSTED and convergence.should_stop:
-        stop_reason = CampaignStopReason.CONVERGED
+        stop_reason = (
+            CampaignStopReason.CONVERGED
+            if convergence.converged
+            else CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+        )
 
     return ScientificCampaignResult(
         config_digest=config.digest,

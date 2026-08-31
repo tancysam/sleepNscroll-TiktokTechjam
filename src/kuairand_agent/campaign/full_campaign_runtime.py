@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
-from typing import Final, Literal, Protocol, cast
+from typing import Final, Literal, Protocol, TypedDict, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -1315,6 +1315,7 @@ def _reflect(
     research_config: ResearchConfig,
     artifacts: ArtifactStore,
     research_model: ResearchModel | None = None,
+    fusion_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord] | None = None,
 ) -> tuple[str, str, ArtifactRef, Reflection]:
     candidate_result = result.candidates[0] if result.candidates else None
     run = None
@@ -1333,6 +1334,12 @@ def _reflect(
         else run.metrics
     )
     promoted = result.incumbent.candidate_id == candidate_id
+    # The metrics above are the rank-fusion BLEND's, not this model's.  Commit 8124607 disclosed
+    # that on the propose path and stopped there, so reflection kept reading a blend as its own
+    # result: every reflection in runs 16 and 17 recorded that it could not tell a discarded model
+    # from a tie, and reconstructed the answer by exact-matching the control's score.  Same
+    # disclosure, same helper, now on the path that decides what gets tried next.
+    fusion = _fusion_disclosure({} if fusion_records is None else fusion_records)
     summary = ExperimentResultSummary(
         tier="outer" if promoted else "inner",
         status="promoted" if promoted else "rejected",
@@ -1342,6 +1349,10 @@ def _reflect(
         execution_failed=execution_failed,
         runtime_seconds=0.0 if run is None else run.resources.wall_seconds,
         peak_memory_mb=(0.0 if run is None else run.resources.peak_rss_bytes / float(1024**2)),
+        candidate_standalone_primary=fusion["candidate_standalone_primary"],
+        fold_b_control_primary=fusion["fold_b_control_primary"],
+        fusion_weights_selected=fusion["fusion_weights_selected"],
+        fusion_note=fusion["fusion_note"],
     )
     request = ReflectionRequest.create(
         request_id=f"iteration-{scientific_iteration:02d}-reflect",
@@ -1484,9 +1495,18 @@ def _measured_primary(
     return primary, delta, "inner_fold"
 
 
+class FusionDisclosure(TypedDict):
+    """What rank fusion did to one iteration, in the exact shape both consumers splat."""
+
+    candidate_standalone_primary: float | None
+    fold_b_control_primary: float | None
+    fusion_weights_selected: str | None
+    fusion_note: str | None
+
+
 def _fusion_disclosure(
     records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord],
-) -> dict[str, str | float | None]:
+) -> FusionDisclosure:
     """Describe what rank fusion did to this iteration's predictions.
 
     Every candidate prediction is rank-fused with the official FM control on a fixed five-point
@@ -1585,7 +1605,10 @@ def _iteration_record(
             "candidate_primary_tier": tier,
             "delta_vs_incumbent": None if delta is None else round(delta, 6),
             # candidate_primary above is the FUSED score. These four say what the model itself did.
-            **fusion,
+            "candidate_standalone_primary": fusion["candidate_standalone_primary"],
+            "fold_b_control_primary": fusion["fold_b_control_primary"],
+            "fusion_weights_selected": fusion["fusion_weights_selected"],
+            "fusion_note": fusion["fusion_note"],
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
@@ -2349,7 +2372,13 @@ def _run_autonomous_followups(
 
     while True:
         if result.convergence.should_stop:
-            terminal = CampaignStopReason.CONVERGED
+            # Only a measured plateau may be reported as convergence; a run of iterations that
+            # produced no eligible outer primary gets its own reason.
+            terminal = (
+                CampaignStopReason.CONVERGED
+                if result.convergence.converged
+                else CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+            )
             break
         if result.convergence.completed_iterations >= scientific_config.max_scientific_iterations:
             terminal = CampaignStopReason.ITERATION_CAP
@@ -2515,6 +2544,7 @@ def _run_autonomous_followups(
             research_config=request.config.research,
             artifacts=runtime_template.artifacts,
             research_model=research_model,
+            fusion_records=iteration_runtime.records,
         )
         records.append(
             _iteration_record(
@@ -4058,6 +4088,7 @@ def run_provider_free_campaign(
             research_model=research_model,
             candidate_id=candidate_id,
             scientific_iteration=accepted_scientific_iteration,
+            fusion_records=runtime.records,
         )
         _check_cancel(cancel_event)
         iterations_completed = accepted_scientific_iteration

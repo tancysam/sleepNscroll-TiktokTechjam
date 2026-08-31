@@ -856,26 +856,26 @@ def _convergence_json(value: Mapping[str, object]) -> str:
         "schema_version",
         "best_primary",
         "non_material_streak",
+        "unmeasured_streak",
         "completed_iterations",
         "required_completion_pending",
     }
     if set(value) != expected:
-        raise StoreInvariantError("convergence state must contain the exact version-1 fields")
-    if value["schema_version"] != 1:
-        raise StoreInvariantError("convergence schema_version must be 1")
+        raise StoreInvariantError("convergence state must contain the exact version-2 fields")
+    if value["schema_version"] != 2:
+        raise StoreInvariantError("convergence schema_version must be 2")
     best = value["best_primary"]
     if isinstance(best, bool) or not isinstance(best, (int, float)):
         raise StoreInvariantError("convergence best_primary must be numeric")
     if not math.isfinite(float(best)) or not 0.0 <= float(best) <= 1.0:
         raise StoreInvariantError("convergence best_primary must be finite in [0, 1]")
-    for key in ("non_material_streak", "completed_iterations"):
+    for key in ("non_material_streak", "unmeasured_streak", "completed_iterations"):
         number = value[key]
         if type(number) is not int or number < 0:
             raise StoreInvariantError(f"convergence {key} must be a non-negative integer")
-    if cast(int, value["non_material_streak"]) > cast(int, value["completed_iterations"]):
-        raise StoreInvariantError(
-            "convergence non_material_streak cannot exceed completed_iterations"
-        )
+    for key in ("non_material_streak", "unmeasured_streak"):
+        if cast(int, value[key]) > cast(int, value["completed_iterations"]):
+            raise StoreInvariantError(f"convergence {key} cannot exceed completed_iterations")
     if type(value["required_completion_pending"]) is not bool:
         raise StoreInvariantError("convergence required_completion_pending must be boolean")
     return _json_object(value, "convergence state")

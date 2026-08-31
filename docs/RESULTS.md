@@ -49,9 +49,15 @@ organizers' convergence threshold.
 
 ## 3. Results
 
-### 3.1 Scripted full-data campaign — `runs/scripted-full-data-20260828`
+### 3.1 Scripted full-data campaign — `runs/report-check-01`
 
 Provider-free reference run. Completed end to end on full data.
+
+*Corrected 2026-08-31.* An earlier version of this section cited a run directory
+`runs/scripted-full-data-20260828` that is not on this machine, and read the primary below as the
+LambdaRank model's own score. Both are fixed here: the campaign survives as `runs/report-check-01`
+with byte-identical metrics, and the primary is a **fusion blend**, not the model. See "Honest
+reading" below, and §3.3a for the general form of that mistake.
 
 | Item | Value |
 |---|---|
@@ -60,7 +66,11 @@ Provider-free reference run. Completed end to end on full data.
 | Selection status | `validation_improved` |
 | Validation GAUC | 0.6671879292 |
 | Validation nDCG@5 | 0.5359807014 |
-| **Validation primary** | **0.6015843153** |
+| **Validation primary (25/75 BLEND, not the model)** | **0.6015843153** |
+| **LambdaRank standalone, Fold B (100/0)** | **0.5710743666** |
+| **Fold B official-FM control (0/100)** | **0.5754240304** |
+| **Standalone minus control** | **−0.0043496639 = −5.44σ** |
+| Frozen fusion weights | `[0.25, 0.75]` model / control |
 | Confirmation-seed mean primary | 0.6014825006 |
 | Charged training launches | 14 |
 | Outer validation queries | 1 |
@@ -73,12 +83,44 @@ Provider-free reference run. Completed end to end on full data.
 | Replay verified | yes |
 | Submission SHA-256 | `cfc226decff4cdd0130c92ab021bbf28fcd25ab0e41e1f12e6d49975da602161c` |
 
-**Honest reading of this result.** Against this repository's official-FM confirmation-seed mean of
-0.6014402509, the delta is **+0.000144**. That is roughly one fifth of a single seed standard
-deviation and an order of magnitude below ε = 0.002. **We do not claim this as an improvement.**
-It reproduces the baseline; it does not beat it. Its value is that it proves the entire
-pipeline — acquisition, qualification, iteration, promotion, finalization, replay, and an
-organizer-valid CSV — works end to end without human intervention.
+**Honest reading of this result.** The 0.6015843153 above is the score of a **blend**, 25% this
+model and 75% the official FM control, on a weight the Fold B screen selected. It is not a
+measurement of the LambdaRank model, and the earlier reading of it as "+0.000144 over the
+confirmation-seed mean" was the §3.3a mistake applied one section early.
+
+Read at the 100/0 point, the model scored **0.5710743666** against the Fold B control's
+**0.5754240304** — a deficit of **0.00435, or −5.44σ** at σ = 0.0008. That places the scripted
+LambdaRank in the same band as the weakest generated candidates in §3.3a, not near the baseline.
+Reproduce the whole grid with `python3 fusion_audit.py report-check-01`:
+
+| Fold B weights (model / control) | primary |
+|---|---:|
+| 1.00 / 0.00 — **the model alone** | **0.5710743666** |
+| 0.75 / 0.25 | 0.5715741813 |
+| 0.50 / 0.50 | 0.5742886513 |
+| **0.25 / 0.75 — selected** | **0.5756440163** |
+| 0.00 / 1.00 — the control alone | 0.5754240304 |
+
+The blend at the selected weight was also measured on public validation across the three matched
+seeds, against each seed's own FM member:
+
+| seed | 25/75 blend | its FM member alone | delta |
+|---|---:|---:|---:|
+| 0 | 0.6015843 | 0.6014695 | +0.000115 |
+| 1 | 0.6015052 | 0.6017609 | **−0.000256** |
+| 2 | 0.6013579 | 0.6010903 | +0.000268 |
+
+Mean **+0.000042**, and negative on one seed of three — inside noise, and two orders of magnitude
+below ε = 0.002. **We do not claim this as an improvement**, and we no longer claim it reproduces
+the baseline either: the model is well below the baseline and the blend is indistinguishable from
+it. Its value is that it proves the entire pipeline — acquisition, qualification, iteration,
+promotion, finalization, replay, and an organizer-valid CSV — works end to end without human
+intervention.
+
+This also closes a direction that looked open: a tree-plus-FM rank blend combines two genuinely
+decorrelated families (38 causal aggregate columns and gradient-boosted trees against five identity
+fields and FM embeddings) and is the standard way to gain on ranking tasks, but on this benchmark it
+has now been measured and is worth **+0.000042**.
 
 Note also that `provider = "scripted"` in this configuration. It is a valid submission floor, but
 it is **not** evidence of autonomous LLM-driven research, and we do not present it as such.
@@ -163,6 +205,25 @@ converged and then stranded in finalization on the latent defects described belo
 | `maki-overnight-15` | 3 | **3** | 3 | `candidate-01` (`validation_improved`) | **stranded `FINALIZING`** | $1.44 |
 | `maki-overnight-16` | 3 | **3** | 0 | `official-fm-fallback-seed-4` | converged | $1.52 |
 | `maki-overnight-17` | 3 | **3** | 0 | `official-fm-fallback-seed-4` | converged | $1.58 |
+
+**Every run in that table stopped at exactly three iterations, and that column is the finding.**
+The campaigns held a 21,600-second budget and a 50-iteration cap; runs 16 and 17 spent 714.9 s and
+620.3 s of candidate wall time — about **4% of the budget** — and used 13 of 50 launches. The cause
+was in our own convergence arithmetic, not in the agent or the provider. `update_after_iteration`
+accepted `None` for an iteration that produced no eligible outer primary and still incremented the
+non-material streak, so **three consecutive rejections were reported as `converged`**. In runs 16
+and 17 no candidate reached outer validation at all, which the "Reached outer validation = 0" column
+records: those two convergence claims rest on three rejections and zero measurements.
+
+That is not what the frozen contract describes. `BENCHMARK_CONTRACT.convergence` states the rule as
+*"eligible outer primary delta strictly greater than epsilon"*, and a rejected iteration has no
+eligible outer primary to take a delta from. **Corrected on 2026-08-31**
+(`campaign/convergence.py`): rejections now accumulate in a separate `unmeasured_streak` and stop
+the campaign under their own reason, `candidates_not_promotable`, after six. `epsilon = 0.002`,
+`patience = 3`, `benchmark_digest` and the meaning of `converged` are all unchanged — `converged`
+is now strictly a claim about measured results, which it previously was not. The measured effect on
+the loop, from `tests/integration/test_full_campaign_runtime.py`: the autonomous followup driver
+went from **3 iterations to 7** on the identical fixture.
 
 **No generated candidate has beaten the baseline by a material margin, and the fallback shipped in
 seven of nine runs.** Those seven published a byte-identical submission, SHA-256 `e12746ae…`, so
@@ -316,6 +377,38 @@ that basis, when its model had in fact been discarded. Commit `8124607` exposes
 visible in the next run's reasoning: run 15 iteration-03 instead wrote that its parent *"scores
 0.5713044 standalone against the 0.575424 Fold B control"* — a measured before-and-after on the
 agent's own reasoning, produced by one fix.
+
+#### The agent found the half of that fix we missed
+
+`8124607` reached `propose` and stopped there. `_reflect` kept building its
+`ExperimentResultSummary` from tier, status, GAUC, nDCG@5, primary, runtime and memory alone, and
+never called `_fusion_disclosure`. So the agent proposed with the disclosure and then **reflected
+without it** — on the blend, with no way to know it was a blend.
+
+It noticed, unprompted, in **six reflections out of six** across runs 16 and 17. Run 16
+iteration-01:
+
+> "The request does not provide candidate_standalone_primary or the frozen model/control fusion
+> weight. Therefore, this result cannot establish that the candidate itself beat the official FM
+> control; the small scored advantage may belong to a selected blend."
+
+Each time it refused the causal claim the missing field would have licensed, and in run 17
+iteration-01 it recovered the answer by inference instead:
+
+> "The result exactly reproduces official_fm_fold_A at full supplied precision … this indicates
+> that the frozen control-only blend was selected and the candidate contributed no ranking signal."
+
+**This is the one capability gap in this project that the agent identified rather than being told.**
+The three framings that shaped runs 16 and 17 — no user identity at prediction time, no within-user
+rank normalisation, seed ensembling — were all supplied in the briefing, and the run-16 versus
+run-17 system-prompt diff makes that checkable. The reflect-payload gap was not.
+
+Fixed on 2026-08-31: `ExperimentResultSummary` carries `candidate_standalone_primary`,
+`fold_b_control_primary`, `fusion_weights_selected` and `fusion_note`, `_reflect` populates them
+from the same `_fusion_disclosure` helper the propose path already used, and the reflect prompt
+explains how to read them. The defect and its fix are both worth more than the direction they were
+found in: a disclosure applied to one of two paths is invisible until something on the other path
+complains, and here the complainant was the model.
 
 #### A confounder in the run series: run 11 failed over mid-campaign
 
@@ -527,7 +620,7 @@ original campaign identity, budget, and deadline is counted, and the reason is r
 
 | Run | Interventions | Detail |
 |---|---|---|
-| `runs/scripted-full-data-20260828` | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
+| `runs/report-check-01` (the scripted full-data campaign) | 1 | One safe resume. A source edit during the run changed the repository digest and the campaign correctly halted with `trusted project source differs from campaign creation`. The edit was reverted, the campaign resumed under its original source identity with budget and deadline accounting preserved, and the edit was reapplied afterwards. The campaign's own internal counter recorded 0; we report 1, because a human acted. |
 | `maki-overnight-09` | 0 | Converged with no human action after launch. |
 | `maki-overnight-10` | 0 | Converged with no human action after launch. |
 | `maki-overnight-11` | 0 | Converged with no human action after launch. Its provider chain failed over mid-campaign, which is an automatic recovery rather than an intervention; see §3.3. |

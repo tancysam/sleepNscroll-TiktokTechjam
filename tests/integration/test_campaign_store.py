@@ -41,9 +41,10 @@ def _convergence(
     pending: bool = False,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "best_primary": best,
         "non_material_streak": streak,
+        "unmeasured_streak": 0,
         "completed_iterations": iterations,
         "required_completion_pending": pending,
     }

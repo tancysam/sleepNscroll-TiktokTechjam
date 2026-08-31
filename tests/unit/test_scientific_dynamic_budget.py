@@ -98,6 +98,9 @@ def test_durable_cursors_continue_across_one_candidate_driver_calls() -> None:
 
     assert first.convergence.completed_iterations == 1
     assert second.convergence.completed_iterations == 2
-    assert second.convergence.non_material_streak == 2
+    # Both screens were rejected, so the streak that carries across the restart is the unmeasured
+    # one; the frozen epsilon comparison never ran.
+    assert second.convergence.non_material_streak == 0
+    assert second.convergence.unmeasured_streak == 2
     assert second.launches_used == first.launches_used + 1
     assert second.elapsed_seconds >= first.elapsed_seconds

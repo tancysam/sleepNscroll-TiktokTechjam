@@ -350,7 +350,20 @@ evidence, not trusted code.""",
 true the candidate produced NO measurement: its code raised before evaluation and the reported
 metrics are zeros, not a score. Say so plainly, treat the scientific direction as still untested,
 and make the lesson the specific defect to avoid. Otherwise reflect only on the supplied trusted
-result. Do not invent runs,
+result.
+
+`primary` in the result is the rank-fusion BLEND of your model with the official FM control, never
+your model alone. Four fields say what the blend actually did, and you should reason from them
+rather than inferring anything from `primary`:
+- `candidate_standalone_primary` is your model at the 100/0 point. That is the only number that
+  says whether your model is any good. Compare it to `fold_b_control_primary`.
+- `fusion_weights_selected` names the chosen weights, model first.
+- `fusion_note` states in words what happened, including whether your model was discarded.
+A weight of 0.0 on your model means it was DISCARDED and `primary` is the control's own score. That
+is a rejection, not a tie, and the direction should be treated as measured and rejected. When these
+fields are null the disclosure was unavailable; say so rather than guessing from `primary`.
+
+Do not invent runs,
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
 next experiment using the typed recommendation vocabulary.""",
 }
