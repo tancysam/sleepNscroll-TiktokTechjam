@@ -160,9 +160,26 @@ optimisation budget before you try to beat it on anything else. Hold the interac
 above fixed while you do it, and change the optimiser only. A metric-matched weight or a
 regularisation schedule cannot express itself in 20 gradient steps, so this comes first.
 
-Once you have MEASURED optimisation parity and it is working, ONE later iteration may try a single
-enhancement above Adam, such as Lookahead fast and slow weight averaging, or sharpness-aware
-minimisation. Never before parity is on the board, and never more than one at a time.
+Once you have MEASURED optimisation parity and it is working, later iterations may go past the
+control rather than only match it. The control uses plain Adam with its L2 folded into the gradient,
+clips only the sigmoid argument, and keeps no averaged copy of its weights, so each of the following
+is something it does NOT do. Take at most ONE per iteration, in this order, and never before parity
+is on the board:
+
+1. An exponential moving average of the parameters, updated every step as
+   `ema = decay * ema + (1 - decay) * live` with decay near 0.999, and used INSTEAD of the live
+   weights when you predict. This is the most valuable of the three here for a specific reason: the
+   control keeps the best of forty epochs measured on the split it is then scored on, and you get
+   one shot with no such selection. Averaging the trajectory is a principled substitute for that
+   advantage, and it composes with the train-derived holdout above. It costs one extra array per
+   parameter block.
+2. Decoupled weight decay. The control adds `l2 * parameter` into the gradient, where Adam's second
+   moment then damps the penalty hardest on exactly the rows updated most often. Subtract
+   `learning_rate * decay * parameter` from the parameter AFTER the Adam step instead. Decay only
+   the rows the batch touched, or you pay a full table multiply on every one of thousands of steps.
+3. Linear learning-rate warmup over roughly the first five percent of steps. Lowest value of the
+   three, since Adam's bias correction already compensates much of the cold start, but it is nearly
+   free.
 
 SEED ENSEMBLING inside one candidate has been measured and is a dead end. Training five copies of
 the same scorer on the same data and averaging their raw scores in `predict_scores` scored 0.5740
@@ -219,7 +236,12 @@ what the batch touched, or accumulate into a preallocated buffer, and keep the s
 the embedding gradient. Second, the final batch of an epoch is ragged: 1,141,112 rows at batch 8192
 leaves a last slice of 4,216, so any array you size to the batch size rather than to the length of
 the slice you actually took will raise on the last iteration of every epoch. Size every per batch
-array from the slice itself.
+array from the slice itself. Third, clip your gradients before the parameter update, for example
+`np.clip(grad, -1.0, 1.0, out=grad)`. Over thousands of steps one anomalous batch can otherwise
+drive the Adam second moment to a value that flattens every later update, or push embedding rows to
+magnitudes the scorer cannot recover from, and you will not see it until the run is over. The
+control clips the sigmoid argument but never the gradient, so this costs one line and protects work
+you cannot repeat.
 
 Two things that look like improvements here and are not. Reshuffle every epoch rather than once
 before the loop, which is what the control does; permuting the index array costs about ten
