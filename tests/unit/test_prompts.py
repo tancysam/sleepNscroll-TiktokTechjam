@@ -178,7 +178,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
-    assert PROMPT_VERSION == 16
+    assert PROMPT_VERSION == 17
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -264,18 +264,48 @@ def test_briefing_states_the_user_weighting_asymmetry(operation: ResearchOperati
 
 
 @pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
-def test_briefing_rules_out_the_avenues_the_runtime_cannot_express(
+def test_the_briefing_forbids_only_what_is_actually_forbidden(
     operation: ResearchOperation,
 ) -> None:
-    """Multi-task and censored watch-time are organizer priorities this runtime cannot reach."""
+    """It used to enumerate what was allowed, having closed nearly everything else.
+
+    Multi-task learning and user sequences were listed as impossible. They are not: the controller
+    holds eleven outcome columns and its canonical inputs carry ``time_ms``, so both are UNBUILT
+    rather than unreachable. Two campaigns in a row then proposed the same three mechanisms in the
+    same order, opening with the one the briefing called the cheapest way to cross the control --
+    a corridor, not a search.
+    """
 
     rendered = instructions_for(operation)
-    assert "NOT reachable from your interface" in rendered
-    assert "Do not propose these" in rendered
-    for absent_field in ("is_follow", "is_comment", "is_forward", "play_time_ms"):
-        assert absent_field in rendered, f"{absent_field} must be named as unavailable"
-    assert "exactly one binary target vector" in rendered
-    assert "DIN/SIM" in rendered, "sequence modelling is unreachable and must be named"
+    assert "WHAT IS ACTUALLY FORBIDDEN" in rendered
+    assert "Everything not on it is yours to propose" in rendered
+    # The real prohibitions, which are policy rather than plumbing.
+    assert "randomized exposure log" in rendered
+    assert "outcome from the scored period" in rendered
+    # And the retractions, so the model is not steered by a claim we have disproved.
+    assert "that was wrong" in rendered
+    assert "UNBUILT" in rendered
+    assert "Do not propose these, they cannot be implemented" not in rendered
+    assert "exactly one binary target vector" not in rendered
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_the_briefing_names_no_favourite_mechanism(operation: ResearchOperation) -> None:
+    """Naming a cheapest option produced two identical campaigns; state evidence, not a ranking."""
+
+    rendered = instructions_for(operation)
+    assert "The cheapest remaining way to cross the control is SEED ENSEMBLING" not in rendered
+    assert "Read it as evidence, not as an instruction" in rendered
+
+
+def test_tuning_the_inherited_parent_is_granted_rather_than_forbidden() -> None:
+    """ "Never spend an iteration on a hyperparameter" closed the cheapest lever once the parent
+    became competitive and exposed five of them in config.json."""
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert "do sweep hyperparameters, hard" in rendered
+    assert "no candidate has\nyet swept more than one of them" in rendered
+    assert "So never spend an iteration on a hyperparameter." not in rendered
 
 
 def test_lightgbm_guidance_pins_the_objective_cutoff() -> None:

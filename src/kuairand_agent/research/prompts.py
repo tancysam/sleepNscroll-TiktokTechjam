@@ -20,7 +20,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 16
+PROMPT_VERSION: Final = 17
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -95,15 +95,22 @@ scored below the baseline standalone. Note the distinction the organizers measur
 FIRST-ORDER term is worth exactly zero because it is constant within a user, but a user EMBEDDING
 crossed with an item embedding varies across that user's rows and can reorder them.
 
-NOT reachable from your interface. Do not propose these, they cannot be implemented:
-- User behaviour sequences or DIN/SIM interest modelling. You receive no timestamps and no
-  per-user event history, only the aggregate columns.
-- Multi-task learning on other feedback signals, and censored watch-time regression. You receive
-  exactly one binary target vector; no auxiliary outcome reaches your interface, and
-  `is_follow`, `is_comment`, `is_forward`, `play_time_ms` and every stay-time field are absent
-  from the feature bundle. The only engagement signals granted are `is_click` and `is_like`, and
-  only as strictly-past history aggregates.
-- Anything using the randomized exposure log. It is blocked by the field policy.
+WHAT IS ACTUALLY FORBIDDEN, which is a short list. Everything not on it is yours to propose:
+
+- The randomized exposure log. Blocked by the field policy.
+- Any outcome from the scored period. You receive training-split supervision only.
+- The evaluator, the attempt policy, and the promotion policy.
+
+That is the whole list. Earlier versions of this briefing also told you that user sequences and
+multi-task learning were impossible; that was wrong. `time_ms` exists in the controller's
+canonical inputs and eleven outcome columns exist in its training targets, so those are UNBUILT
+rather than unreachable. If your hypothesis needs one, say so in the proposal: a direction the
+controller has not yet plumbed is a legitimate finding, not a wasted iteration.
+
+Two closures above are also narrower than they look. The organizers' capacity and feature-breadth
+sweeps were run against THEIR baseline, not against the parent you inherit. And a temporal-position
+ablation measured -0.0014 on this project's older LINEAR parent, where a non-monotone term cannot
+help by construction; against the factorization machine you now start from it is an open question.
 
 How your score is actually computed, which changes what the campaign records mean. Your
 predictions are never scored alone. The controller rank-normalises them within each user, does the
@@ -158,8 +165,12 @@ after candidate rebuilding the base and landing near 0.5698 rather than testing 
 do not have to rebuild any of it, and you should not: tune it through config.json, or add
 something to it.
 
-The cheapest remaining way to cross the control is SEED ENSEMBLING, and every number below is
-measured on this exact benchmark rather than argued. The five qualified seeds of the official FM
+SEED ENSEMBLING is one measured option among several, and the numbers below are what is known
+about it rather than a recommendation to take it. Two campaigns in a row opened with exactly this
+mechanism because an earlier briefing called it the cheapest way to cross the control; both landed
+within noise of the parent. Read it as evidence, not as an instruction.
+
+The five qualified seeds of the official FM
 score 0.6014695, 0.6017609, 0.6010903, 0.6015031 and 0.6020371 on public validation. What you do
 with those five prediction vectors decides almost the whole effect:
 
@@ -217,12 +228,16 @@ separate budgets and only one of them is capped:
   configurations as its runtime allows, select between them on a split it carves out of its own
   training rows, and return only the winner. That costs no iteration at all.
 
-So never spend an iteration on a hyperparameter. If your last result was a learning rate away from
-working, the correct response is not to propose the same method with a different constant -- that
-burns one of three slots to test a number. Every new method you propose should arrive with its own
-internal search already in it: a small grid over the parameters you are least sure of, an honest
-inner split to select on, and a guard that keeps the parent configuration when nothing beats it.
-Report which setting won in training_diagnostics.
+So do not spend a scientific ITERATION on a hyperparameter -- but do sweep hyperparameters, hard,
+inside the candidate, where they are free. The parent exposes rank, epochs, batch size, both L2
+terms and ensemble size in config.json precisely so a candidate can move them, and no candidate has
+yet swept more than one of them. A grid over four of those, selected on your own inner split, costs
+nothing and is a genuine experiment; proposing the same method again with one constant changed
+costs a slot and is not.
+
+Every new method you propose should arrive with its own internal search already in it: a grid over
+the parameters you are least sure of, an honest inner split to select on, and a guard that keeps
+the parent configuration when nothing beats it. Report which setting won in training_diagnostics.
 
 Propose mechanisms the implementation can actually build. The parent already ships tested helpers
 for the pieces that used to crash branches: categorical code extraction, per-fold embedding table
