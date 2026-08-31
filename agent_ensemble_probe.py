@@ -131,7 +131,8 @@ def main(data_dir: str, starter_dir: str, runs_root: str) -> int:
     ]
     print(
         f"pairwise rank correlation between campaigns: "
-        f"min {min(correlations):.4f}  mean {np.mean(correlations):.4f}  max {max(correlations):.4f}"
+        f"min {min(correlations):.4f}  mean {np.mean(correlations):.4f}  "
+        f"max {max(correlations):.4f}"
     )
     if np.mean(correlations) > 0.99:
         print("    Near-identical orderings: the campaigns converged to one model, so their")
