@@ -85,3 +85,45 @@ def test_restart_rejects_unknown_or_invalid_state() -> None:
     invalid["best_primary"] = float("nan")
     with pytest.raises(ConvergenceStateError, match="finite"):
         ConvergenceState.from_manifest(invalid)
+
+
+def test_a_crash_does_not_spend_one_of_the_organizers_three_rounds() -> None:
+    """The published rule counts rounds whose validation primary failed to improve by >epsilon.
+
+    A branch that raised before evaluation produced no validation primary at all, so it is not
+    such a round. Counting it meant a campaign could converge having tested one hypothesis instead
+    of three -- run 11 lost two candidates to exceptions in purely informational diagnostics code
+    after they had already trained successfully.
+    """
+
+    state = ConvergenceState.initial(0.6)
+    for _ in range(5):
+        state = state.update_after_iteration(None, produced_measurement=False)
+
+    assert state.non_material_streak == 0
+    assert not state.converged
+    # Still bounded: the iteration is counted, so the hard cap and wall clock still apply.
+    assert state.completed_iterations == 5
+
+
+def test_a_measured_null_result_still_counts_against_convergence() -> None:
+    """Only crashes are exempt. A candidate that was scored and lost is real evidence."""
+
+    state = ConvergenceState.initial(0.6)
+    for _ in range(3):
+        state = state.update_after_iteration(None)
+
+    assert state.non_material_streak == 3
+    assert state.converged
+
+
+def test_a_material_improvement_clears_a_streak_built_from_measured_rounds() -> None:
+    state = ConvergenceState.initial(0.6)
+    state = state.update_after_iteration(None)
+    state = state.update_after_iteration(None)
+    assert state.non_material_streak == 2
+
+    state = state.update_after_iteration(0.6 + 0.0021)
+
+    assert state.non_material_streak == 0
+    assert state.best_primary == 0.6021

@@ -86,12 +86,22 @@ class ConvergenceState:
         eligible_outer_primary: float | None,
         *,
         required_completion_pending: bool | None = None,
+        produced_measurement: bool = True,
     ) -> Self:
         """Apply one completed scientific iteration against the *previous* best.
 
         ``None`` represents failure, policy rejection, or a non-promoted iteration. A valid
         non-material outer improvement still advances ``best_primary`` while incrementing the
         streak; subsequent iterations compare against that new best.
+
+        ``produced_measurement=False`` marks an iteration whose code raised before any evaluation.
+        The organizers' convergence rule is three consecutive rounds whose *validation primary*
+        fails to improve by more than epsilon; a branch that crashed produced no validation primary
+        at all, so it is not a round that failed to improve -- it is a round that did not happen.
+        Counting it spent a scientific slot on an engineering defect, which is how a campaign could
+        converge having tested one hypothesis instead of three. The iteration is still recorded in
+        ``completed_iterations``, so the hard iteration cap, the wall clock and the repeated
+        pre-admission failure rule all continue to bound a campaign that only crashes.
         """
 
         if self.converged:
@@ -108,13 +118,23 @@ class ConvergenceState:
             if eligible_outer_primary is None
             else _primary(eligible_outer_primary, "eligible_outer_primary")
         )
+        if type(produced_measurement) is not bool:
+            raise ConvergenceStateError("produced_measurement must be boolean")
         material = observed is not None and (
             Decimal(str(observed)) - Decimal(str(self.best_primary)) > EPSILON
         )
         next_best = self.best_primary if observed is None else max(self.best_primary, observed)
+        if material:
+            streak = 0
+        elif produced_measurement:
+            streak = self.non_material_streak + 1
+        else:
+            # No validation primary was produced, so this round cannot be one of the three the
+            # organizers' rule counts. The iteration still advances completed_iterations.
+            streak = self.non_material_streak
         return type(self)(
             best_primary=next_best,
-            non_material_streak=0 if material else self.non_material_streak + 1,
+            non_material_streak=streak,
             completed_iterations=self.completed_iterations + 1,
             required_completion_pending=pending,
         )

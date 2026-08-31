@@ -305,7 +305,12 @@ def test_callback_failure_is_charged_but_cannot_displace_replayable_fallback() -
     assert result.incumbent == result.fallback == _fallback()
     assert result.launches_used == 7
     assert result.convergence.completed_iterations == 1
-    assert result.convergence.non_material_streak == 1
+    # A crashed branch produced no validation primary, so it is not one of the three
+    # rounds the organizers' convergence rule counts. It is still a completed iteration,
+    # so the hard cap and wall clock still bound a campaign that only crashes; what it
+    # must not do is spend a scientific slot on an engineering defect. The screen-
+    # rejection test above still asserts 1, because that candidate was actually scored.
+    assert result.convergence.non_material_streak == 0
 
 
 def test_three_nonmaterial_screens_converge_before_fourth_candidate() -> None:

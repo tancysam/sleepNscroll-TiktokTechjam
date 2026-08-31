@@ -73,9 +73,7 @@ def _selection(grid: _Grid) -> FoldBFusionSelectionEvidence:
             fusion_digest=f"{index + 10:02d}" * 32,
             scorer_runtime_seconds=0.5,
         )
-        for index, (weights, (gauc, ndcg)) in enumerate(
-            zip(FUSION_WEIGHT_GRID, grid, strict=True)
-        )
+        for index, (weights, (gauc, ndcg)) in enumerate(zip(FUSION_WEIGHT_GRID, grid, strict=True))
     )
     best = max(enumerate(points), key=lambda item: (item[1].metrics.primary_decimal, -item[0]))[1]
     return FoldBFusionSelectionEvidence(

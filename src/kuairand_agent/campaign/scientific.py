@@ -1187,7 +1187,9 @@ def run_scientific_campaign(
                     reason=f"callback_failed:{callback_failure}",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
+            # The branch raised before any evaluation, so it produced no validation primary
+            # and is not one of the three rounds the organizers' convergence rule counts.
+            convergence = convergence.update_after_iteration(None, produced_measurement=False)
             continue
         elapsed_seconds += evidence.resources.wall_seconds
         parent_fold_b = dict(incumbent.inner_by_fold)["B"]
@@ -1274,7 +1276,9 @@ def run_scientific_campaign(
                     reason=f"fold_a_callback_failed:{callback_failure}",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
+            # The branch raised before any evaluation, so it produced no validation primary
+            # and is not one of the three rounds the organizers' convergence rule counts.
+            convergence = convergence.update_after_iteration(None, produced_measurement=False)
             continue
         elapsed_seconds += fold_a_evidence.resources.wall_seconds
         runs: list[ScientificRunEvidence] = [evidence, fold_a_evidence]
@@ -1287,7 +1291,9 @@ def run_scientific_campaign(
                     reason="fold_a_failed",
                 )
             )
-            convergence = convergence.update_after_iteration(None)
+            # The branch raised before any evaluation, so it produced no validation primary
+            # and is not one of the three rounds the organizers' convergence rule counts.
+            convergence = convergence.update_after_iteration(None, produced_measurement=False)
             continue
 
         incumbent_folds = dict(incumbent.inner_by_fold)

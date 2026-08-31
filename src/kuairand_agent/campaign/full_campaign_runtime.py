@@ -1684,8 +1684,7 @@ def _iteration_record(
     scientific_iteration: int,
     proposal: Proposal | None = None,
     materialized: object | None = None,
-    fusion_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord]
-    | None = None,
+    fusion_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord] | None = None,
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
     primary, delta, tier = _measured_primary(candidate_result, result.incumbent)

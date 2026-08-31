@@ -13,7 +13,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 10
+PROMPT_VERSION: Final = 11
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -77,6 +77,29 @@ gets most of its ordering power, and it is the most likely reason every candidat
 scored below the baseline standalone. Note the distinction the organizers measured: a user-side
 FIRST-ORDER term is worth exactly zero because it is constant within a user, but a user EMBEDDING
 crossed with an item embedding varies across that user's rows and can reorder them.
+
+HOW TO SPEND AN ITERATION, WHICH IS THE MOST COMMON WAY THIS CAMPAIGN IS WASTED. You have two
+separate budgets and only one of them is capped:
+
+- A new HYPOTHESIS costs one scientific iteration. The organizers' convergence rule stops the
+  campaign after three consecutive iterations that fail to improve validation primary by more than
+  0.002, so you get about three. This budget is frozen and cannot be extended.
+- TUNING INSIDE ONE CANDIDATE is free and unlimited. Your training code may fit as many
+  configurations as its runtime allows, select between them on a split it carves out of its own
+  training rows, and return only the winner. That costs no iteration at all.
+
+So never spend an iteration on a hyperparameter. If your last result was a learning rate away from
+working, the correct response is not to propose the same method with a different constant -- that
+burns one of three slots to test a number. Every new method you propose should arrive with its own
+internal search already in it: a small grid over the parameters you are least sure of, an honest
+inner split to select on, and a guard that keeps the parent configuration when nothing beats it.
+Report which setting won in training_diagnostics.
+
+Two consequences worth stating explicitly. First, a direction that lost at ONE configuration has
+not been shown to be a dead direction, so read a prior campaign's candidate_config_json before
+concluding a family is exhausted -- it tells you the setting that produced the score. Second, your
+own winning configuration is recorded and inherited by later campaigns, so tuning well is not
+throwaway work.
 
 Where the headroom is. These are all reachable from your interface and all worth covering; the
 campaign has few iterations, so prefer a direction the records show has not been measured yet
@@ -439,7 +462,23 @@ metrics are zeros, not a score. Say so plainly, treat the scientific direction a
 and make the lesson the specific defect to avoid. Otherwise reflect only on the supplied trusted
 result. Do not invent runs,
 metrics, causal claims, or promotions. Recommend closing, retaining a specialist, or proposing a
-next experiment using the typed recommendation vocabulary.""",
+next experiment using the typed recommendation vocabulary.
+
+You may also ask up to four questions of the TRAINING data, in analysis_requests. The trusted
+controller answers them over training rows only and puts the scalars in the next iteration's
+context, so this is the one way you can look at the data rather than at summaries chosen for you.
+It costs no iteration. Ask questions whose answer would change your next proposal:
+
+- {"kind": "within_user_interaction", "feature": A, "second_feature": B} reports the within-user
+  correlation of A, of B, and of their product with long_view. Use it before building a cross:
+  a product that does not beat both single columns is already captured by what you have.
+- {"kind": "label_rate_by_bucket", "feature": A, "buckets": N} reports the training label rate per
+  quantile bucket of A. A non-monotonic pattern means a linear term cannot capture that column.
+- {"kind": "signal_by_slate_size", "feature": A, "buckets": N} reports A's within-user correlation
+  split by slate size. A column whose signal sits only in large slates helps GAUC and not nDCG@5.
+
+Feature names must come from controller_causal_feature_bundle.feature_names_csv exactly. An
+unanswerable question is returned to you as a failure record with the reason, not as an error.""",
 }
 
 # PROPOSE and REFLECT emit no files, so they are not charged for the environment notes or the

@@ -92,8 +92,22 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _exact_fields(raw: Mapping[str, object], expected: set[str], location: str) -> None:
-    unknown = set(raw) - expected
+def _exact_fields(
+    raw: Mapping[str, object],
+    expected: set[str],
+    location: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
+    """Check a response's key set, allowing named fields to be absent.
+
+    ``optional`` exists so the contract can gain a capability without invalidating every response
+    recorded before it. An optional field is still rejected when present but malformed; it is only
+    its absence that is tolerated.
+    """
+
+    permitted = expected | (optional or set())
+    unknown = set(raw) - permitted
     missing = expected - set(raw)
     if unknown:
         raise SchemaValidationError(f"unknown {location} field(s): {', '.join(sorted(unknown))}")
@@ -1455,12 +1469,22 @@ class Reflection:
     summary: str
     recommendation: str
     lessons: tuple[str, ...]
+    # Bounded train-only questions for the next iteration. Kept as inert wire mappings here: this
+    # module owns the response contract and must not depend on the campaign's analysis executor.
+    analysis_requests: tuple[Mapping[str, object], ...] = ()
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         _schema_version(self.schema_version, "reflection")
         _text(self.response_id, "reflection.response_id", identifier=True)
         _text(self.summary, "reflection.summary")
+        if type(self.analysis_requests) is not tuple or len(self.analysis_requests) > 4:
+            raise SchemaValidationError("reflection.analysis_requests must be at most 4 entries")
+        for index, request in enumerate(self.analysis_requests):
+            if not isinstance(request, Mapping):
+                raise SchemaValidationError(
+                    f"reflection.analysis_requests[{index}] must be an object"
+                )
         if self.recommendation not in {
             "close_branch",
             "retain_specialist",
@@ -1479,6 +1503,7 @@ class Reflection:
             "summary": self.summary,
             "recommendation": self.recommendation,
             "lessons": list(self.lessons),
+            "analysis_requests": [dict(item) for item in self.analysis_requests],
         }
 
     @property
@@ -1495,6 +1520,7 @@ class Reflection:
             raw,
             {"schema_version", "response_id", "summary", "recommendation", "lessons"},
             "reflection",
+            optional={"analysis_requests"},
         )
         return cls(
             schema_version=_schema_version(raw["schema_version"], "reflection"),
@@ -1502,7 +1528,45 @@ class Reflection:
             summary=_text(raw["summary"], "reflection.summary"),
             recommendation=_text(raw["recommendation"], "reflection.recommendation"),
             lessons=_string_tuple(raw["lessons"], "reflection.lessons", maximum_items=16),
+            analysis_requests=_analysis_requests(raw.get("analysis_requests", ())),
         )
+
+
+def _analysis_requests(value: object) -> tuple[Mapping[str, object], ...]:
+    """Validate the shape of requested analyses without interpreting their meaning.
+
+    This module owns the response contract; the campaign's executor owns the vocabulary and the
+    train-only guarantee. Anything unrecognised is rejected here so a malformed request cannot
+    reach the executor at all.
+    """
+
+    if value is None or value == ():
+        return ()
+    if not isinstance(value, list) or len(value) > 4:
+        raise SchemaValidationError("reflection.analysis_requests must be a list of at most 4")
+    requests: list[Mapping[str, object]] = []
+    for index, item in enumerate(value):
+        location = f"reflection.analysis_requests[{index}]"
+        if not isinstance(item, Mapping):
+            raise SchemaValidationError(f"{location} must be an object")
+        _exact_fields(item, {"kind", "feature"}, location, optional={"second_feature", "buckets"})
+        _text(item["kind"], f"{location}.kind")
+        _text(item["feature"], f"{location}.feature")
+        second = item.get("second_feature")
+        if second is not None:
+            _text(second, f"{location}.second_feature")
+        buckets = item.get("buckets", 5)
+        if type(buckets) is not int or not 2 <= buckets <= 10:
+            raise SchemaValidationError(f"{location}.buckets must be an integer in [2, 10]")
+        requests.append(
+            {
+                "kind": item["kind"],
+                "feature": item["feature"],
+                "second_feature": second,
+                "buckets": buckets,
+            }
+        )
+    return tuple(requests)
 
 
 def _strict_object_schema(title: str, properties: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
@@ -1633,6 +1697,34 @@ _REFLECTION_SCHEMA: Final = _strict_object_schema(
             "items": _TEXT_SCHEMA,
             "minItems": 1,
             "maxItems": 16,
+        },
+        # Questions to answer over the TRAINING split before the next proposal. The controller
+        # validates and computes these; the model receives scalars, never rows and never code
+        # execution. Attached here rather than as its own operation so asking costs no extra
+        # provider call.
+        "analysis_requests": {
+            "type": "array",
+            "items": _strict_object_schema(
+                "AnalysisRequest",
+                {
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "within_user_interaction",
+                            "label_rate_by_bucket",
+                            "signal_by_slate_size",
+                        ],
+                    },
+                    "feature": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "second_feature": {
+                        "type": ["string", "null"],
+                        "maxLength": 128,
+                    },
+                    "buckets": {"type": "integer", "minimum": 2, "maximum": 10},
+                },
+            ),
+            "minItems": 0,
+            "maxItems": 4,
         },
     },
 )

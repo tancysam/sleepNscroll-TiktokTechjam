@@ -291,9 +291,7 @@ class OfficialFMSeedEnsembleReplayRecipe:
         ):
             raise ReplayRecipeError("fm_members must be a tuple of OfficialFMMemberRecipe")
         if not (
-            MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS
-            <= len(members)
-            <= MAX_OFFICIAL_FM_ENSEMBLE_MEMBERS
+            MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS <= len(members) <= MAX_OFFICIAL_FM_ENSEMBLE_MEMBERS
         ):
             raise ReplayRecipeError(
                 f"fm_members must contain between {MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS} and "
@@ -343,9 +341,7 @@ class OfficialFMSeedEnsembleReplayRecipe:
 
 
 type ReplayRecipe = (
-    GeneratedLambdaRankReplayRecipe
-    | OfficialFMReplayRecipe
-    | OfficialFMSeedEnsembleReplayRecipe
+    GeneratedLambdaRankReplayRecipe | OfficialFMReplayRecipe | OfficialFMSeedEnsembleReplayRecipe
 )
 
 
