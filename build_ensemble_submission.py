@@ -163,8 +163,10 @@ def main() -> int:
     delta = result.primary - PUBLISHED_BASELINE_VALIDATION
     print(f"    GAUC     {result.gauc:.10f}")
     print(f"    nDCG@5   {result.ndcg_at_5:.10f}")
-    print(f"    primary  {result.primary:.10f}   vs published {PUBLISHED_BASELINE_VALIDATION} "
-          f"= {delta:+.10f}")
+    print(
+        f"    primary  {result.primary:.10f}   vs published {PUBLISHED_BASELINE_VALIDATION} "
+        f"= {delta:+.10f}"
+    )
 
     print("\nscoring the hidden test split (labels never read)")
     final = dataset.split(SplitName.TEST)
@@ -228,8 +230,10 @@ def main() -> int:
     )
     print(f"wrote {out / 'provenance.json'}")
     print("\nValidate with the organizer checker:")
-    print(f"    cd {starter_dir} && python submit.py "
-          f"{(out / 'submission.csv').resolve()} --data_dir <DATA> --split test --check")
+    print(
+        f"    cd {starter_dir} && python submit.py "
+        f"{(out / 'submission.csv').resolve()} --data_dir <DATA> --split test --check"
+    )
     return 0
 
 

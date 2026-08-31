@@ -46,8 +46,7 @@ def main() -> int:
         per[run]["cost_milli"] += round(cost * 1000)
 
     header = (
-        f"{'run':<22}{'usage calls':>12}{'input':>11}{'output':>11}"
-        f"{'total':>12}{'reasoning':>11}"
+        f"{'run':<22}{'usage calls':>12}{'input':>11}{'output':>11}{'total':>12}{'reasoning':>11}"
     )
     print(header)
     print("-" * len(header))

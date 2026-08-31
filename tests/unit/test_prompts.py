@@ -178,7 +178,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
-    assert PROMPT_VERSION == 17
+    assert PROMPT_VERSION == 18
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -588,3 +588,28 @@ def test_no_role_reads_the_whole_briefing_any_more() -> None:
     for operation in ResearchOperation:
         rendered = instructions_for(operation)
         assert not all(block in rendered for block in blocks), operation
+
+
+def test_the_proposer_knows_why_a_different_model_family_matters() -> None:
+    """It knew `lightgbm` was installed and not why that mattered, for three prompt versions.
+
+    The argument -- native ranking objective, genuinely different model family -- lived in the
+    execution-environment block, which only IMPLEMENT and REPAIR receive. Scoping the briefing by
+    role moved the reasoning away from the only role that chooses an axis.
+    """
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert "lambdarank" in rendered
+    assert "genuinely different model family" in rendered
+    # And the measurement that makes it worth an iteration rather than a preference.
+    assert "0.95 to 0.99" in rendered, "the campaigns' agreement with each other must be stated"
+    assert "+0.00079" in rendered and "+0.00116" in rendered
+    assert "disagreement is the thing the portfolio\nlacks" in rendered
+
+
+def test_the_tree_caution_travels_with_the_tree_suggestion() -> None:
+    """43 rows per user makes a high-cardinality split memorisation, not generalisation."""
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert "43 training rows per user" in rendered
+    assert "wrong input for a tree" in rendered

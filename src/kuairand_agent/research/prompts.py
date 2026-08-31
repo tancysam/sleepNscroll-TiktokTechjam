@@ -20,7 +20,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 17
+PROMPT_VERSION: Final = 18
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -392,6 +392,38 @@ _BUILDABILITY: Final = _measured(_ITERATION_BUDGET[_ITERATION_BUDGET.index(_BUIL
 _METRICS: Final = _measured(_METRIC_MECHANICS)
 _HAZARDS: Final = _measured(_IMPLEMENTATION_HAZARDS)
 
+#: Why a different model family is worth proposing. This belongs with the role that CHOOSES an
+#: axis, and for three prompt versions it did not reach it: the argument lived in the execution
+#: environment block, which only the code-writing roles receive, so the proposer knew `lightgbm`
+#: was installed and not why that mattered.
+_MODEL_FAMILY: Final = """\
+A different model family is on the table, and your portfolio is short of one.
+
+`lightgbm` is installed and it has a native ranking objective. `objective="lambdarank"` with
+per-user group sizes optimises NDCG directly, which is the metric family being scored, and the
+training request already supplies the user grouping needed to build those groups. A gradient
+boosted ranker over the dense causal columns is a genuinely different model family from the
+parent's linear/FM scorer, not a variation of it.
+
+Why that is worth an iteration right now, measured rather than argued. Five completed campaigns
+were rank-ensembled and gained only +0.00079 over an official-FM mean, against +0.00116 for the
+organizers' own five seeds. The reason is in the correlations: the five campaigns agree with each
+other at rank correlation 0.95 to 0.99, and each agrees with the official control at about 0.85.
+They are near-copies of one another, so their errors do not cancel. An ensemble gains in
+proportion to how much its members DISAGREE while each staying strong.
+
+A boosted tree over the causal aggregates disagrees with a factorization machine over identity
+codes by construction: trees express non-monotone thresholds and interactions that a latent-factor
+model cannot, and the FM expresses identity crosses that a tree at any practical depth cannot.
+That is the largest available source of disagreement, and disagreement is the thing the portfolio
+lacks -- not another variation on the inherited scorer.
+
+Two cautions if you take it. High-cardinality identity codes are the wrong input for a tree: at
+about 43 training rows per user, splitting on `user_id_code` memorises rather than generalises.
+The low-cardinality codes are fine. And a tree member still has to be strong standalone -- a
+weak member is refused before Fold A, and in the five-campaign ensemble above, dropping the one
+near-zero member IMPROVED the result."""
+
 _PACKAGES_TAIL: Final = """Execution environment
 
 `lightgbm` matters here because it has a native ranking objective. `objective="lambdarank"` with
@@ -759,6 +791,7 @@ _SECTIONS: Final = {
         _BUILDABILITY,
         _METRICS,
         _ENVIRONMENT_FACTS,
+        _MODEL_FAMILY,
         _FEATURE_AUTHORITY,
     ),
     # IMPLEMENT keeps the metric mechanics: how GAUC weights users by positive count is what a
