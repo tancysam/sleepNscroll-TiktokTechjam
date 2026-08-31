@@ -118,6 +118,62 @@ def _load_candidate(directory: Path) -> tuple[object, dict[str, object]]:
     return module, json.loads((directory / "config.json").read_text(encoding="utf-8"))
 
 
+def evaluate_candidate(
+    candidate_dir: Path | str,
+    data_dir: str = ".data/KuaiRand-Pure/data",
+    starter_dir: str = "kuairand-starter-kit",
+) -> float:
+    """Fold B standalone primary for one candidate tree, scored by the protected scorer.
+
+    Extracted so `advance_seed.py` gates a cross-campaign promotion with the same harness that
+    gates the parent, rather than a second implementation that could drift from it.
+    """
+
+    return _fold_b_primary(Path(data_dir), Path(starter_dir), Path(candidate_dir))
+
+
+def _fold_b_primary(data_dir: Path, starter_dir: Path, candidate_dir: Path) -> float:
+    dataset = load_canonical_dataset(data_dir)
+    train = dataset.split(SplitName.TRAIN)
+    assert train.targets is not None
+    dates = np.asarray(train.inputs.date)
+    all_labels = np.asarray(train.targets.long_view, dtype=np.int8)
+    prefix_rows = np.flatnonzero((dates >= _PREFIX_DATES[0]) & (dates <= _PREFIX_DATES[1]))
+    query_rows = np.flatnonzero((dates >= _QUERY_DATES[0]) & (dates <= _QUERY_DATES[1]))
+    prefix_inputs = subset_canonical_inputs(train.inputs, prefix_rows.tolist())
+    query_inputs = subset_canonical_inputs(train.inputs, query_rows.tolist())
+    pair = build_pure_feature_pair(
+        prefix_inputs=prefix_inputs,
+        prefix_labels=[int(value) for value in all_labels[prefix_rows]],
+        query_inputs=query_inputs,
+        dataset_digest=dataset.digest,
+        split_role="inner_train",
+        builder_source_digest=_BUILDER_DIGEST,
+        prefix_auxiliary={
+            name: [int(v) for v in np.asarray(train.targets.column(name))[prefix_rows]]
+            for name in ("is_click", "is_like")
+        },
+    )
+    split = SplitIdentity(name="inner_valid", token="seed-gate-v1", expected_count=len(query_rows))
+    alignment = Alignment.from_ids(
+        split=split, user_ids=query_inputs.user_id, video_ids=query_inputs.video_id
+    )
+    scorer = ProtectedScorer(starter_dir=starter_dir, trusted_alignment=alignment)
+    model_impl, config = _load_candidate(candidate_dir)
+    return _fit_and_score(
+        np.asarray(pair.prefix.values, dtype=np.float64),
+        np.asarray(all_labels[prefix_rows], dtype=np.float64),
+        np.asarray([hash(value) % (2**31) for value in prefix_inputs.user_id], dtype=np.float64),
+        np.asarray(pair.query.values, dtype=np.float64),
+        scorer,
+        alignment,
+        split,
+        all_labels[query_rows],
+        config,
+        model_impl,
+    )
+
+
 def main(data_dir: str, starter_dir: str, candidate_dir: str = "candidate_seed") -> int:
     dataset = load_canonical_dataset(Path(data_dir))
     train = dataset.split(SplitName.TRAIN)
