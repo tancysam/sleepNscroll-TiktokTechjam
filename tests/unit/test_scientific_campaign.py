@@ -785,3 +785,91 @@ def test_a_candidate_that_genuinely_scores_worse_keeps_the_screen_failure_reason
 
     assert result.candidates[0].outcome is CandidateOutcome.SCREEN_REJECTED
     assert result.candidates[0].reason == "fold_b_screen_failed"
+
+
+# The Fold B screen reads the rank-FUSED primary, which is mostly the official control's own
+# ordering. sol5 iteration-01 scored 0.570702 standalone against a control of 0.575424 and still
+# cleared a screen tightened to one measured sigma, because the 25/75 blend the selector rescued
+# it into beat the parent by 0.000153. It then spent a Fold A launch and three outer seeds.
+
+
+def _screened(
+    request: ScientificRunRequest,
+    primary: float,
+    *,
+    standalone: float | None,
+    control: float | None,
+) -> ScientificRunEvidence:
+    return replace(
+        _evidence(request, primary),
+        standalone_primary=standalone,
+        control_primary=control,
+    )
+
+
+def test_a_model_far_below_the_control_is_refused_before_fold_a() -> None:
+    """The blend passed; the model did not. Only the model earns the next launch."""
+
+    requests: list[ScientificRunRequest] = []
+
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        requests.append(request)
+        # A blend comfortably over the parent, hiding a model 4.7 sigma below the control.
+        return _screened(request, 0.601, standalone=0.570702, control=0.575424)
+
+    result = run_scientific_campaign(
+        config=replace(_config(), standalone_tolerance=0.001896),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert [request.tier for request in requests] == [ScientificTier.FOLD_B_SCREEN]
+    assert result.candidates[0].outcome is CandidateOutcome.SCREEN_REJECTED
+    assert result.candidates[0].reason == "fold_b_standalone_below_control"
+    assert result.incumbent.candidate_id == "official-fm"
+
+
+def test_the_best_candidate_on_record_still_clears_the_standalone_gate() -> None:
+    """Run 16 sits 0.00089 below the control and is the structure the briefing recommends.
+
+    A gate that demanded an outright standalone win would reject every candidate this project
+    has produced, so this pins the tolerance as a tolerance.
+    """
+
+    requests: list[ScientificRunRequest] = []
+
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        requests.append(request)
+        return _screened(request, 0.601, standalone=0.574534, control=0.575424)
+
+    run_scientific_campaign(
+        config=replace(_config(), standalone_tolerance=0.001896),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert ScientificTier.FOLD_A_CONFIRMATION in [request.tier for request in requests]
+
+
+def test_a_runner_that_discloses_no_standalone_keeps_the_historical_behaviour() -> None:
+    """Absent disclosure must not be read as a failing model."""
+
+    requests: list[ScientificRunRequest] = []
+
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        requests.append(request)
+        return _screened(request, 0.601, standalone=None, control=None)
+
+    run_scientific_campaign(
+        config=replace(_config(), standalone_tolerance=0.001896),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert ScientificTier.FOLD_A_CONFIRMATION in [request.tier for request in requests]
