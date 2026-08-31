@@ -16,7 +16,7 @@ def test_candidate_generation_prompts_derive_the_enforced_source_contract(
 ) -> None:
     instructions = instructions_for(operation)
 
-    assert PROMPT_VERSION == 12
+    assert PROMPT_VERSION == 14
     assert DEFAULT_CANDIDATE_SOURCE_POLICY.digest in instructions
     assert "candidate.py" in instructions
     assert "baseline.py" in instructions

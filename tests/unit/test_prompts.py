@@ -178,7 +178,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
-    assert PROMPT_VERSION == 12
+    assert PROMPT_VERSION == 14
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -201,9 +201,9 @@ def test_axis_choosing_operations_are_shown_the_closed_families(
     operation: ResearchOperation,
 ) -> None:
     rendered = instructions_for(operation, blocked_families=(("pairwise", "already lost"),))
-    assert "Closed proposal families" in rendered
+    assert "Family verdicts" in rendered
     assert "pairwise: already lost" in rendered
-    assert "Choose a different axis." in rendered
+    assert "remain open except where named closed above" in rendered
 
 
 @pytest.mark.parametrize("operation", (ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR))
@@ -213,11 +213,11 @@ def test_committed_operations_are_not_charged_for_closures(
     """IMPLEMENT and REPAIR serve an already-admitted proposal and cannot act on a closure."""
 
     rendered = instructions_for(operation, blocked_families=(("pairwise", "already lost"),))
-    assert "Closed proposal families" not in rendered
+    assert "Family verdicts" not in rendered
 
 
 def test_no_closures_renders_no_section() -> None:
-    assert "Closed proposal families" not in instructions_for(ResearchOperation.PROPOSE)
+    assert "Family verdicts" not in instructions_for(ResearchOperation.PROPOSE)
 
 
 @pytest.mark.parametrize("bad", [(("pairwise",),), (("pairwise", ""),), ((1, "why"),)])
@@ -292,7 +292,10 @@ def test_feature_authority_states_the_measured_cost_of_an_embedding_table() -> N
     rendered = instructions_for(ResearchOperation.PROPOSE)
     assert "0.5705" in rendered, "the measured identity-embedding result must be stated"
     assert "26,211" in rendered and "7,539" in rendered
-    assert "id__tab" in rendered, "the low-cardinality escape hatch must be named"
+    assert "tab_code" in rendered, "the low-cardinality escape hatch must be named"
+    # The identity columns must be named from ID_CODE_FEATURE_NAMES, never restated by hand: an
+    # earlier hand-written copy named `id__user`/`id__tab`, which have never existed.
+    assert "id__" not in rendered
 
 
 def test_instructions_reject_a_foreign_source_policy() -> None:
@@ -391,3 +394,90 @@ def test_proposals_are_steered_toward_the_tested_helpers(operation: ResearchOper
     rendered = " ".join(instructions_for(operation).split())
     assert "Propose mechanisms the implementation can actually build" in rendered
     assert "hand-rolled interaction algebra" in rendered
+
+
+# The seed-ensemble block was the prompt's flagship recommendation and it was wrong twice: it cited
+# the rank-ensemble figure as though it were the raw-score mean, then told the model the rank
+# version was impossible. Run 17 followed it exactly and came out flat. `ensemble_mode_probe.py`
+# measures the correction: grouping by `user_id_code` keeps 96.2% of the controller's own ceiling.
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_the_seed_ensemble_block_states_the_reachable_mechanism(
+    operation: ResearchOperation,
+) -> None:
+    rendered = " ".join(instructions_for(operation).split())
+    assert "0.6021143" in rendered, "the raw-score mean must be attributed to raw averaging"
+    assert "0.6026034" in rendered, "the rank mean must be attributed to rank averaging"
+    assert "0.6025848" in rendered, "the candidate-reachable figure must be stated"
+    assert "user_id_code` is a COLUMN OF THE FEATURE MATRIX" in rendered
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_the_prompt_no_longer_forbids_within_user_normalisation(
+    operation: ResearchOperation,
+) -> None:
+    """The retracted claim, in the words it was written in."""
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "you cannot rank normalise within a user there" not in rendered
+    assert "Average the raw scores or logits instead" not in rendered
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR),
+)
+def test_the_proposer_can_price_its_own_proposal(operation: ResearchOperation) -> None:
+    """PROPOSE chose an axis without being told the libraries or the training budget."""
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "1800 seconds" in rendered, "the launch budget must be stated, not withheld"
+    assert "lightgbm` 4.7.0" in rendered
+    assert "`scikit-learn`, `pandas`, `scipy` and `torch` are NOT installed" in rendered
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (ResearchOperation.PROPOSE, ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR),
+)
+def test_the_full_diagnostics_blacklist_is_documented_not_just_the_token_rule(
+    operation: ResearchOperation,
+) -> None:
+    """Four consecutive iterations died on this gate; the token rule alone does not cover it."""
+
+    rendered = " ".join(instructions_for(operation).split())
+    for exact_key in ("`auc`", "`metric`", "`metrics`", "`recall_50`"):
+        assert exact_key in rendered, f"{exact_key} is refused and must be named"
+
+
+def test_propose_gets_the_budget_without_the_implementation_recipe() -> None:
+    """Token budget: PROPOSE runs every iteration and writes no code."""
+
+    rendered = instructions_for(ResearchOperation.PROPOSE)
+    assert "Resource budget and environment" in rendered
+    assert "Execution environment" not in rendered, "the lightgbm recipe is for code-writing ops"
+    assert "Worked example" not in rendered
+
+
+def test_the_worked_example_is_not_a_measured_dead_end() -> None:
+    """It demonstrated a listwise softmax, which the same prompt calls a measured dead end.
+
+    Candidates copied it: the ledger carries `listwise` and grouped-softmax families. The example
+    now shows the best-measured structure instead -- identity-code interaction with the causal
+    aggregates kept first-order.
+    """
+
+    rendered = instructions_for(ResearchOperation.IMPLEMENT)
+    example = rendered[rendered.index("A valid response returns") :]
+    assert "_group_softmax" not in example
+    assert "fm_interaction_scores" in example
+    assert "categorical_codes" in example
+
+
+def test_the_pairwise_recipe_does_not_invite_a_blocked_proposal() -> None:
+    """The prompt supplied a pairwise recipe while the controller blocks the pairwise family."""
+
+    rendered = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
+    assert "READ THE CLOSED-FAMILIES LIST FIRST" in rendered
+    assert "not an invitation to propose a pairwise one" in rendered

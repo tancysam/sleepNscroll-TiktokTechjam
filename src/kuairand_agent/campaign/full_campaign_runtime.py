@@ -1624,6 +1624,17 @@ def _candidate_config(materialized: object) -> Mapping[str, object] | None:
 # The rendered configuration reaches a later prompt, so it is bounded rather than trusted.
 _RECORD_CONFIG_MAX_CHARS: Final = 600
 
+#: How far a candidate must beat the incumbent on the Fold B screen before it is worth a Fold A
+#: launch and an incumbent re-base.  One measured seed sigma (docs/RESULTS.md 3.4, observed 0.000316
+#: across the five qualified official-FM seeds; the organizers publish 0.0008 on their own
+#: platform).  At the previous 0.0 a candidate promoted on a +0.00004 Fold B delta, which is an
+#: eighth of a sigma, so the incumbent chain was a random walk that spent Fold A launches on noise.
+#:
+#: This does NOT address Fold B overfitting: the two largest Fold B gains in the ledger (+0.00059,
+#: +0.00034) clear this margin and still lost Fold A by more than they won.  It only stops the
+#: churn below the noise floor.
+FOLD_B_SCREEN_MARGIN: Final = 0.000316
+
 
 def _bounded_config_json(config: Mapping[str, object] | None) -> str | None:
     """Render a candidate configuration as compact JSON, or ``None`` when unusable."""
@@ -1712,6 +1723,7 @@ def _fusion_disclosure(
             "candidate_standalone_primary": None,
             "fold_b_control_primary": None,
             "fusion_weights_selected": None,
+            "fusion_model_discarded": None,
             "fusion_note": None,
         }
     standalone = selection.standalone_primary
@@ -1740,6 +1752,10 @@ def _fusion_disclosure(
         "candidate_standalone_primary": None if standalone is None else round(standalone, 7),
         "fold_b_control_primary": None if control is None else round(control, 7),
         "fusion_weights_selected": f"{weights[0]} model, {weights[1]} official FM control",
+        # The note above says this in prose; the flag says it to the family breaker, which
+        # otherwise never closes the harshest verdict of all -- the selector threw the model out
+        # and the record then reads as a tie with the baseline.
+        "fusion_model_discarded": selection.model_was_discarded,
         "fusion_note": note,
     }
 
@@ -1784,6 +1800,12 @@ def _iteration_record(
                     "raised an exception before any evaluation. Treat it as a code defect to "
                     "avoid, not as evidence about the scientific direction."
                 )
+            ),
+            # Without this the note above is all the proposer gets, and a candidate that broke a
+            # stated rule cannot tell which one: four consecutive iterations were lost to the same
+            # rejected diagnostics key because the reason never reached the model.
+            "execution_failure_remedy": (
+                None if candidate_result is None else candidate_result.remedy
             ),
             # The direction this iteration actually tested.  A proposer that cannot see this
             # cannot avoid restating it, and the convergence rule allows very few attempts.
@@ -4558,7 +4580,7 @@ def run_provider_free_campaign(
             qualified_fallback_receipt_digest=fallback_receipt,
             max_scientific_iterations=request.config.benchmark.max_iterations,
             launches_already_used=launches_at_start,
-            screen_margin=0.0,
+            screen_margin=FOLD_B_SCREEN_MARGIN,
             elapsed_seconds_at_start=float(elapsed_at_start),
             wall_clock_seconds=request.config.benchmark.wall_clock_seconds,
             finalization_reserve_seconds=(request.config.runner.finalization_reserve_seconds),

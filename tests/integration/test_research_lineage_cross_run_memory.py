@@ -341,6 +341,7 @@ def test_autonomous_followup_records_real_fold_metrics_against_the_actual_parent
             outcome=SimpleNamespace(value="inner_rejected"),
             runs=(run_b, run_a),
             reason="inner_mean_not_positive",
+            remedy=None,
         )
         return ScientificCampaignResult(
             config_digest=config.digest,
@@ -623,6 +624,7 @@ def test_lineage_ledger_write_survives_an_incomplete_candidate(
             outcome=SimpleNamespace(value="screen_rejected"),
             runs=(SimpleNamespace(digest="1" * 64, metrics=None),),
             reason="fold_b_screen_failed",
+            remedy=None,
         )
         return ScientificCampaignResult(
             config_digest=config.digest,
@@ -786,6 +788,7 @@ def test_lineage_ledger_preserves_a_screen_rejected_candidates_real_fold_b_resul
                 ),
             ),
             reason="fold_b_screen_failed",
+            remedy=None,
         )
         return ScientificCampaignResult(
             config_digest=config.digest,

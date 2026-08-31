@@ -451,14 +451,17 @@ def test_live_lineage_blocks_excluded_proposal_family_before_implementation(
 def test_live_lineage_blocks_a_family_already_admitted_and_not_promoted(
     tmp_path: Path,
 ) -> None:
-    """A family that already reached a full inner-fold evaluation and lost is hard-blocked.
+    """A family that lost TWO full inner-fold evaluations is hard-blocked.
 
-    This is the cross-run circuit breaker: the record here has exactly the shape a
+    This is the cross-run circuit breaker: the records here have exactly the shape a
     ``prior_campaign_lesson_*`` advisory record takes when sourced from the
     ``ResearchLineageLedger`` (see ``full_campaign_runtime._run_autonomous_followups``'s
     ``prior_lineage_advisory_records``), so this exercises the same code path a real second
-    campaign would hit -- one strike from a real training run is enough, unlike the two-strike
-    threshold for cheap pre-admission rejections.
+    campaign would hit.
+
+    One strike used to be enough, which contradicted the briefing's own instruction to read a
+    prior ``candidate_config_json`` before concluding a family is exhausted. A single loss now
+    reopens for one refined attempt; the second loss is what closes the family for good.
     """
 
     model = _LiveFixtureModel()
@@ -470,18 +473,19 @@ def test_live_lineage_blocks_a_family_already_admitted_and_not_promoted(
         dataset_manifest_sha256="b" * 64,
         capability_manifests=(),
         budgets=ResearchBudgetContext(44, 18_000, 1, 0),
-        campaign_records=(
+        campaign_records=tuple(
             AggregateRecord(
-                "prior_campaign_lesson_0001",
+                f"prior_campaign_lesson_{ordinal:04d}",
                 {
-                    "campaign_id": "earlier-campaign",
+                    "campaign_id": f"earlier-campaign-{ordinal}",
                     "branch_outcome": "admitted",
                     "proposal_family": "binary-long-view-ranking",
                     "inner_fold_a_primary": 0.6074,
                     "parent_fold_a_primary": 0.6074,
                     "promoted": False,
                 },
-            ),
+            )
+            for ordinal in (1, 2)
         ),
     )
 

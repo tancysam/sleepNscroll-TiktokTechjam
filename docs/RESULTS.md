@@ -291,21 +291,35 @@ inferred:
    Commit `4aa6a25` added `user_id_code` (bundle 37 → 38 columns, user vocabulary 26,211, 1.59% of
    validation rows on the unknown slot). **This hypothesis is falsified:** run 15 stayed at −5.15σ.
    The change was structurally correct and did not close the gap.
-2. **No within-user rank normalisation at prediction time**, for the same reason. This is why
-   run 17's internal five-member seed ensemble came out flat — 0.5740230 against run 16's
-   0.5745312, a 0.6σ difference that is inside noise. `ensemble_mode_probe.py` measures the cause
-   on the five qualified official FM seeds: averaging on raw scores is worth **+0.0000772** while
-   averaging on within-user rank percentiles is worth **+0.0005664**. **86% of the ensembling gain
-   is the rank normalisation**, and a candidate cannot perform it. **Second hypothesis falsified**,
-   with the mechanism identified rather than guessed at.
+2. **No within-user rank normalisation at prediction time — RETRACTED, see below.** This was
+   offered as the reason run 17's internal five-member seed ensemble came out flat — 0.5740230
+   against run 16's 0.5745312, a 0.6σ difference inside noise. `ensemble_mode_probe.py` measures
+   the mechanism on the five qualified official FM seeds: averaging on raw scores is worth
+   **+0.0000772** while averaging on within-user rank percentiles is worth **+0.0005664**, so
+   **86% of the ensembling gain is the rank normalisation**. That half stands. The claim that a
+   candidate cannot perform it does not.
+
+   `user_id_code` is a *column of the feature matrix* (`pure_features.py`
+   `ID_CODE_FEATURE_NAMES`), so it reaches `predict_scores` like any other feature: the absent
+   capability is `user_groups`, not user identity. A candidate can group its own rows by that code
+   and normalise inside each group. Re-measured with the same five seeds, grouping by
+   `user_id_code` scores **0.6025848** against the true-user-id ceiling of 0.6026034 — **+0.0005478
+   over the best single seed, keeping 96.2% of the ceiling**. The unknown slot is 1,990 of 124,909
+   validation rows (1.59%) and costs −0.0000186, handled by ranking that pool among itself.
+
+   So run 17 was not blocked by the seam; it was following a briefing that told it to average raw
+   scores, which is the row measured flat. `prompts.py` v14 carries the corrected recipe. This is
+   the largest single mechanism still available to a candidate, and it was closed off by an
+   incorrect structural claim in this document.
 3. **No early stopping on the scored split.** `baselines/starter_fm.py:701-708` keeps the epoch
    scoring best *on the split it is then reported on*, over up to 40 epochs. The published 0.6016
    has the same property (`baseline.py:88`, `if va['primary'] > best`). Our candidate never sees
    that split and gets one shot, so the residual ~1σ is measured against a reference holding an
    advantage the seam denies it.
 
-The agent-side levers are therefore exhausted, and the reason is demonstrated rather than assumed.
-None of the three is reachable by changing the briefing.
+Two of the three are structural and demonstrated. The second was neither: it was reachable by
+changing the briefing all along, and this section asserting otherwise is what stopped anyone
+looking. Limits 1 and 3 stand; limit 2 is retracted above.
 
 A fourth cause was informational rather than structural: **the agent was never told fusion
 existed.** `prompts.py` did not contain the word, and the primary returned to reflection was the

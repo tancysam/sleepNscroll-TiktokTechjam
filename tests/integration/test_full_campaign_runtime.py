@@ -17,6 +17,7 @@ from kuairand_agent.campaign.controller import (
     CampaignEngine,
 )
 from kuairand_agent.campaign.convergence import ConvergenceState
+from kuairand_agent.campaign.failure_remedies import remedy_for
 from kuairand_agent.campaign.full_campaign import (
     FullCampaignCancelled,
     FullCampaignError,
@@ -1089,6 +1090,10 @@ def test_a_crashed_candidate_is_recorded_as_scoreless_rather_than_as_a_baseline_
         outcome=CandidateOutcome.CALLBACK_FAILED,
         runs=(),
         reason="callback_failed:CandidateExecutionError",
+        remedy=remedy_for(
+            "CandidateProtocolError: diagnostics contain a candidate-declared official "
+            "metric at diagnostics.inner_gauc"
+        ),
     )
     result = ScientificCampaignResult(
         config_digest=config.digest,
@@ -1114,6 +1119,9 @@ def test_a_crashed_candidate_is_recorded_as_scoreless_rather_than_as_a_baseline_
     assert values["candidate_primary"] is None
     assert values["delta_vs_incumbent"] is None
     assert "NO measured score" in cast(str, values["execution_failure_note"])
+    # The note alone says only "a defect happened". Four consecutive sol3 iterations were lost
+    # re-emitting the same rejected diagnostics key because the reason never reached the model.
+    assert "inner_score" in cast(str, values["execution_failure_remedy"])
 
 
 def _breadth_fixture(

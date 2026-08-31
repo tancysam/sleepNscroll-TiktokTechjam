@@ -151,6 +151,7 @@ def test_disclosure_is_empty_rather_than_wrong_when_no_fold_b_selection_exists()
         "candidate_standalone_primary": None,
         "fold_b_control_primary": None,
         "fusion_weights_selected": None,
+        "fusion_model_discarded": None,
         "fusion_note": None,
     }
 
@@ -174,3 +175,21 @@ def test_selection_still_refuses_a_grid_that_is_not_the_frozen_one() -> None:
             selected_prediction_digest="00" * 32,
             selected_fusion_digest="10" * 32,
         )
+
+
+def test_the_screen_margin_is_a_measured_sigma_not_zero() -> None:
+    """At 0.0 a candidate promoted on a +0.00004 Fold B delta and re-based the incumbent.
+
+    That is an eighth of the measured seed sigma (docs/RESULTS.md 3.4, 0.000316), so the incumbent
+    chain was a random walk spending Fold A launches on noise.
+    """
+
+    from kuairand_agent.campaign.full_campaign_runtime import FOLD_B_SCREEN_MARGIN
+
+    assert FOLD_B_SCREEN_MARGIN == 0.000316
+    # The churn it stops.
+    assert FOLD_B_SCREEN_MARGIN > 0.00004
+    # And what it does NOT stop: the two largest Fold B gains on record clear this margin and
+    # still lost Fold A by more than they won. This margin is not a fix for Fold B overfitting.
+    assert FOLD_B_SCREEN_MARGIN < 0.000590
+    assert FOLD_B_SCREEN_MARGIN < 0.000344

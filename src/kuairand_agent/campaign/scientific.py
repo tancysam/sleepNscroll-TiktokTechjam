@@ -20,6 +20,7 @@ from pathlib import PurePosixPath
 from typing import Final, Protocol
 
 from kuairand_agent.campaign.convergence import ConvergenceState
+from kuairand_agent.campaign.failure_remedies import remedy_for
 from kuairand_agent.campaign.selector import (
     CandidateEvidence,
     FoldEvidence,
@@ -761,6 +762,9 @@ class CandidateCampaignResult:
     runs: tuple[ScientificRunEvidence, ...]
     reason: str
     selection: SelectionDecision | None = None
+    #: Trusted advice for a failure the candidate could have avoided. Always a constant from
+    #: ``failure_remedies``; never text a candidate authored. ``None`` when unrecognised.
+    remedy: str | None = None
 
 
 def _direction(candidate: float, incumbent: float) -> str:
@@ -925,8 +929,14 @@ def _validate_evidence(
 def _invoke_runner(
     runner: ScientificRunCallback,
     request: ScientificRunRequest,
-) -> tuple[ScientificRunEvidence | None, str | None]:
-    """Contain candidate-controlled failures, including malformed returned evidence."""
+) -> tuple[ScientificRunEvidence | None, str | None, str | None]:
+    """Contain candidate-controlled failures, including malformed returned evidence.
+
+    Only the exception's type name crosses back, never its message, which can quote
+    candidate-authored text. ``remedy_for`` reads that message under containment and
+    answers with a trusted constant, so a recognised rule violation reaches the next
+    proposer as advice it can act on without the candidate authoring a word of it.
+    """
 
     try:
         evidence = runner(request)
@@ -934,8 +944,8 @@ def _invoke_runner(
     except ScientificCampaignCancelled:
         raise
     except Exception as exc:
-        return None, type(exc).__name__
-    return evidence, None
+        return None, type(exc).__name__, remedy_for(str(exc))
+    return evidence, None, None
 
 
 def _effective_gates(evidence: ScientificRunEvidence) -> GateEvidence:
@@ -1176,7 +1186,7 @@ def run_scientific_campaign(
             seed=0,
         )
         launches_used += 1
-        evidence, callback_failure = _invoke_runner(runner, request)
+        evidence, callback_failure, callback_remedy = _invoke_runner(runner, request)
         if evidence is None:
             elapsed_seconds += candidate.p95_runtime_seconds
             results.append(
@@ -1185,6 +1195,7 @@ def run_scientific_campaign(
                     outcome=CandidateOutcome.CALLBACK_FAILED,
                     runs=(),
                     reason=f"callback_failed:{callback_failure}",
+                    remedy=callback_remedy,
                 )
             )
             # The branch raised before any evaluation, so it produced no validation primary
@@ -1265,7 +1276,7 @@ def run_scientific_campaign(
             seed=0,
         )
         launches_used += 1
-        fold_a_evidence, callback_failure = _invoke_runner(runner, fold_a_request)
+        fold_a_evidence, callback_failure, callback_remedy = _invoke_runner(runner, fold_a_request)
         if fold_a_evidence is None:
             elapsed_seconds += candidate.p95_runtime_seconds
             results.append(
@@ -1274,6 +1285,7 @@ def run_scientific_campaign(
                     outcome=CandidateOutcome.CALLBACK_FAILED,
                     runs=(evidence,),
                     reason=f"fold_a_callback_failed:{callback_failure}",
+                    remedy=callback_remedy,
                 )
             )
             # The branch raised before any evaluation, so it produced no validation primary
@@ -1437,7 +1449,7 @@ def run_scientific_campaign(
                 seed=seed,
             )
             launches_used += 1
-            outer_evidence, _ = _invoke_runner(runner, outer_request)
+            outer_evidence, _, _ = _invoke_runner(runner, outer_request)
             if outer_evidence is None:
                 elapsed_seconds += candidate.p95_runtime_seconds
                 outer_failed = True

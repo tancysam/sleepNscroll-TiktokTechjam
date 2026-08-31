@@ -7,13 +7,14 @@ from typing import Final
 
 from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
+from kuairand_agent.research.proposal_families import REOPENABLE_REASONS
 from kuairand_agent.research.schemas import ResearchOperation
 from kuairand_agent.research.source_policy import (
     DEFAULT_CANDIDATE_SOURCE_POLICY,
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 12
+PROMPT_VERSION: Final = 14
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -95,6 +96,13 @@ internal search already in it: a small grid over the parameters you are least su
 inner split to select on, and a guard that keeps the parent configuration when nothing beats it.
 Report which setting won in training_diagnostics.
 
+Name those diagnostics carefully, because the obvious names are fatal. Only the evaluator may
+name an official metric, so training_diagnostics is refused outright if any key contains the
+token `gauc`, `ndcg` or `primary`, or if any string value names one. The refusal happens after
+your training has already succeeded and it discards the whole run. `inner_gauc`, `val_ndcg@5`
+and `primary_by_size` are all rejected; `inner_score`, `inner_score_by_size`, `selected_members`
+and `guard_margin` are all fine. Report the NUMBER you selected on, never the metric's name.
+
 Propose mechanisms the implementation can actually build. The parent already ships tested helpers
 for the pieces that used to crash branches: categorical code extraction, per-fold embedding table
 sizing, the FM second-order interaction term, and within-user pair sampling. A proposal that rests
@@ -170,36 +178,52 @@ twelve. Start from that structure. Two further measurements from the same run: p
 loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
 collapsed it to 0.5630, so do not replace the loss.
 
-The cheapest remaining way to cross the control is SEED ENSEMBLING, and its effect size on this
-exact benchmark is already measured. The five qualified seeds of the official FM score 0.6014695,
-0.6017609, 0.6010903, 0.6015031 and 0.6020371 on public validation; averaging all five scores
-0.6026034, which beats every individual seed including the luckiest. Seed-to-seed sigma is 0.0008
-and averaging removes most of it. That is a larger effect than any modelling change in this
-project's history, and it is available to you inside a single candidate:
+The cheapest remaining way to cross the control is SEED ENSEMBLING, and every number below is
+measured on this exact benchmark rather than argued. The five qualified seeds of the official FM
+score 0.6014695, 0.6017609, 0.6010903, 0.6015031 and 0.6020371 on public validation. What you do
+with those five prediction vectors decides almost the whole effect:
+
+    averaging the raw scores                       0.6021143   +0.0000772 over the best seed
+    averaging WITHIN-USER RANK PERCENTILES         0.6026034   +0.0005664 over the best seed
+
+Six times the gain, from the normalisation and not from the averaging. Raw-score averaging has
+been tried in this project and came out flat, exactly as that first row predicts. Do not repeat it.
+
+You CAN do the second row. `predict_scores` receives the feature matrix and the checkpoint and
+nothing else, and there is no `user_groups` at prediction time -- but `user_id_code` is a COLUMN OF
+THE FEATURE MATRIX, so user identity is right there in your own input. Group your rows by it and
+normalise inside each group. Measured with the same five seeds, grouping by `user_id_code` instead
+of the true user id scores 0.6025848, which is +0.0005478 over the best seed and keeps 96.2% of
+the ceiling above. The recipe:
 
 - Derive N child seeds deterministically from the `seed` argument you are given, so replay stays
   byte exact. N = 5 is the measured point.
 - Train N copies of the SAME scorer on the SAME data and store every parameter set in the
   checkpoint under indexed names.
-- In `predict_scores`, average the N members' scores.
-
-One constraint that will otherwise break this: `predict_scores` receives the feature matrix and
-the checkpoint and NOTHING ELSE. There is no `user_groups` at prediction time, so you cannot rank
-normalise within a user there. Average the raw scores or logits instead. That is valid here
-because every member shares one architecture, one standardisation and one training set, so their
-scales are directly comparable.
+- In `predict_scores`, score every member, then for EACH member convert its scores to within-group
+  percentiles in `[0, 1]` using `user_id_code` as the group key, ties sharing their average rank
+  and a singleton group taking 0.5. Average the percentiles, not the raw scores.
+- Handle the unknown slot. Every user absent from the training fold encodes to the one trailing
+  code, so that group is a mixture of unrelated users and must not be ranked as if it were a
+  single slate. Rank those rows among themselves instead: any monotone function of the raw score
+  preserves each hidden user's own ordering, which is all the metrics read. That pool is 1.59% of
+  validation rows and costs -0.0000186 of the gain, so it does not threaten the result.
 
 This is a variance-reduction change, not a new architecture. Hold the scorer fixed and wrap it in
 a loop. It is a few extra lines, not a bigger model.
 
-Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
-user's positive count, and per-user AUC divides by that user's pair count, so an eligible pair
-carries weight proportional to 1/n_negatives_u. Sample a positive row uniformly from the pooled
-positives of GAUC-eligible users, then a negative uniformly from that same user's logged negatives,
-and optimise `softplus(-(s_positive - s_negative))`. Sampling users uniformly, or sampling
-uniformly across all pairs, or sampling unexposed catalogue items, each optimises a different
-quantity than the one being scored. Pair this with a scoring function that has the capacity to
-reorder; on its own it has already been measured flat.
+Metric-matched sampling. READ THE CLOSED-FAMILIES LIST FIRST: when `pairwise` appears there, the
+controller refuses a pairwise proposal before your code runs, and five proposals across earlier
+campaigns were spent discovering that. This paragraph is then reference material for weighting a
+DIFFERENT objective, not an invitation to propose a pairwise one.
+
+The weighting fact itself generalises. GAUC weights each user's AUC by that user's positive count,
+and per-user AUC divides by that user's pair count, so an eligible pair carries weight
+proportional to 1/n_negatives_u. If you are constructing per-row or per-pair weights for any
+objective, that is the weighting GAUC actually applies; weighting users uniformly, weighting all
+pairs uniformly, or drawing unexposed catalogue items each optimises a different quantity than the
+one being scored. And whatever the objective, pair it with a scoring function that has the
+capacity to reorder: changing the loss on its own has already been measured flat.
 
 THE TWO METRICS WEIGHT USERS DIFFERENTLY, AND THIS IS THE MOST EXPLOITABLE FACT IN THE BRIEFING.
 Read the scorer's own shape:
@@ -249,10 +273,30 @@ that group's own negative count before you add it to the start. Assert
 every group you sample from has at least one positive and one negative. A branch that raises is
 worth nothing, so spend a few lines on these bounds."""
 
-_PACKAGES: Final = """Execution environment
+# The facts a PROPOSAL needs to be priceable, split out from the implementation recipe below.
+# The proposer was choosing an axis without being told which libraries exist or what the training
+# budget is, so "keep it within remaining resource evidence" was an instruction it could not
+# follow, and "as many configurations as its runtime allows" withheld the number that decides it.
+_ENVIRONMENT_FACTS: Final = """Resource budget and environment
 
 Available: `numpy` (import as `np`) and `lightgbm` 4.7.0 (verified importable in the sandbox), plus
 the Python standard library minus the forbidden import roots supplied in the request.
+`scikit-learn`, `pandas`, `scipy` and `torch` are NOT installed.
+
+Your budget, so you can price a proposal instead of guessing at it: each training launch gets
+1800 seconds of wall clock and a single CPU thread, over roughly 1.14 million training rows. That
+is the number that decides how large an internal grid you can afford. A five-member ensemble of a
+linear/FM scorer fits inside it comfortably; a grid of twenty deep boosted models does not.
+
+`training_diagnostics` has a naming rule that discards an otherwise successful run, so read it
+before you name anything. Rejected: any key whose underscore-separated tokens include `gauc`,
+`ndcg` or `primary`, and any key equal to `auc`, `metric`, `metrics`, `official_metric`,
+`official_score`, `public_metric`, `public_score`, `validation_metric`, `validation_score`,
+`evaluation_metric`, `evaluation_score` or `recall_50`. Any string VALUE naming an official
+metric is rejected too. The evaluator alone may name a score; you report numbers under neutral
+names such as `selected_members`, `inner_score`, `inner_score_by_size` or `guard_margin`."""
+
+_PACKAGES_TAIL: Final = """Execution environment
 
 `lightgbm` matters here because it has a native ranking objective. `objective="lambdarank"` with
 per-user group sizes optimises NDCG directly, which is the metric family being scored, and the
@@ -328,7 +372,15 @@ run. Name a helper module after the mechanism it implements -- `pairwise_sampler
 You write no files and parse no requests. The protected wrapper owns protocol parsing,
 capability loading, checkpoint and prediction file I/O, and the command line. `train_model`
 returns a dict of named finite NumPy arrays and `predict_scores` returns one finite array;
-the wrapper serializes both."""
+the wrapper serializes both.
+
+`training_diagnostics` may not name an official metric. Any key containing the token `gauc`,
+`ndcg` or `primary`, and any string value naming one, is refused after training has already
+succeeded, discarding the run. Report internal model selection under neutral names such as
+`inner_score`, `inner_score_by_size`, `selected_members` or `guard_margin`."""
+
+#: The operations that write code get the budget facts and the implementation recipe together.
+_PACKAGES: Final = f"{_ENVIRONMENT_FACTS}\n\n{_PACKAGES_TAIL}"
 
 _WORKED_EXAMPLE_TEMPLATE: Final = """Worked example
 
@@ -391,34 +443,35 @@ shapes differ, and mixing them raises a broadcast error; that single defect cost
 `within_user_pairs` indexes by a group's compact position, never by a raw `user_groups` value, and
 draws each offset against that group's own negative count; that defect cost three more.
 
-A valid response returns `model_impl.py` implementing a genuinely different mechanism:
+A valid response returns `model_impl.py` implementing a genuinely different mechanism. This one is
+the best-measured structure in the project's history -- a second-order interaction over the
+identity codes ONLY, with the causal aggregates kept as separate additive first-order terms:
 
 ```python
 def train_model(features, targets, user_groups, config, seed):
-    # Listwise softmax cross-entropy over each user's own logged impressions.
+    # Identity-code FM interaction plus additive aggregate terms. The control crosses only its
+    # categorical fields; crossing the standardized aggregates into the same latent space was
+    # measured four to twelve sigma worse, so they stay first-order here.
     normalized = (features - mean) / scale
+    codes = categorical_codes(features, $CODE_COUNT)
+    tables = _identity_tables(codes, config["rank"], np.random.default_rng(seed))
     weights = np.zeros(features.shape[1], dtype=np.float64)
-    order = np.argsort(user_groups, kind="stable")
-    starts, sizes = _group_bounds(user_groups[order])
     for _ in range(epochs):
-        gradient = np.zeros_like(weights)
-        for start, size in zip(starts, sizes):
-            rows = order[start : start + size]
-            probabilities = _group_softmax(normalized[rows] @ weights, temperature)
-            residual = probabilities * targets[rows].sum() - targets[rows]
-            gradient += normalized[rows].T @ residual / temperature
-        weights -= learning_rate * (gradient / len(sizes) + l2 * weights)
-    return {"weights": weights, "feature_mean": mean, "feature_scale": scale}
+        scores = normalized @ weights + bias + fm_interaction_scores(tables, codes)
+        error = _sigmoid(scores, clip) - targets
+        weights -= learning_rate * ((normalized.T @ error) / row_count + l2 * weights)
+        _update_identity_tables(tables, codes, error, learning_rate, embedding_l2)
+    return {"weights": weights, "feature_mean": mean, "feature_scale": scale, **_pack(tables)}
 ```
 
 and declares:
 
 ```json
-{"material_symbols": ["train_model", "_group_bounds", "_group_softmax"]}
+{"material_symbols": ["train_model", "_identity_tables", "_update_identity_tables", "_pack"]}
 ```
 
-Accepted because `train_model` is a top-level function whose body changed, and the two helpers are
-newly added top-level functions in a file reachable from `candidate.py`.
+Accepted because `train_model` is a top-level function whose body changed, and the three helpers
+are newly added top-level functions in a file reachable from `candidate.py`.
 
 Contrast, each of these is REJECTED:
 - Returning `candidate.py`. It is a protected path; the overlay is refused before any gate runs.
@@ -514,7 +567,7 @@ unanswerable question is returned to you as a failure record with the reason, no
 # PROPOSE and REFLECT emit no files, so they are not charged for the environment notes or the
 # worked example. Every operation that reasons about the science receives the briefing.
 
-_FEATURE_AUTHORITY: Final = """Feature authority inside your own code
+_FEATURE_AUTHORITY_TEMPLATE: Final = """Feature authority inside your own code
 
 `features` arrives as a mutable NumPy array and you may transform it inside `train_model` and your
 scoring path before fitting: build interaction columns (`features[:, i] * features[:, j]`), apply
@@ -527,8 +580,8 @@ deriving it only from the training matrix, or your scores will not correspond to
 Second, this authority extends only to arithmetic on the matrix you are given: it is not permission
 to read raw columns, current-row outcomes, or any capability the field policy withholds.
 
-Entity identity columns. The matrix ends with integer identity codes -- `id__user`, `id__video`,
-`id__author`, `id__tab`, `id__duration_bucket` -- stored as float64. The
+Entity identity columns. The matrix ends with integer identity codes -- $CODE_NAMES -- stored as
+float64. `user_id_code` is the one that makes within-user work possible in `predict_scores`. The
 `controller_identity_columns` method card gives their exact cardinalities, including the trailing
 UNK slot that every value unseen in training resolves to. Cast with `.astype(np.int64)` and index
 an embedding table.
@@ -562,15 +615,27 @@ Three ways to make identities pay, all cheaper than more epochs: initialise the 
 rather than randomly, so an untrained row contributes nothing instead of noise; regularise the
 embedding toward zero far more strongly than the dense weights, so rare rows shrink back to the
 aggregate-only model; or cross the aggregates against a low-cardinality identity only
-(`id__tab` at 16, `id__duration_bucket` at 7), where every row is seen thousands of times and
+(`tab_code` at 16, `duration_bucket_code` at 7), where every row is seen thousands of times and
 there is no tail to speak of. The last of these is the cheapest experiment in the space and has
 never been run."""
+
+# Rendered from the bundle constant rather than restated. An earlier hand-written copy of this
+# list named columns (`id__user`, `id__video`, ...) that have never existed, so every candidate
+# following it looked for the wrong keys.
+_FEATURE_AUTHORITY: Final = _FEATURE_AUTHORITY_TEMPLATE.replace(
+    "$CODE_NAMES", ", ".join(f"`{name}`" for name in ID_CODE_FEATURE_NAMES)
+)
 
 _SECTIONS: Final = {
     # PROPOSE receives the feature-authority grant because the proposal is where an axis is
     # chosen: without it the proposer cannot know that in-matrix feature work is even available
     # to it, and every observed proposal preserved the controller bundle verbatim.
-    ResearchOperation.PROPOSE: (_BENCHMARK, _FEATURE_AUTHORITY),
+    #
+    # It receives _PACKAGES for the same reason. The proposer was previously choosing an axis
+    # without being told which libraries exist, how many threads it gets, or what the training
+    # time budget is -- so it could not price its own proposal, and "keep it within remaining
+    # resource evidence" was an instruction it had no way to follow.
+    ResearchOperation.PROPOSE: (_BENCHMARK, _ENVIRONMENT_FACTS, _FEATURE_AUTHORITY),
     ResearchOperation.IMPLEMENT: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE, _BENCHMARK),
     ResearchOperation.REPAIR: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE),
     ResearchOperation.REFLECT: (_BENCHMARK,),
@@ -578,27 +643,54 @@ _SECTIONS: Final = {
 
 
 def _blocked_family_constraints(blocked_families: Sequence[tuple[str, str]]) -> str:
-    """Render the closed families as a pre-proposal directive.
+    """Render the family verdicts as a pre-proposal directive.
 
-    The controller refuses these deterministically after the fact. Showing the model the same list
-    before it chooses an axis is what turns a wasted provider call into a redirected one.
+    The controller applies these deterministically after the fact. Showing the model the same list
+    before it chooses an axis is what turns a wasted provider call into a redirected one -- but
+    only if the list says the same thing the enforcement does. It is partitioned here because it
+    no longer has one meaning: a family that lost twice is a wall, while a family that lost once
+    reopens for a refined re-attempt, and telling the model that both are walls is what walled off
+    the most-explored axis in the ledger.
     """
 
-    lines = [
-        "Closed proposal families -- CHECK THIS BEFORE CHOOSING YOUR AXIS",
-        "",
-        "The controller will reject a proposal in any family below, deterministically, before your",
-        "code is ever run. This is not a preference to weigh against your own judgement; it is a",
-        "wall. Proposing into it spends the iteration and returns no measurement, and a campaign",
-        "whose proposals are all rejected this way closes having built nothing.",
-        "",
+    closed = [
+        (family, reason) for family, reason in blocked_families if reason not in REOPENABLE_REASONS
     ]
-    lines.extend(f"- {family}: {reason}" for family, reason in blocked_families)
-    lines.append("")
+    reopenable = [
+        (family, reason) for family, reason in blocked_families if reason in REOPENABLE_REASONS
+    ]
+    lines: list[str] = ["Family verdicts -- CHECK THIS BEFORE CHOOSING YOUR AXIS", ""]
+    if closed:
+        lines.extend(
+            (
+                "CLOSED. The controller will reject a proposal in any family below,",
+                "deterministically, before your code is ever run. This is not a preference to",
+                "weigh against your own judgement; it is a wall. Proposing into it spends the",
+                "iteration and returns no measurement, and a campaign whose proposals are all",
+                "rejected this way closes having built nothing.",
+                "",
+            )
+        )
+        lines.extend(f"- {family}: {reason}" for family, reason in closed)
+        lines.append("")
+    if reopenable:
+        lines.extend(
+            (
+                "REOPENABLE, ONE REFINED ATTEMPT EACH. These lost a single evaluation, which is",
+                "evidence about one configuration and not about the direction. You may propose",
+                "into them, but only with a proposal that is materially different from the",
+                "recorded one: read that iteration's candidate_config_json, say what you are",
+                "changing and why the change addresses the loss. A restatement of the same",
+                "mechanism will lose the same way and close the family for good.",
+                "",
+            )
+        )
+        lines.extend(f"- {family}: {reason}" for family, reason in reopenable)
+        lines.append("")
     lines.append(
-        "Choose a different axis. The benchmark briefing lists the organizers' own priority order "
-        "and the feature-authority section describes axes reachable inside your own code; both "
-        "remain open except where named above."
+        "The benchmark briefing lists the organizers' own priority order and the feature-authority "
+        "section describes axes reachable inside your own code; both remain open except where "
+        "named closed above."
     )
     lines.append("")
     lines.append(
