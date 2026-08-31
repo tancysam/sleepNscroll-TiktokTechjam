@@ -123,6 +123,8 @@ from kuairand_agent.finalization.organizer_check import (
     check_final_submission,
 )
 from kuairand_agent.finalization.recipe import (
+    MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS,
+    OFFICIAL_FM_ENSEMBLE_COMBINATION,
     GeneratedLambdaRankReplayRecipe,
     OfficialFMMemberRecipe,
     OfficialFMReplayRecipe,
@@ -1004,6 +1006,44 @@ def _derive_bundle_status(manifest: Mapping[str, object]) -> FinalStatus:
             )
         if len(inner) != 1:
             raise ProductionFinalizationError("baseline bundle fold disclosure is incomplete")
+        return declared
+
+    if declared is FinalStatus.ENSEMBLE_SELECTED:
+        # Its own exact shape, for the reason the baseline branch has one: a bundle must not be
+        # able to claim a status its evidence does not support. RESULTS.md 3.3 records the cheap
+        # way through that was refused -- declaring `seeds: [4]` for a five-model ensemble would
+        # have fabricated the audit trail -- so this branch requires every seed to be named, the
+        # combination to be the measured rank-percentile mean rather than a raw average, and the
+        # bundle to admit it is controller-derived rather than an agent result.
+        if set(summary) != {
+            "schema_version",
+            "seeds",
+            "representative_seed",
+            "combination",
+            "matched_confirmation",
+            "derived_status",
+            "confirmation_is_controller_derived",
+        }:
+            raise ProductionFinalizationError("ensemble bundle confirmation is incomplete")
+        seeds = summary.get("seeds")
+        if (
+            summary.get("schema_version") != 1
+            or not isinstance(seeds, list)
+            or len(seeds) < MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS
+            or sorted(seeds) != seeds
+            or len(set(seeds)) != len(seeds)
+            or any(type(seed) is not int or seed < 0 for seed in seeds)
+            or summary.get("representative_seed") not in seeds
+            or summary.get("combination") != OFFICIAL_FM_ENSEMBLE_COMBINATION
+            or summary.get("matched_confirmation") is not False
+            or summary.get("derived_status") != FinalStatus.ENSEMBLE_SELECTED.value
+            or summary.get("confirmation_is_controller_derived") is not True
+        ):
+            raise ProductionFinalizationError(
+                "ensemble bundle confirmation is forged or incomplete"
+            )
+        if len(inner) != len(seeds):
+            raise ProductionFinalizationError("ensemble bundle member disclosure is incomplete")
         return declared
 
     expected_summary_fields = {

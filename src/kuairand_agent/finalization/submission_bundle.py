@@ -84,6 +84,11 @@ class FinalStatus(StrEnum):
     BASELINE_REPRODUCED = "baseline_reproduced"
     VALIDATION_IMPROVED = "validation_improved"
     MATERIALLY_CONFIRMED = "materially_confirmed"
+    #: A controller-derived rank ensemble of already-qualified official FM seeds was
+    #: validation-best, so it is what the campaign designates as final. It performs no new
+    #: training and is not an agent result; the bundle says so rather than borrowing the
+    #: vocabulary of one, and its confirmation shape names every seed it actually contains.
+    ENSEMBLE_SELECTED = "ensemble_selected"
 
 
 @dataclass(frozen=True, slots=True)
