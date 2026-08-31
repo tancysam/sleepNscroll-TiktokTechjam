@@ -178,7 +178,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
-    assert PROMPT_VERSION == 15
+    assert PROMPT_VERSION == 16
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -481,3 +481,80 @@ def test_the_pairwise_recipe_does_not_invite_a_blocked_proposal() -> None:
     rendered = " ".join(instructions_for(ResearchOperation.PROPOSE).split())
     assert "READ THE CLOSED-FAMILIES LIST FIRST" in rendered
     assert "not an invitation to propose a pairwise one" in rendered
+
+
+# The briefing was one 20 KB block that three of four roles read in full, which is one agent
+# invoked four times rather than four specialists. REFLECT received the LightGBM recipe, the
+# material-symbol rules and the identity-embedding history in order to answer "what happened and
+# what should I ask of the data" -- and across two campaigns it spent zero analysis_requests.
+
+
+def test_every_role_knows_what_is_being_scored() -> None:
+    """The one thing no role can work without."""
+
+    for operation in ResearchOperation:
+        rendered = instructions_for(operation)
+        assert "long_view" in rendered, operation
+        assert "GAUC" in rendered and "nDCG@5" in rendered, operation
+
+
+def test_implementation_hazards_do_not_reach_the_roles_that_write_no_code() -> None:
+    """PROPOSE and REFLECT cannot act on a broadcast-shape defect; they should not pay for it."""
+
+    for operation in (ResearchOperation.PROPOSE, ResearchOperation.REFLECT):
+        rendered = instructions_for(operation)
+        assert "broadcast error" not in rendered, operation
+        assert "Vectorised within-user negative sampling" not in rendered, operation
+
+
+def test_the_code_writing_roles_do_get_them() -> None:
+    for operation in (ResearchOperation.IMPLEMENT, ResearchOperation.REPAIR):
+        rendered = instructions_for(operation)
+        assert "Vectorised within-user negative sampling" in rendered, operation
+        assert "`recall_50`" in rendered, operation
+
+
+def test_only_the_role_that_spends_an_iteration_is_told_how_to_spend_it() -> None:
+    """The iteration budget is a proposer's decision; no other role can make it."""
+
+    assert "HOW TO SPEND AN ITERATION" in instructions_for(ResearchOperation.PROPOSE)
+    for operation in (
+        ResearchOperation.IMPLEMENT,
+        ResearchOperation.REPAIR,
+        ResearchOperation.REFLECT,
+    ):
+        assert "HOW TO SPEND AN ITERATION" not in instructions_for(operation), operation
+
+
+def test_reflect_carries_the_metric_mechanics_its_questions_reason_over() -> None:
+    """Its job is to read a result and interrogate the data, so this is the part it needs."""
+
+    rendered = instructions_for(ResearchOperation.REFLECT)
+    assert "THE TWO METRICS WEIGHT USERS DIFFERENTLY" in rendered
+    assert "median 8 impressions per user" in rendered
+    assert "analysis_requests" in rendered
+    # And not the parts it cannot use.
+    assert "Worked example" not in rendered
+    assert "lambdarank" not in rendered
+
+
+def test_repair_finally_knows_what_the_benchmark_is() -> None:
+    """It previously received packages, feature authority and a worked example -- and no task.
+
+    A role asked to fix a rejected candidate without being told what is being scored is guessing.
+    """
+
+    rendered = instructions_for(ResearchOperation.REPAIR)
+    assert "long_view" in rendered
+    assert "0.8645" in rendered, "the ceiling keeps a repair from chasing a leak-shaped score"
+
+
+def test_no_role_reads_the_whole_briefing_any_more() -> None:
+    """The point of the split: four specialists, not one agent invoked four times."""
+
+    import kuairand_agent.research.prompts as module
+
+    blocks = (module._TASK, module._EVIDENCE, module._BUDGET, module._METRICS, module._HAZARDS)
+    for operation in ResearchOperation:
+        rendered = instructions_for(operation)
+        assert not all(block in rendered for block in blocks), operation

@@ -20,7 +20,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 15
+PROMPT_VERSION: Final = 16
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -32,7 +32,14 @@ features. The protected organizer evaluator, attempt policy, and promotion polic
 change. The request.runtime_contract object is the authoritative executable interface; do not
 infer a different interface from a proposal, filename, or prior model convention."""
 
-_BENCHMARK_TEMPLATE: Final = """Benchmark briefing
+# The benchmark briefing, split by the role that needs each part. It was one 20 KB block that
+# three of the four roles read in full, which is not four specialists -- it is one agent invoked
+# four times. REFLECT in particular received the LightGBM recipe, the material-symbol rules and
+# the identity-embedding history in order to answer "what happened, and what should I ask of the
+# data", and it never once spent an analysis_request.
+
+#: What the benchmark IS. Every role needs this and nothing here is role-specific.
+_TASK_CORE: Final = """Benchmark briefing
 
 Task: rank each user's own logged impressions. This is within-user ranking over an existing
 impression list, not retrieval over a catalogue.
@@ -45,8 +52,11 @@ Ceilings, so you calibrate expectations correctly:
 - 27.1% of users have zero positives (nDCG is permanently 0 for them); 9.2% are all-positive
   (permanently 1). Only the remaining 63.7% are GAUC-eligible.
 - The baseline has already captured ~30% of the reachable range. Remaining headroom is ~0.27.
-- A result near 1.0 indicates a leak or an evaluation bug, not a breakthrough.
+- A result near 1.0 indicates a leak or an evaluation bug, not a breakthrough."""
 
+#: Evidence about what has already been measured. Shapes what is worth proposing and how to read
+#: a new result, so PROPOSE and REFLECT need it; the roles that write code do not.
+_SCIENCE: Final = """\
 Measured dead ends. The organizers ran these and published the results. Do not spend an iteration
 rediscovering them:
 - Adding all 13 static feature domains scored 0.5940 versus 0.5950 for the 5-field baseline.
@@ -84,71 +94,6 @@ gets most of its ordering power, and it is the most likely reason every candidat
 scored below the baseline standalone. Note the distinction the organizers measured: a user-side
 FIRST-ORDER term is worth exactly zero because it is constant within a user, but a user EMBEDDING
 crossed with an item embedding varies across that user's rows and can reorder them.
-
-HOW TO SPEND AN ITERATION, WHICH IS THE MOST COMMON WAY THIS CAMPAIGN IS WASTED. You have two
-separate budgets and only one of them is capped:
-
-- A new HYPOTHESIS costs one scientific iteration. The organizers' convergence rule stops the
-  campaign after three consecutive iterations that fail to improve validation primary by more than
-  0.002, so you get about three. This budget is frozen and cannot be extended.
-- TUNING INSIDE ONE CANDIDATE is free and unlimited. Your training code may fit as many
-  configurations as its runtime allows, select between them on a split it carves out of its own
-  training rows, and return only the winner. That costs no iteration at all.
-
-So never spend an iteration on a hyperparameter. If your last result was a learning rate away from
-working, the correct response is not to propose the same method with a different constant -- that
-burns one of three slots to test a number. Every new method you propose should arrive with its own
-internal search already in it: a small grid over the parameters you are least sure of, an honest
-inner split to select on, and a guard that keeps the parent configuration when nothing beats it.
-Report which setting won in training_diagnostics.
-
-Name those diagnostics carefully, because the obvious names are fatal. Only the evaluator may
-name an official metric, so training_diagnostics is refused outright if any key contains the
-token `gauc`, `ndcg` or `primary`, or if any string value names one. The refusal happens after
-your training has already succeeded and it discards the whole run. `inner_gauc`, `val_ndcg@5`
-and `primary_by_size` are all rejected; `inner_score`, `inner_score_by_size`, `selected_members`
-and `guard_margin` are all fine. Report the NUMBER you selected on, never the metric's name.
-
-Propose mechanisms the implementation can actually build. The parent already ships tested helpers
-for the pieces that used to crash branches: categorical code extraction, per-fold embedding table
-sizing, the FM second-order interaction term, and within-user pair sampling. A proposal that rests
-on those plus a grid over a training function is cheap and reliable. A proposal that requires
-hand-rolled interaction algebra, a bespoke sampler or a custom checkpoint validator is where eight
-of eight branches died, so ask for those only when the hypothesis genuinely needs them.
-
-Two consequences worth stating explicitly. First, a direction that lost at ONE configuration has
-not been shown to be a dead direction, so read a prior campaign's candidate_config_json before
-concluding a family is exhausted -- it tells you the setting that produced the score. Second, your
-own winning configuration is recorded and inherited by later campaigns, so tuning well is not
-throwaway work.
-
-Where the headroom is. These are all reachable from your interface and all worth covering; the
-campaign has few iterations, so prefer a direction the records show has not been measured yet
-rather than a variation on one that has.
-
-NOVELTY APPLIES TO WHAT YOU ADD, NEVER TO THE BASE. Building the strongest known scoring
-structure is not a repeated direction, it is the floor you build from, and re-deriving a weaker
-one to be novel is the most expensive mistake available to you. Measured: candidates that
-rebuilt the base scored 0.5693, 0.5674 and 0.5724 standalone, all bracketing the trusted
-parent's own 0.5698, against a control at 0.5754 -- so the iteration bought nothing and the
-hypothesis on top of it was never really tested. Start from the parent's best known structure,
-then be novel in the increment:
-1. Identity embeddings combined with the causal aggregate columns, trained under a ranking
-   objective. The baseline has identities but no causal aggregates; earlier candidates had
-   aggregates but no identities. Holding both is strictly more information than either.
-   The aggregates include strictly-past click and like history alongside long_view, for every
-   grouping and cross (`*__is_click_positive`, `*__is_click_smoothed_rate`, and the same for
-   `is_like`). No candidate has yet crossed those against an identity code.
-2. Interaction structure over the codes: FM latent factors, or explicit user_groups-by-item-code
-   interactions. Note the organizers measured embedding dimension k = 8/16/32 as flat ON IDENTITIES
-   ALONE, so raise capacity only together with the aggregate columns or a ranking objective.
-3. Regularisation and optimisation quality: identity embeddings on a 1.1M-row log overfit readily.
-   Frequency-aware regularisation, early stopping on the inner fold, and an adaptive optimiser are
-   real levers, not housekeeping.
-4. Temporal drift, via date_offset_from_20220408 and recency-sensitive weighting of training rows.
-   There is no hour-of-day column, so only day-level drift is reachable.
-5. Protecting nDCG@5 while a ranking objective lifts GAUC. See the metric-weighting section below:
-   this is where the most recent candidate gave back everything it gained.
 
 NOT reachable from your interface. Do not propose these, they cannot be implemented:
 - User behaviour sequences or DIN/SIM interest modelling. You receive no timestamps and no
@@ -258,8 +203,71 @@ proportional to 1/n_negatives_u. If you are constructing per-row or per-pair wei
 objective, that is the weighting GAUC actually applies; weighting users uniformly, weighting all
 pairs uniformly, or drawing unexposed catalogue items each optimises a different quantity than the
 one being scored. And whatever the objective, pair it with a scoring function that has the
-capacity to reorder: changing the loss on its own has already been measured flat.
+capacity to reorder: changing the loss on its own has already been measured flat."""
 
+#: How a scientific iteration is spent. PROPOSE only -- it is the only role that spends one.
+_ITERATION_BUDGET: Final = """\
+HOW TO SPEND AN ITERATION, WHICH IS THE MOST COMMON WAY THIS CAMPAIGN IS WASTED. You have two
+separate budgets and only one of them is capped:
+
+- A new HYPOTHESIS costs one scientific iteration. The organizers' convergence rule stops the
+  campaign after three consecutive iterations that fail to improve validation primary by more than
+  0.002, so you get about three. This budget is frozen and cannot be extended.
+- TUNING INSIDE ONE CANDIDATE is free and unlimited. Your training code may fit as many
+  configurations as its runtime allows, select between them on a split it carves out of its own
+  training rows, and return only the winner. That costs no iteration at all.
+
+So never spend an iteration on a hyperparameter. If your last result was a learning rate away from
+working, the correct response is not to propose the same method with a different constant -- that
+burns one of three slots to test a number. Every new method you propose should arrive with its own
+internal search already in it: a small grid over the parameters you are least sure of, an honest
+inner split to select on, and a guard that keeps the parent configuration when nothing beats it.
+Report which setting won in training_diagnostics.
+
+Propose mechanisms the implementation can actually build. The parent already ships tested helpers
+for the pieces that used to crash branches: categorical code extraction, per-fold embedding table
+sizing, the FM second-order interaction term, and within-user pair sampling. A proposal that rests
+on those plus a grid over a training function is cheap and reliable. A proposal that requires
+hand-rolled interaction algebra, a bespoke sampler or a custom checkpoint validator is where eight
+of eight branches died, so ask for those only when the hypothesis genuinely needs them.
+
+Two consequences worth stating explicitly. First, a direction that lost at ONE configuration has
+not been shown to be a dead direction, so read a prior campaign's candidate_config_json before
+concluding a family is exhausted -- it tells you the setting that produced the score. Second, your
+own winning configuration is recorded and inherited by later campaigns, so tuning well is not
+throwaway work.
+
+Where the headroom is. These are all reachable from your interface and all worth covering; the
+campaign has few iterations, so prefer a direction the records show has not been measured yet
+rather than a variation on one that has.
+
+NOVELTY APPLIES TO WHAT YOU ADD, NEVER TO THE BASE. Building the strongest known scoring
+structure is not a repeated direction, it is the floor you build from, and re-deriving a weaker
+one to be novel is the most expensive mistake available to you. Measured: candidates that
+rebuilt the base scored 0.5693, 0.5674 and 0.5724 standalone, all bracketing the trusted
+parent's own 0.5698, against a control at 0.5754 -- so the iteration bought nothing and the
+hypothesis on top of it was never really tested. Start from the parent's best known structure,
+then be novel in the increment:
+1. Identity embeddings combined with the causal aggregate columns, trained under a ranking
+   objective. The baseline has identities but no causal aggregates; earlier candidates had
+   aggregates but no identities. Holding both is strictly more information than either.
+   The aggregates include strictly-past click and like history alongside long_view, for every
+   grouping and cross (`*__is_click_positive`, `*__is_click_smoothed_rate`, and the same for
+   `is_like`). No candidate has yet crossed those against an identity code.
+2. Interaction structure over the codes: FM latent factors, or explicit user_groups-by-item-code
+   interactions. Note the organizers measured embedding dimension k = 8/16/32 as flat ON IDENTITIES
+   ALONE, so raise capacity only together with the aggregate columns or a ranking objective.
+3. Regularisation and optimisation quality: identity embeddings on a 1.1M-row log overfit readily.
+   Frequency-aware regularisation, early stopping on the inner fold, and an adaptive optimiser are
+   real levers, not housekeeping.
+4. Temporal drift, via date_offset_from_20220408 and recency-sensitive weighting of training rows.
+   There is no hour-of-day column, so only day-level drift is reachable.
+5. Protecting nDCG@5 while a ranking objective lifts GAUC. See the metric-weighting section below:
+   this is where the most recent candidate gave back everything it gained."""
+
+#: How the two metrics weight users, and the slate statistics behind that. This is what a
+#: reflection reasons over when choosing which question to ask of the training data.
+_METRIC_MECHANICS: Final = """\
 THE TWO METRICS WEIGHT USERS DIFFERENTLY, AND THIS IS THE MOST EXPLOITABLE FACT IN THE BRIEFING.
 Read the scorer's own shape:
 - GAUC accumulates `npos_u * auc_u` over a denominator of `npos_u`, and only over mixed-label
@@ -286,7 +294,17 @@ users, not inert. What that cutoff rewards:
   being worth full weight to GAUC.
 - Per-metric headroom, so you can price a trade: GAUC 0.6610 -> 1.0000 is 0.1695 of primary;
   nDCG@5 0.5282 -> 0.7289 is 0.1004 of primary. GAUC holds more, but nDCG@5 holds over a third
-  and is where recent candidates have given back their GAUC gains.
+  and is where recent candidates have given back their GAUC gains."""
+
+#: Defects that killed candidates after training had already succeeded. Only the roles that write
+#: code can act on these, and only they should pay for them.
+_IMPLEMENTATION_HAZARDS: Final = """\
+Name those diagnostics carefully, because the obvious names are fatal. Only the evaluator may
+name an official metric, so training_diagnostics is refused outright if any key contains the
+token `gauc`, `ndcg` or `primary`, or if any string value names one. The refusal happens after
+your training has already succeeded and it discards the whole run. `inner_gauc`, `val_ndcg@5`
+and `primary_by_size` are all rejected; `inner_score`, `inner_score_by_size`, `selected_members`
+and `guard_margin` are all fine. Report the NUMBER you selected on, never the metric's name.
 
 Two further defects lost every candidate in the most recent campaign, both after training had
 already succeeded. First, training_diagnostics must return only finite Python scalars, so every
@@ -337,11 +355,27 @@ names such as `selected_members`, `inner_score`, `inner_score_by_size` or `guard
 # direction that discourages the internal grids the briefing asks for.
 _ENVIRONMENT_FACTS: Final = _ENVIRONMENT_FACTS_TEMPLATE.replace("$THREADS", str(CANDIDATE_THREADS))
 
-_BENCHMARK: Final = (
-    _BENCHMARK_TEMPLATE.replace("$PUBLISHED_SIGMA", f"{PUBLISHED_SEED_SIGMA:g}")
-    .replace("$MEASURED_SIGMA", f"{MEASURED_SEED_SIGMA:g}")
-    .replace("$STANDALONE_TOLERANCE", f"{STANDALONE_TOLERANCE:.6f}")
-)
+
+def _measured(text: str) -> str:
+    """Render the constants the controller enforces, so the prompt cannot drift from them."""
+
+    return (
+        text.replace("$PUBLISHED_SIGMA", f"{PUBLISHED_SEED_SIGMA:g}")
+        .replace("$MEASURED_SIGMA", f"{MEASURED_SEED_SIGMA:g}")
+        .replace("$STANDALONE_TOLERANCE", f"{STANDALONE_TOLERANCE:.6f}")
+    )
+
+
+_TASK: Final = _measured(_TASK_CORE)
+# "Propose mechanisms the implementation can actually build" is addressed to the proposer, but the
+# helper inventory inside it is what stops an implementation reinventing tested maths and what a
+# reflection needs to recommend something buildable. Split at that sentence rather than duplicated.
+_BUILDABILITY_MARK: Final = "Propose mechanisms the implementation can actually build."
+_EVIDENCE: Final = _measured(_SCIENCE)
+_BUDGET: Final = _measured(_ITERATION_BUDGET[: _ITERATION_BUDGET.index(_BUILDABILITY_MARK)].strip())
+_BUILDABILITY: Final = _measured(_ITERATION_BUDGET[_ITERATION_BUDGET.index(_BUILDABILITY_MARK) :])
+_METRICS: Final = _measured(_METRIC_MECHANICS)
+_HAZARDS: Final = _measured(_IMPLEMENTATION_HAZARDS)
 
 _PACKAGES_TAIL: Final = """Execution environment
 
@@ -693,14 +727,39 @@ _SECTIONS: Final = {
     # chosen: without it the proposer cannot know that in-matrix feature work is even available
     # to it, and every observed proposal preserved the controller bundle verbatim.
     #
-    # It receives _PACKAGES for the same reason. The proposer was previously choosing an axis
-    # without being told which libraries exist, how many threads it gets, or what the training
-    # time budget is -- so it could not price its own proposal, and "keep it within remaining
-    # resource evidence" was an instruction it had no way to follow.
-    ResearchOperation.PROPOSE: (_BENCHMARK, _ENVIRONMENT_FACTS, _FEATURE_AUTHORITY),
-    ResearchOperation.IMPLEMENT: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE, _BENCHMARK),
-    ResearchOperation.REPAIR: (_PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE),
-    ResearchOperation.REFLECT: (_BENCHMARK,),
+    # It receives _ENVIRONMENT_FACTS for the same reason. The proposer was previously choosing an
+    # axis without being told which libraries exist, how many threads it gets, or what the
+    # training time budget is -- so it could not price its own proposal, and "keep it within
+    # remaining resource evidence" was an instruction it had no way to follow.
+    #
+    # Each role reads what its job needs and stops there. Every role sees _TASK, because none of
+    # them can work without knowing what is being scored. Beyond that they diverge: only the roles
+    # that choose a direction get the accumulated evidence, only the roles that write code get the
+    # implementation hazards, and REFLECT gets the metric mechanics its data questions reason over
+    # rather than a recipe for a library it will never call.
+    ResearchOperation.PROPOSE: (
+        _TASK,
+        _EVIDENCE,
+        _BUDGET,
+        _BUILDABILITY,
+        _METRICS,
+        _ENVIRONMENT_FACTS,
+        _FEATURE_AUTHORITY,
+    ),
+    # IMPLEMENT keeps the metric mechanics: how GAUC weights users by positive count is what a
+    # weighted loss or a sampler has to encode, so the role writing that code needs it too.
+    ResearchOperation.IMPLEMENT: (
+        _TASK,
+        _PACKAGES,
+        _FEATURE_AUTHORITY,
+        _WORKED_EXAMPLE,
+        _HAZARDS,
+        _EVIDENCE,
+        _BUILDABILITY,
+        _METRICS,
+    ),
+    ResearchOperation.REPAIR: (_TASK, _PACKAGES, _FEATURE_AUTHORITY, _WORKED_EXAMPLE, _HAZARDS),
+    ResearchOperation.REFLECT: (_TASK, _EVIDENCE, _BUILDABILITY, _METRICS),
 }
 
 
