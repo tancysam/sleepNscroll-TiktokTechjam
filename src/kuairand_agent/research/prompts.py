@@ -12,7 +12,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 10
+PROMPT_VERSION: Final = 11
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -34,8 +34,10 @@ mean. The official FM baseline scores primary 0.5946 on the held-out period.
 
 Ceilings, so you calibrate expectations correctly:
 - A perfect oracle scores primary 0.8645, NOT 1.0. nDCG@5 alone ceilings at 0.7289.
-- 27.1% of users have zero positives (nDCG is permanently 0 for them); 9.2% are all-positive
-  (permanently 1). Only the remaining 63.7% are GAUC-eligible.
+- On the held-out period 27.1% of users have zero positives (nDCG is permanently 0 for them) and
+  9.2% are all-positive (permanently 1), leaving 63.7% GAUC-eligible. On the public validation
+  period the same split is 30.3% / 11.9% / 57.8% of 22,377 users. Only mixed-label users can be
+  reordered into a better score, on either metric.
 - The baseline has already captured ~30% of the reachable range. Remaining headroom is ~0.27.
 - A result near 1.0 indicates a leak or an evaluation bug, not a breakthrough.
 
@@ -87,8 +89,17 @@ rather than a variation on one that has:
    interactions. Note the organizers measured embedding dimension k = 8/16/32 as flat ON IDENTITIES
    ALONE, so raise capacity only together with the aggregate columns or a ranking objective.
 3. Regularisation and optimisation quality: identity embeddings on a 1.1M-row log overfit readily.
-   Frequency-aware regularisation, early stopping on the inner fold, and an adaptive optimiser are
-   real levers, not housekeeping.
+   Frequency-aware regularisation and an adaptive optimiser are real levers, not housekeeping, and
+   so is EARLY STOPPING, which you may do and no candidate has yet done. You are handed `targets`
+   and `user_groups` for the whole training matrix, so you can hold out a USER-DISJOINT slice of
+   it yourself: pick a deterministic subset of distinct user_groups values, train on the remaining
+   rows, and after each epoch score the held-out rows with a within-user ranking metric you compute
+   in your own code from labels you were given. Keep the epoch that maximises it, then either stop
+   there or refit on all rows for that fixed epoch count. This is not the scored split and does not
+   touch it. The official baseline trains up to 40 epochs and keeps the epoch that scores best on
+   the very split it is then reported on; you get one shot and no such selection, which is worth
+   roughly one sigma of the gap you are trying to close. Splitting by user rather than by row
+   matters, because both metrics are computed within a user.
 4. Temporal drift, via date_offset_from_20220408 and recency-sensitive weighting of training rows.
 
 NOT reachable from your interface. Do not propose these, they cannot be implemented:
@@ -130,27 +141,34 @@ twelve. Start from that structure. Two further measurements from the same run: p
 loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
 collapsed it to 0.5630, so do not replace the loss.
 
-The cheapest remaining way to cross the control is SEED ENSEMBLING, and its effect size on this
-exact benchmark is already measured. The five qualified seeds of the official FM score 0.6014695,
-0.6017609, 0.6010903, 0.6015031 and 0.6020371 on public validation; averaging all five scores
-0.6026034, which beats every individual seed including the luckiest. Seed-to-seed sigma is 0.0008
-and averaging removes most of it. That is a larger effect than any modelling change in this
-project's history, and it is available to you inside a single candidate:
+SEED ENSEMBLING inside one candidate has been measured and is a dead end. Training five copies of
+the same scorer on the same data and averaging their raw scores in `predict_scores` scored 0.5740
+standalone against 0.5745 for the identical single-copy scorer: flat, and slightly worse. The
+controller-side five-seed ensemble that does help averages WITHIN-USER RANK PERCENTILES, and
+`predict_scores` cannot do that because it receives no `user_groups`. Raw-score averaging captures
+about one seventh of the effect. Do not spend an iteration on it.
 
-- Derive N child seeds deterministically from the `seed` argument you are given, so replay stays
-  byte exact. N = 5 is the measured point.
-- Train N copies of the SAME scorer on the SAME data and store every parameter set in the
-  checkpoint under indexed names.
-- In `predict_scores`, average the N members' scores.
+The largest unexamined lever is that the scorer weights users very differently in its two halves,
+and no candidate has ever matched that weighting. Read `kuairand-starter-kit/evaluate.py`: GAUC
+accumulates `npos * auc(user)` over a denominator of `sum(npos)`, so a user with ten positives
+counts ten times a user with one, and users with zero or all positives are skipped. nDCG@5 instead
+averages UNIFORMLY over every user, including the ones permanently stuck at 0 or 1. Both halves can
+only be moved on the same mixed-label users, and inside that set GAUC cares about positive-rich
+users far more than uniform training does.
 
-One constraint that will otherwise break this: `predict_scores` receives the feature matrix and
-the checkpoint and NOTHING ELSE. There is no `user_groups` at prediction time, so you cannot rank
-normalise within a user there. Average the raw scores or logits instead. That is valid here
-because every member shares one architecture, one standardisation and one training set, so their
-scales are directly comparable.
+Measured on the public validation window: 22,377 users, 57.8% mixed-label and GAUC-eligible, 30.3%
+zero-positive, 11.9% all-positive. Among eligible users the top 10% by positive count carry 29.0%
+of the whole GAUC denominator, while the 37.6% holding exactly one positive carry only 14.0%.
 
-This is a variance-reduction change, not a new architecture. Hold the scorer fixed and wrap it in
-a loop. It is a few extra lines, not a bigger model.
+Every candidate so far trains with uniform row weights, which matches neither half. A per-row
+weight derived from that row's user positive count aligns the pointwise objective with how GAUC is
+actually computed. This is a WEIGHT on the loss that already works, NOT a replacement for it: keep
+pointwise logistic loss, which produced 0.5745, while a pairwise swap on the identical scorer
+collapsed to 0.5630. `train_model` receives `targets` and `user_groups` for the whole training
+matrix, so per-user positive counts are computable during training with no new capability. The
+mechanism is already de-risked: a previous candidate applied recency weights per row and executed
+cleanly, so only the weighting function is new. Normalise weights to mean one so the effective
+learning rate does not move, and treat the exact form as the thing under test.
 
 Metric-matched sampling, if you propose a pairwise objective: GAUC weights each user's AUC by that
 user's positive count, so an eligible pair carries weight proportional to 1/N_u. Sample a positive
