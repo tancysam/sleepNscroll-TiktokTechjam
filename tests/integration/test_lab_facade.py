@@ -316,18 +316,40 @@ def test_published_bundle_recovers_after_crash_before_atomic_terminal_commit(
     with pytest.raises(RuntimeError, match="injected crash"):
         lab.compete(options=_fixture_options(), idempotency_key="recoverable-publication")
 
+    publication_roots = list((tmp_path / "run" / "campaigns").glob("*/final/submission-bundle"))
+    assert len(publication_roots) == 1
+    published_root = publication_roots[0]
+    interrupted_campaign_id = published_root.parents[1].name
+    interrupted = lab.inspect(campaign_id=interrupted_campaign_id)
+    interrupted_entities = cast(Mapping[str, list[Mapping[str, object]]], interrupted["entities"])
+    member_identity = {
+        member.name: (member.stat().st_ino, member.stat().st_mtime_ns)
+        for member in published_root.iterdir()
+    }
+    assert cast(Mapping[str, object], interrupted["campaign"])["state"] == "RUNNING"
+    assert len(interrupted_entities["terminal_preparations"]) == 1
+    assert interrupted_entities["bundle_publications"] == []
+    assert stat.S_IMODE(published_root.lstat().st_mode) == 0o555
+
     monkeypatch.setattr(StateRepository, "finalize_prepared_campaign", original)
     recovered = lab.compete(options=_fixture_options(), idempotency_key="recoverable-publication")
     snapshot = lab.inspect(campaign_id=recovered.campaign_id)
     entities = cast(Mapping[str, list[Mapping[str, object]]], snapshot["entities"])
     bundle_payload = cast(Mapping[str, object], entities["bundles"][0]["payload"])
 
+    assert recovered.campaign_id == interrupted_campaign_id
+    assert recovered.bundle_path == published_root.resolve()
+    assert {
+        member.name: (member.stat().st_ino, member.stat().st_mtime_ns)
+        for member in published_root.iterdir()
+    } == member_identity
     assert recovered.terminal_state == "COMPLETED_OFFLINE_FIXTURE"
     assert recovered.replay_grades == (
         ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
         ReplayGrade.BUNDLE_EXACT.value,
     )
     assert len(entities["resource_receipts"]) == 1
+    assert len(entities["bundle_publications"]) == 1
     assert (
         lab.validate_bundle(recovered.bundle_path).preparation_id
         == bundle_payload["preparation_id"]

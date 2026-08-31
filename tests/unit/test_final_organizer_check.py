@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from kuairand_agent.data.canonical import LOG_HEADER, OUTCOME_FIELDS, VIDEO_BASI
 from kuairand_agent.finalization.organizer_check import (
     OrganizerCheckError,
     check_final_submission,
+    validate_organizer_check_manifest,
 )
 
 ROOT = Path(__file__).parents[2]
@@ -239,3 +241,72 @@ def test_checker_rejects_symlinked_required_data_file(tmp_path: Path) -> None:
         )
 
     assert tuple(scratch.iterdir()) == ()
+
+
+def test_organizer_manifest_validator_accepts_bound_check_evidence(tmp_path: Path) -> None:
+    data = _make_data_view(tmp_path / "dataset", b"\xff")
+    submission = _submission(tmp_path / "submission.csv")
+    evidence = check_final_submission(
+        submission,
+        data_dir=data,
+        starter_dir=STARTER,
+        scratch_dir=tmp_path,
+    )
+
+    validated = validate_organizer_check_manifest(
+        evidence.manifest(),
+        expected_submission_sha256=hashlib.sha256(submission.read_bytes()).hexdigest(),
+        expected_submission_size_bytes=submission.stat().st_size,
+        expected_starter_manifest_sha256=verify_starter_kit(STARTER).manifest_sha256,
+        expected_final_rows=2,
+    )
+
+    assert validated == evidence.manifest()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    (
+        ("digest", "masked data-view digest is invalid"),
+        ("submission", "observed different submission bytes"),
+        ("final_rows", "final outcome-isolation evidence is unsafe"),
+        ("unsafe_outcome", "final outcome-isolation evidence is unsafe"),
+    ),
+)
+def test_organizer_manifest_validator_rejects_tampered_evidence(
+    tmp_path: Path,
+    tamper: str,
+    message: str,
+) -> None:
+    data = _make_data_view(tmp_path / "dataset", b"\xff")
+    submission = _submission(tmp_path / "submission.csv")
+    evidence = check_final_submission(
+        submission,
+        data_dir=data,
+        starter_dir=STARTER,
+        scratch_dir=tmp_path,
+    )
+    manifest = deepcopy(evidence.manifest())
+    masked = manifest["masked_data_view"]
+    assert isinstance(masked, dict)
+    isolation = masked["final_outcome_isolation"]
+    assert isinstance(isolation, dict)
+    if tamper == "digest":
+        masked["digest"] = "0" * 64
+    elif tamper == "submission":
+        submission_evidence = manifest["submission"]
+        assert isinstance(submission_evidence, dict)
+        submission_evidence["sha256"] = "0" * 64
+    elif tamper == "final_rows":
+        isolation["final_rows_masked"] = 3
+    else:
+        isolation["outcome_cells_hashed"] = 1
+
+    with pytest.raises(OrganizerCheckError, match=message):
+        validate_organizer_check_manifest(
+            manifest,
+            expected_submission_sha256=hashlib.sha256(submission.read_bytes()).hexdigest(),
+            expected_submission_size_bytes=submission.stat().st_size,
+            expected_starter_manifest_sha256=verify_starter_kit(STARTER).manifest_sha256,
+            expected_final_rows=2,
+        )

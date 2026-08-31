@@ -499,19 +499,29 @@ def _remove_projection(path: Path) -> None:
     shutil.rmtree(path)
 
 
-def _inspect_exact_unsealed_orphan(path: Path) -> _Projection:
-    """Read a known post-rename orphan without trusting its claimed identity."""
+def _inspect_exact_existing_publication(
+    path: Path,
+    *,
+    expected_root_mode: int,
+    description: str,
+) -> _Projection:
+    """Read an existing publication without trusting its claimed identity.
+
+    A crash can leave the exclusively renamed directory either unsealed (0700) or already sealed
+    (0555).  Both cases are recoverable only after the caller's frozen request regenerates every
+    member byte and :func:`_assert_same_projection` proves exact equality.
+    """
 
     initial = path.lstat()
     if (
         stat.S_ISLNK(initial.st_mode)
         or not stat.S_ISDIR(initial.st_mode)
-        or stat.S_IMODE(initial.st_mode) != 0o700
+        or stat.S_IMODE(initial.st_mode) != expected_root_mode
     ):
-        raise BundleProjectionError("existing destination is not an unsealed publication orphan")
+        raise BundleProjectionError(f"existing destination is not {description}")
     members = tuple(sorted(path.iterdir(), key=lambda item: item.name))
     if tuple(member.name for member in members) != tuple(sorted(REQUIRED_BUNDLE_PATHS)):
-        raise BundleProjectionError("publication orphan member set differs from the exact layout")
+        raise BundleProjectionError(f"{description} member set differs from the exact layout")
     for member in members:
         metadata = member.lstat()
         if (
@@ -519,17 +529,17 @@ def _inspect_exact_unsealed_orphan(path: Path) -> _Projection:
             or not stat.S_ISREG(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != 0o444
         ):
-            raise BundleProjectionError("publication orphan contains an unsealed member")
+            raise BundleProjectionError(f"{description} contains an unsealed member")
     manifest_sha256, _ = _read_digest(path / _BUNDLE_MANIFEST_NAME)
     submission_sha256, _ = _read_digest(path / EvidenceRole.SUBMISSION.value)
     inventory_sha256, file_count, total_size_bytes = _inventory(path)
     try:
         digest_text = (path / _BUNDLE_DIGEST_NAME).read_text(encoding="ascii")
     except (OSError, UnicodeError) as exc:
-        raise BundleProjectionError("publication orphan bundle digest is unreadable") from exc
+        raise BundleProjectionError(f"{description} bundle digest is unreadable") from exc
     if not digest_text.endswith("\n") or digest_text.count("\n") != 1:
-        raise BundleProjectionError("publication orphan bundle digest has invalid framing")
-    bundle_id = _digest(digest_text.removesuffix("\n"), "publication orphan BundleId")
+        raise BundleProjectionError(f"{description} bundle digest has invalid framing")
+    bundle_id = _digest(digest_text.removesuffix("\n"), f"{description} BundleId")
     final = path.lstat()
     if (
         final.st_dev,
@@ -542,7 +552,7 @@ def _inspect_exact_unsealed_orphan(path: Path) -> _Projection:
         initial.st_mtime_ns,
         initial.st_mode,
     ):
-        raise BundleProjectionError("publication orphan changed during exact verification")
+        raise BundleProjectionError(f"{description} changed during exact verification")
     return _Projection(
         root=path,
         bundle_id=bundle_id,
@@ -551,6 +561,22 @@ def _inspect_exact_unsealed_orphan(path: Path) -> _Projection:
         inventory_sha256=inventory_sha256,
         file_count=file_count,
         total_size_bytes=total_size_bytes,
+    )
+
+
+def _inspect_exact_unsealed_orphan(path: Path) -> _Projection:
+    return _inspect_exact_existing_publication(
+        path,
+        expected_root_mode=0o700,
+        description="unsealed publication orphan",
+    )
+
+
+def _inspect_exact_sealed_publication(path: Path) -> _Projection:
+    return _inspect_exact_existing_publication(
+        path,
+        expected_root_mode=0o555,
+        description="sealed publication",
     )
 
 
@@ -576,6 +602,7 @@ class BundleFinalizer:
         if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
             raise BundleProjectionError("bundle parent must be a real directory")
         orphan_candidate = False
+        sealed_candidate = False
         if os.path.lexists(destination):
             existing = destination.lstat()
             orphan_candidate = (
@@ -583,7 +610,12 @@ class BundleFinalizer:
                 and stat.S_ISDIR(existing.st_mode)
                 and stat.S_IMODE(existing.st_mode) == 0o700
             )
-            if not orphan_candidate:
+            sealed_candidate = (
+                not stat.S_ISLNK(existing.st_mode)
+                and stat.S_ISDIR(existing.st_mode)
+                and stat.S_IMODE(existing.st_mode) == 0o555
+            )
+            if not orphan_candidate and not sealed_candidate:
                 raise BundleProjectionError(f"bundle destination already exists: {destination}")
 
         first_root = Path(
@@ -610,6 +642,20 @@ class BundleFinalizer:
             )
             grade = derive_bundle_exact_grade(regeneration)
             _check_cancellation(cancel_event, "exclusive publication")
+            if sealed_candidate:
+                sealed = _inspect_exact_sealed_publication(destination)
+                _assert_same_projection(sealed, first)
+                return BundleFinalizationResult(
+                    root=destination.resolve(),
+                    bundle_id=sealed.bundle_id,
+                    manifest_sha256=sealed.manifest_sha256,
+                    submission_sha256=sealed.submission_sha256,
+                    inventory_sha256=sealed.inventory_sha256,
+                    file_count=sealed.file_count,
+                    total_size_bytes=sealed.total_size_bytes,
+                    regeneration_evidence=regeneration,
+                    replay_grade=grade,
+                )
             if orphan_candidate:
                 orphan = _inspect_exact_unsealed_orphan(destination)
                 _assert_same_projection(orphan, first)

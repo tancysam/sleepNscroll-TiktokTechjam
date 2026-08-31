@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -58,6 +59,16 @@ _STABLE_COMMAND: Final = (
 
 class OrganizerCheckError(RuntimeError):
     """Raised when safe view construction or the immutable checker fails closed."""
+
+
+def _sha256(value: object, location: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise OrganizerCheckError(f"{location} must be a lowercase SHA-256 digest")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +403,172 @@ def _verify_starter(starter_dir: Path, phase: str) -> str:
         ) from exc
 
 
+def validate_organizer_check_manifest(
+    value: object,
+    *,
+    expected_submission_sha256: str,
+    expected_submission_size_bytes: int | None,
+    expected_starter_manifest_sha256: str,
+    expected_final_rows: int,
+) -> dict[str, object]:
+    """Authenticate retained evidence from the hash-pinned structural checker.
+
+    This validates the value-free masking proof as well as the checker outcome.  It is shared by
+    the state authority and public bundle validator so a digest-shaped organizer claim cannot be
+    accepted without the exact retained manifest behind it.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "checker",
+        "mode",
+        "split",
+        "starter_manifest_sha256",
+        "submission",
+        "masked_data_view",
+        "command",
+        "returncode",
+        "stdout",
+        "stderr",
+        "stdout_sha256",
+        "stderr_sha256",
+    }:
+        raise OrganizerCheckError("organizer check evidence has an unexpected schema")
+    if (
+        value.get("schema_version") != ORGANIZER_CHECK_SCHEMA_VERSION
+        or value.get("checker") != "hash-pinned organizer submit.py"
+        or value.get("mode") != "check_only"
+        or value.get("split") != "test"
+        or value.get("returncode") != 0
+        or value.get("command") != list(_STABLE_COMMAND)
+    ):
+        raise OrganizerCheckError("organizer check evidence does not prove check-only success")
+    if type(expected_final_rows) is not int or expected_final_rows <= 0:
+        raise OrganizerCheckError("expected_final_rows must be positive")
+    starter = _sha256(value.get("starter_manifest_sha256"), "starter_manifest_sha256")
+    if starter != _sha256(expected_starter_manifest_sha256, "expected_starter_manifest_sha256"):
+        raise OrganizerCheckError("organizer checker used a different starter manifest")
+    submission = value.get("submission")
+    if not isinstance(submission, Mapping) or set(submission) != {"sha256", "size_bytes"}:
+        raise OrganizerCheckError("organizer submission evidence has an unexpected schema")
+    if _sha256(submission.get("sha256"), "submission.sha256") != _sha256(
+        expected_submission_sha256, "expected_submission_sha256"
+    ):
+        raise OrganizerCheckError("organizer checker observed different submission bytes")
+    submission_size = submission.get("size_bytes")
+    if type(submission_size) is not int or submission_size <= 0:
+        raise OrganizerCheckError("organizer submission size is invalid")
+    if expected_submission_size_bytes is not None and (
+        type(expected_submission_size_bytes) is not int
+        or expected_submission_size_bytes <= 0
+        or submission_size != expected_submission_size_bytes
+    ):
+        raise OrganizerCheckError("organizer submission size differs from retained bytes")
+    for stream in ("stdout", "stderr"):
+        observed = value.get(stream)
+        if type(observed) is not str:
+            raise OrganizerCheckError(f"organizer {stream} must be text")
+        expected_digest = hashlib.sha256(observed.encode("utf-8")).hexdigest()
+        if _sha256(value.get(f"{stream}_sha256"), f"{stream}_sha256") != expected_digest:
+            raise OrganizerCheckError(f"organizer {stream} digest is invalid")
+
+    masked = value.get("masked_data_view")
+    if not isinstance(masked, Mapping) or set(masked) != {
+        "schema_version",
+        "files",
+        "final_outcome_isolation",
+        "digest",
+    }:
+        raise OrganizerCheckError("masked data-view evidence has an unexpected schema")
+    if masked.get("schema_version") != ORGANIZER_CHECK_SCHEMA_VERSION:
+        raise OrganizerCheckError("masked data-view schema_version is unsupported")
+    files = masked.get("files")
+    if not isinstance(files, list) or len(files) != len(REQUIRED_DATA_FILENAMES):
+        raise OrganizerCheckError("masked data-view file inventory is incomplete")
+    normalized_files: list[dict[str, object]] = []
+    counted_final_rows = 0
+    for index, candidate in enumerate(files):
+        if not isinstance(candidate, Mapping) or set(candidate) != {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+            "data_rows",
+            "final_rows_masked",
+        }:
+            raise OrganizerCheckError(f"masked file evidence {index} has an unexpected schema")
+        relative_path = candidate.get("relative_path")
+        if type(relative_path) is not str:
+            raise OrganizerCheckError("masked file relative_path must be text")
+        size_bytes = candidate.get("size_bytes")
+        if type(size_bytes) is not int or size_bytes <= 0:
+            raise OrganizerCheckError("masked file size is invalid")
+        _sha256(candidate.get("sha256"), f"masked files[{index}].sha256")
+        data_rows = candidate.get("data_rows")
+        final_rows = candidate.get("final_rows_masked")
+        if relative_path == VIDEO_BASIC_FILENAME:
+            if data_rows is not None or final_rows is not None:
+                raise OrganizerCheckError("video feature masking counters must be absent")
+        else:
+            if (
+                type(data_rows) is not int
+                or data_rows <= 0
+                or type(final_rows) is not int
+                or final_rows < 0
+                or final_rows > data_rows
+            ):
+                raise OrganizerCheckError("standard-log masking counters are invalid")
+            counted_final_rows += final_rows
+        normalized_files.append(dict(candidate))
+    if [entry["relative_path"] for entry in normalized_files] != sorted(REQUIRED_DATA_FILENAMES):
+        raise OrganizerCheckError("masked data-view file inventory differs from the contract")
+
+    isolation = masked.get("final_outcome_isolation")
+    counter_names = (
+        "outcome_cells_sliced",
+        "outcome_cells_decoded",
+        "outcome_cells_converted",
+        "outcome_cells_validated",
+        "outcome_cells_logged",
+        "outcome_cells_hashed",
+        "outcome_cells_scored",
+    )
+    expected_cells = expected_final_rows * len(OUTCOME_FIELDS)
+    if not isinstance(isolation, Mapping) or set(isolation) != {
+        "registered_fields",
+        "final_rows_masked",
+        "final_outcome_cells_replaced",
+        *counter_names,
+    }:
+        raise OrganizerCheckError("final outcome-isolation evidence has an unexpected schema")
+    if (
+        isolation.get("registered_fields") != list(OUTCOME_FIELDS)
+        or isolation.get("final_rows_masked") != expected_final_rows
+        or isolation.get("final_outcome_cells_replaced") != expected_cells
+        or counted_final_rows != expected_final_rows
+        or any(isolation.get(name) != 0 for name in counter_names)
+    ):
+        raise OrganizerCheckError("final outcome-isolation evidence is unsafe")
+    digest_body = {
+        "schema_version": ORGANIZER_CHECK_SCHEMA_VERSION,
+        "files": normalized_files,
+        "registered_outcome_fields": list(OUTCOME_FIELDS),
+        "final_rows_masked": expected_final_rows,
+        "final_outcome_cells_replaced": expected_cells,
+    }
+    if (
+        _sha256(masked.get("digest"), "masked_data_view.digest")
+        != hashlib.sha256(_canonical_json(digest_body)).hexdigest()
+    ):
+        raise OrganizerCheckError("masked data-view digest is invalid")
+    try:
+        normalized = json.loads(_canonical_json(dict(value)))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OrganizerCheckError("organizer evidence is not finite canonical JSON") from exc
+    if not isinstance(normalized, dict):  # pragma: no cover - Mapping input guarantees object.
+        raise OrganizerCheckError("organizer evidence must normalize to an object")
+    return normalized
+
+
 def _decode_bounded_output(payload: bytes, stream: str) -> str:
     if len(payload) > _MAX_CHECKER_OUTPUT_BYTES:
         raise OrganizerCheckError(
@@ -523,4 +700,5 @@ __all__ = [
     "OrganizerCheckError",
     "OrganizerCheckEvidence",
     "check_final_submission",
+    "validate_organizer_check_manifest",
 ]

@@ -401,6 +401,11 @@ class OfficialFMFallbackEvidence:
     checkpoint_file_sha256: str
     encoding_file_sha256: str
     validation_predictions_file_sha256: str
+    final_submission_path: Path
+    final_submission_file_sha256: str
+    final_prediction_digest: str
+    final_row_count: int
+    resources: OfficialFMResourceEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -1175,7 +1180,14 @@ def _require_fallback(
         expected_path="final/submission.csv",
         location="fallback final submission",
     )
-    _require_digest(final_submission.get("prediction_digest"), "fallback final prediction digest")
+    final_submission_file_sha256 = _require_digest(
+        final_submission.get("sha256"),
+        "fallback final submission SHA-256",
+    )
+    final_prediction_digest = _require_digest(
+        final_submission.get("prediction_digest"),
+        "fallback final prediction digest",
+    )
     if final_submission.get("final_outcomes_accessed") is not False:
         raise QualificationEvidenceError("fallback final inference accessed outcomes")
 
@@ -1240,6 +1252,11 @@ def _require_fallback(
         checkpoint_file_sha256=hashes["checkpoint.npz"],
         encoding_file_sha256=hashes["encoding.npz"],
         validation_predictions_file_sha256=hashes["validation-predictions.npy"],
+        final_submission_path=(root / "final" / "submission.csv").resolve(),
+        final_submission_file_sha256=final_submission_file_sha256,
+        final_prediction_digest=final_prediction_digest,
+        final_row_count=expectations.final_row_count,
+        resources=seed_four.resources,
     )
 
 

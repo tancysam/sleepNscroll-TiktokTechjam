@@ -35,6 +35,19 @@ from kuairand_agent.domain.identity import (
     PredictionId,
     Sha256Id,
     canonical_json_bytes,
+    canonical_json_sha256,
+)
+from kuairand_agent.finalization.organizer_check import (
+    OrganizerCheckError,
+    validate_organizer_check_manifest,
+)
+from kuairand_agent.finalization.replay_grades import (
+    BundleRegenerationEvidence,
+    ReplayGradeError,
+    ReplayGradeReceipt,
+    combine_replay_grade_receipts,
+    validate_bundle_regeneration_evidence_manifest,
+    validate_replay_grade_receipt_manifest,
 )
 from kuairand_agent.observability.receipts import ReceiptError, ScriptedReplayReceipt
 from kuairand_agent.state.schema import configure_connection, migrate
@@ -213,6 +226,101 @@ _SCRIPTED_RESULT_RESOURCE_FIELDS: Final = frozenset(
 )
 _SCRIPTED_TIMING_FIELDS: Final = frozenset(
     {"started_monotonic_ns", "ended_monotonic_ns", "wall_seconds"}
+)
+_PRODUCTION_TERMINAL_STATE: Final = "COMPLETED"
+_PRODUCTION_REPLAY_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "contract_id",
+        "campaign_id",
+        "prediction_id",
+        "qualification_manifest_digest",
+        "qualification_fallback_digest",
+        "original_prediction_sha256",
+        "replay_prediction_sha256",
+        "row_alignment_sha256",
+        "submission_sha256",
+        "organizer_check_sha256",
+        "organizer_check",
+        "clean_replay_evidence_sha256",
+        "clean_replay_evidence",
+        "scoring_exact_receipt",
+        "same_backend_receipt",
+        "achieved_replay_grades",
+        "required_terminal_replay_grades",
+        "qualification_scope",
+        "official_fm_qualified",
+        "full_data_qualified",
+        "final_period_outcomes_accessed",
+    }
+)
+_PRODUCTION_BUNDLE_CLAIM_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "resource_receipt_id",
+        "prepublication_replay_grades",
+        "required_replay_grades",
+        "bundle_exact_status",
+        "submission_disposition",
+        "scientific_disposition",
+        "campaign_kind",
+        "qualification_scope",
+        "protected_query_count",
+        "provider_operation_count",
+        "exact_metrics",
+        "official_fm_qualified",
+        "full_data_qualified",
+        "final_period_outcomes_accessed",
+        "qualification_manifest_digest",
+    }
+)
+_PRODUCTION_PREPUBLICATION_REPLAY_GRADES: Final = (
+    ReplayGrade.SCORING_EXACT.value,
+    ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+)
+_PRODUCTION_REQUIRED_REPLAY_GRADES: Final = (
+    ReplayGrade.SCORING_EXACT.value,
+    ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+    ReplayGrade.BUNDLE_EXACT.value,
+)
+_POSTPUBLICATION_RESOURCE_SCOPE: Final = "THROUGH_BUNDLE_PUBLICATION_EXCLUDING_TERMINAL_COMMIT"
+_POSTPUBLICATION_RESOURCE_FIELDS: Final = frozenset(
+    {
+        "wall_seconds",
+        "cpu_seconds",
+        "peak_rss_bytes",
+        "disk_bytes",
+        "device",
+    }
+)
+_PRODUCTION_RESOURCE_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "contract_id",
+        "campaign_id",
+        "prediction_id",
+        "campaign_kind",
+        "qualification_scope",
+        "qualification_manifest_digest",
+        "qualification_fallback_digest",
+        "performance_profile_digest",
+        "declared_resource_profile",
+        "actual_trainer_backend",
+        "actual_trainer_device",
+        "qualified_training_resources",
+        "controller_resources",
+        "controller_resource_scope",
+        "preferred_backend_qualified",
+        "official_fm_qualified",
+        "full_data_qualified",
+        "final_period_outcomes_accessed",
+    }
+)
+_PRODUCTION_QUALIFIED_RESOURCE_FIELDS: Final = frozenset(
+    {"wall_seconds", "cpu_seconds", "peak_rss_bytes", "disk_bytes", "device"}
+)
+_PRODUCTION_CONTROLLER_RESOURCE_FIELDS: Final = frozenset(
+    {"wall_seconds", "cpu_seconds", "peak_rss_bytes", "disk_bytes", "device"}
 )
 
 
@@ -424,6 +532,8 @@ class TerminalPreparation:
     decision_payload: Mapping[str, object] = field(default_factory=dict)
     replay_payload: Mapping[str, object] = field(default_factory=dict)
     bundle_claims: Mapping[str, object] = field(default_factory=dict)
+    scoring_exact_receipt: ReplayGradeReceipt | None = None
+    same_backend_receipt: ReplayGradeReceipt | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +570,93 @@ class PublishedBundleReceipt:
     submission_sha256: str
     file_count: int
     total_size_bytes: int
+    regeneration_evidence: BundleRegenerationEvidence | None = None
+    bundle_exact_receipt: ReplayGradeReceipt | None = None
+    postpublication_resource_receipt: PostpublicationResourceReceipt | None = None
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PostpublicationResourceReceipt:
+    """Authority-only resource evidence measured through successful bundle publication.
+
+    The receipt is intentionally excluded from the already content-addressed bundle.  Its identity
+    binds the exact prepublication authority receipt and is persisted atomically with terminal
+    campaign state.
+    """
+
+    receipt_id: str
+    contract_id: str
+    campaign_id: str
+    prediction_id: str
+    prepublication_resource_receipt_id: str
+    performance_profile_digest: str
+    scope: str
+    measurements: Mapping[str, object]
+
+    @classmethod
+    def from_measurement(
+        cls,
+        *,
+        contract_id: ContractIdInput,
+        campaign_id: CampaignIdInput,
+        prediction_id: PredictionIdInput,
+        prepublication_resource_receipt_id: str,
+        performance_profile_digest: str,
+        measurements: Mapping[str, object],
+    ) -> PostpublicationResourceReceipt:
+        """Authenticate one finite CPU process-tree measurement at the fixed honest scope."""
+
+        if not isinstance(measurements, Mapping):
+            raise StateInvariantError("postpublication measurements must be a mapping")
+        normalized_measurements = _validate_production_resource_measurements(
+            measurements,
+            fields=_POSTPUBLICATION_RESOURCE_FIELDS,
+            location="postpublication controller resources",
+            peak_rss_positive=True,
+        )
+        contract = _identifier(contract_id, "postpublication contract_id")
+        campaign = _identifier(campaign_id, "postpublication campaign_id")
+        prediction = _identifier(prediction_id, "postpublication prediction_id")
+        prepublication = _sha256(
+            prepublication_resource_receipt_id,
+            "prepublication_resource_receipt_id",
+        )
+        profile = _sha256(performance_profile_digest, "performance_profile_digest")
+        body: dict[str, object] = {
+            "schema_version": 1,
+            "contract_id": contract,
+            "campaign_id": campaign,
+            "prediction_id": prediction,
+            "prepublication_resource_receipt_id": prepublication,
+            "performance_profile_digest": profile,
+            "scope": _POSTPUBLICATION_RESOURCE_SCOPE,
+            "measurements": normalized_measurements,
+        }
+        result = object.__new__(cls)
+        object.__setattr__(result, "receipt_id", canonical_json_sha256(body))
+        object.__setattr__(result, "contract_id", contract)
+        object.__setattr__(result, "campaign_id", campaign)
+        object.__setattr__(result, "prediction_id", prediction)
+        object.__setattr__(result, "prepublication_resource_receipt_id", prepublication)
+        object.__setattr__(result, "performance_profile_digest", profile)
+        object.__setattr__(result, "scope", _POSTPUBLICATION_RESOURCE_SCOPE)
+        object.__setattr__(result, "measurements", MappingProxyType(normalized_measurements))
+        return result
+
+    def manifest(self) -> dict[str, object]:
+        """Return the exact immutable authority payload, including its content identity."""
+
+        return {
+            "schema_version": 1,
+            "receipt_id": self.receipt_id,
+            "contract_id": self.contract_id,
+            "campaign_id": self.campaign_id,
+            "prediction_id": self.prediction_id,
+            "prepublication_resource_receipt_id": self.prepublication_resource_receipt_id,
+            "performance_profile_digest": self.performance_profile_digest,
+            "scope": self.scope,
+            "measurements": dict(self.measurements),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1450,21 +1647,43 @@ class StateRepository:
         terminal_state = _text(preparation.terminal_state, "terminal_state")
         if terminal_state not in _ATOMIC_FINAL_STATES["campaign"]:
             raise StateInvariantError("final campaign state is not an allowed terminal state")
-        if terminal_state == "COMPLETED":
-            raise StateInvariantError(
-                "production terminal replay verification is not implemented; "
-                "COMPLETED preparation fails closed"
-            )
         _reject_publication_fields(preparation.bundle_claims)
-        validated_replay, validated_claims = _normalize_offline_fixture_evidence(
-            contract_id=contract,
-            campaign_id=campaign,
-            selected_prediction_id=selected,
-            replay_payload=preparation.replay_payload,
-            bundle_claims=preparation.bundle_claims,
-        )
+        if terminal_state == _PRODUCTION_TERMINAL_STATE:
+            if not isinstance(preparation.same_backend_receipt, ReplayGradeReceipt):
+                raise StateInvariantError(
+                    "production preparation requires a typed same-backend receipt"
+                )
+            validated_replay, validated_claims = _normalize_production_evidence(
+                contract_id=contract,
+                campaign_id=campaign,
+                selected_prediction_id=selected,
+                fallback_prediction_id=fallback,
+                replay_payload=preparation.replay_payload,
+                bundle_claims=preparation.bundle_claims,
+                scoring_exact_receipt=preparation.scoring_exact_receipt,
+                same_backend_receipt=preparation.same_backend_receipt,
+            )
+        else:
+            if (
+                preparation.scoring_exact_receipt is not None
+                or preparation.same_backend_receipt is not None
+            ):
+                raise StateInvariantError(
+                    "offline terminal preparation cannot attach production replay receipts"
+                )
+            validated_replay, validated_claims = _normalize_offline_fixture_evidence(
+                contract_id=contract,
+                campaign_id=campaign,
+                selected_prediction_id=selected,
+                replay_payload=preparation.replay_payload,
+                bundle_claims=preparation.bundle_claims,
+            )
         decision_json = _canonical_json(preparation.decision_payload, "decision_payload")
-        replay_json = _canonical_json(validated_replay, "validated replay evidence")
+        replay_json = (
+            _canonical_json_preserve_numbers(validated_replay, "validated replay evidence")
+            if terminal_state == _PRODUCTION_TERMINAL_STATE
+            else _canonical_json(validated_replay, "validated replay evidence")
+        )
         claims_json = _canonical_json(validated_claims, "validated bundle claims")
         intent = (
             contract,
@@ -1489,7 +1708,22 @@ class StateRepository:
                 campaign_id=campaign,
                 contract_id=contract,
                 selected_prediction_id=selected,
+                terminal_state=terminal_state,
+                expected_qualification_manifest_digest=cast(
+                    str | None, validated_replay.get("qualification_manifest_digest")
+                ),
+                expected_qualification_fallback_digest=cast(
+                    str | None, validated_replay.get("qualification_fallback_digest")
+                ),
+                expected_prediction_sha256=cast(
+                    str | None, validated_replay.get("original_prediction_sha256")
+                ),
+                expected_row_alignment_sha256=cast(
+                    str | None, validated_replay.get("row_alignment_sha256")
+                ),
             )
+            if terminal_state == _PRODUCTION_TERMINAL_STATE:
+                _validate_production_authority_counts(connection, campaign_id=campaign)
             current = connection.execute(
                 """
                 SELECT state, revision, next_event_seq, terminal
@@ -1598,7 +1832,11 @@ class StateRepository:
                 bundle_claims_json=claims_json,
                 prepared_at=now,
             )
-            projection_json = _canonical_json(projection, "prepared terminal projection")
+            projection_json = (
+                _canonical_json_preserve_numbers(projection, "prepared terminal projection")
+                if terminal_state == _PRODUCTION_TERMINAL_STATE
+                else _canonical_json(projection, "prepared terminal projection")
+            )
             projection_sha = hashlib.sha256(projection_json.encode()).hexdigest()
             preparation_id = hashlib.sha256(
                 b"kuairand-terminal-preparation-v1\0"
@@ -1703,11 +1941,20 @@ class StateRepository:
             preparation_id=identity,
             projection_sha256=str(row[7]),
             projection=projection,
+            preserve_numbers=str(row[4]) == _PRODUCTION_TERMINAL_STATE,
         )
         events = projection.get("events")
         if not isinstance(events, list):
             raise StateInvariantError("prepared terminal projection has no event list")
-        event_payload = b"".join(canonical_json_bytes(event) + b"\n" for event in events)
+        event_payload = b"".join(
+            (
+                _canonical_json_preserve_numbers(event, "terminal event").encode("ascii")
+                if str(row[4]) == _PRODUCTION_TERMINAL_STATE
+                else canonical_json_bytes(event)
+            )
+            + b"\n"
+            for event in events
+        )
         event_sha, event_size = _atomic_publish_bytes(event_export_destination, event_payload)
         return PreparedProjectionArtifacts(
             identity,
@@ -1765,21 +2012,65 @@ class StateRepository:
             replay_json = str(row[11])
             claims = dict(_json_mapping(str(row[12])))
             projection_sha = str(row[13])
-            _validate_stored_terminal_evidence(
+            validated_replay, validated_claims = _validate_stored_terminal_evidence(
                 terminal_state=terminal_state,
                 contract_id=contract,
                 campaign_id=campaign,
                 selected_prediction_id=selected,
+                fallback_prediction_id=fallback,
                 replay_json=replay_json,
                 bundle_claims=claims,
             )
-            resource_receipt_id = cast(str, claims["resource_receipt_id"])
+            resource_receipt_id = cast(str, validated_claims["resource_receipt_id"])
             resource_receipt_payload = _validated_resource_receipt_payload(
                 connection,
                 receipt_id=resource_receipt_id,
                 campaign_id=campaign,
                 contract_id=contract,
                 selected_prediction_id=selected,
+                terminal_state=terminal_state,
+                expected_qualification_manifest_digest=cast(
+                    str | None, validated_replay.get("qualification_manifest_digest")
+                ),
+                expected_qualification_fallback_digest=cast(
+                    str | None, validated_replay.get("qualification_fallback_digest")
+                ),
+                expected_prediction_sha256=cast(
+                    str | None, validated_replay.get("original_prediction_sha256")
+                ),
+                expected_row_alignment_sha256=cast(
+                    str | None, validated_replay.get("row_alignment_sha256")
+                ),
+            )
+            if terminal_state == _PRODUCTION_TERMINAL_STATE:
+                _validate_production_authority_counts(connection, campaign_id=campaign)
+                publication_proof = _validated_production_publication_proof(
+                    publication,
+                    contract_id=contract,
+                    prediction_id=selected,
+                    bundle_id=bundle,
+                    submission_sha256=submission_sha,
+                    inventory_sha256=inventory_sha,
+                    scoring_exact_receipt_manifest=validated_replay.get("scoring_exact_receipt"),
+                    same_backend_receipt_manifest=validated_replay.get("same_backend_receipt"),
+                )
+            else:
+                if (
+                    publication.regeneration_evidence is not None
+                    or publication.bundle_exact_receipt is not None
+                ):
+                    raise StateInvariantError(
+                        "offline publication cannot attach production bundle replay proofs"
+                    )
+                publication_proof = None
+            postpublication_resource = _validated_postpublication_resource_receipt(
+                publication.postpublication_resource_receipt,
+                terminal_state=terminal_state,
+                campaign_id=campaign,
+                contract_id=contract,
+                selected_prediction_id=selected,
+                prepublication_resource_receipt_id=resource_receipt_id,
+                prepublication_resource_payload=resource_receipt_payload,
             )
             root = _verify_published_bundle(
                 publication,
@@ -1800,19 +2091,29 @@ class StateRepository:
                 resource_receipt_id=resource_receipt_id,
                 resource_receipt_payload=resource_receipt_payload,
             )
-            bundle_json = _canonical_json(
-                claims
-                | {
-                    "bundle_path": str(root),
-                    "bundle_sha256": bundle,
-                    "evidence_manifest_path": str(root / "bundle-manifest.json"),
-                    "inventory_sha256": inventory_sha,
-                    "manifest_sha256": manifest_sha,
-                    "submission_sha256": submission_sha,
-                    "preparation_id": identity,
-                    "prepared_projection_sha256": projection_sha,
-                },
-                "published bundle payload",
+            final_claims = claims
+            if publication_proof is not None:
+                final_claims = claims | {
+                    "bundle_exact_status": "VERIFIED",
+                    "replay_grade": ReplayGrade.BUNDLE_EXACT.value,
+                    "replay_grades": list(_PRODUCTION_REQUIRED_REPLAY_GRADES),
+                    "publication_proof": publication_proof,
+                    "postpublication_resource_receipt": postpublication_resource,
+                }
+            bundle_payload = final_claims | {
+                "bundle_path": str(root),
+                "bundle_sha256": bundle,
+                "evidence_manifest_path": str(root / "bundle-manifest.json"),
+                "inventory_sha256": inventory_sha,
+                "manifest_sha256": manifest_sha,
+                "submission_sha256": submission_sha,
+                "preparation_id": identity,
+                "prepared_projection_sha256": projection_sha,
+            }
+            bundle_json = (
+                _canonical_json_preserve_numbers(bundle_payload, "published bundle payload")
+                if terminal_state == _PRODUCTION_TERMINAL_STATE
+                else _canonical_json(bundle_payload, "published bundle payload")
             )
             campaign_row = self._assert_campaign_lineage(
                 connection, campaign_id=campaign, contract_id=contract, writable=False
@@ -3150,6 +3451,7 @@ def _write_terminal_projection_sqlite(
     preparation_id: str,
     projection_sha256: str,
     projection: Mapping[str, object],
+    preserve_numbers: bool = False,
 ) -> tuple[str, int]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -3158,7 +3460,11 @@ def _write_terminal_projection_sqlite(
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        projection_json = canonical_json_bytes(dict(projection)).decode()
+        projection_json = (
+            _canonical_json_preserve_numbers(dict(projection), "terminal projection")
+            if preserve_numbers
+            else canonical_json_bytes(dict(projection)).decode()
+        )
         connection = sqlite3.connect(temporary)
         try:
             connection.executescript(
@@ -3487,22 +3793,534 @@ def _normalize_offline_fixture_evidence(
     return journaled_replay, _normalize_offline_fixture_bundle_claims(bundle_claims)
 
 
+def _production_scoring_receipt(
+    value: object,
+    *,
+    clean_replay: object,
+    contract_id: str,
+    prediction_id: str,
+    original_prediction_sha256: str,
+    replay_prediction_sha256: str,
+    submission_sha256: str,
+) -> ReplayGradeReceipt:
+    if not isinstance(clean_replay, Mapping) or frozenset(clean_replay) != {
+        "schema_version",
+        "candidate_id",
+        "identity",
+        "equality",
+        "training_replay",
+        "validation",
+        "final",
+        "capabilities",
+        "workspace",
+    }:
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: clean replay has an unexpected schema"
+        )
+    if (
+        clean_replay.get("schema_version") != 1
+        or type(clean_replay.get("candidate_id")) is not str
+        or not cast(str, clean_replay.get("candidate_id"))
+        or type(clean_replay.get("training_replay")) is not str
+        or not cast(str, clean_replay.get("training_replay"))
+    ):
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: clean replay header is invalid"
+        )
+    identity = clean_replay.get("identity")
+    if not isinstance(identity, Mapping) or frozenset(identity) != {
+        "source_sha256",
+        "config_sha256",
+        "features_sha256",
+        "checkpoint_sha256",
+        "validation_prediction_artifact_sha256",
+        "validation_prediction_digest",
+        "data_sha256",
+        "environment_sha256",
+    }:
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: frozen replay identity schema differs"
+        )
+    for name, candidate in identity.items():
+        _sha256(candidate, f"clean replay identity {name}")
+    equality = clean_replay.get("equality")
+    if (
+        not isinstance(equality, Mapping)
+        or frozenset(equality) != {"policy", "absolute_tolerance"}
+        or equality.get("policy") != "exact_same_host_bytes"
+        or equality.get("absolute_tolerance") != 0.0
+    ):
+        raise StateInvariantError("PRODUCTION_SCORING_RECEIPT_INVALID: clean replay is not exact")
+    validation = clean_replay.get("validation")
+    if not isinstance(validation, Mapping) or frozenset(validation) != {
+        "row_count",
+        "reference_prediction_digest",
+        "replay_prediction_digest",
+        "replay_prediction_file_sha256",
+        "exact_prediction_bytes",
+        "maximum_absolute_difference",
+        "top5_order_identical",
+        "protected_metrics_identical",
+        "metrics",
+        "public_submission_sha256",
+        "public_submission_prediction_digest",
+        "csv_serialization",
+    }:
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: validation replay schema differs"
+        )
+    validation_reference = _sha256(
+        validation.get("reference_prediction_digest"),
+        "clean replay validation reference prediction",
+    )
+    validation_replay = _sha256(
+        validation.get("replay_prediction_digest"),
+        "clean replay validation replay prediction",
+    )
+    _sha256(
+        validation.get("replay_prediction_file_sha256"),
+        "clean replay validation prediction file",
+    )
+    _sha256(
+        validation.get("public_submission_sha256"),
+        "clean replay validation submission",
+    )
+    _sha256(
+        validation.get("public_submission_prediction_digest"),
+        "clean replay validation submission prediction",
+    )
+    csv = validation.get("csv_serialization")
+    metrics = validation.get("metrics")
+    if not isinstance(metrics, Mapping) or frozenset(metrics) != {"GAUC", "nDCG@5", "primary"}:
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: validation metrics schema differs"
+        )
+    metric_values: dict[str, float] = {}
+    for name, candidate in metrics.items():
+        if type(candidate) not in {int, float} or not math.isfinite(cast(int | float, candidate)):
+            raise StateInvariantError(
+                f"PRODUCTION_SCORING_RECEIPT_INVALID: validation metric {name} is invalid"
+            )
+        metric_values[name] = float(cast(int | float, candidate))
+    if (
+        type(validation.get("row_count")) is not int
+        or cast(int, validation["row_count"]) <= 0
+        or validation_reference != validation_replay
+        or validation.get("exact_prediction_bytes") is not True
+        or validation.get("maximum_absolute_difference") != 0.0
+        or validation.get("top5_order_identical") is not True
+        or validation.get("protected_metrics_identical") is not True
+        or validation.get("public_submission_prediction_digest") != validation_replay
+        or not math.isclose(
+            metric_values["primary"],
+            (metric_values["GAUC"] + metric_values["nDCG@5"]) / 2.0,
+            rel_tol=0.0,
+            abs_tol=2e-7,
+        )
+        or not isinstance(csv, Mapping)
+        or frozenset(csv)
+        != {
+            "float64_round_trip_identity",
+            "within_user_order_preserved",
+            "top5_preserved",
+            "protected_metrics_preserved",
+        }
+        or any(value is not True for value in csv.values())
+        or identity.get("validation_prediction_digest") != validation_reference
+    ):
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: validation replay is not scoring exact"
+        )
+    final = clean_replay.get("final")
+    if not isinstance(final, Mapping) or frozenset(final) != {
+        "row_count",
+        "prediction_digest",
+        "prediction_file_sha256",
+        "submission_sha256",
+        "submission_prediction_digest",
+        "finite_scores",
+        "csv_round_trip_identity",
+        "outcome_access",
+        "final_outcomes_accessed",
+        "final_outcomes_scored",
+    }:
+        raise StateInvariantError("PRODUCTION_SCORING_RECEIPT_INVALID: final replay schema differs")
+    final_prediction = _sha256(final.get("prediction_digest"), "final replay prediction")
+    final_submission_prediction = _sha256(
+        final.get("submission_prediction_digest"), "final replay submission prediction"
+    )
+    final_submission = _sha256(final.get("submission_sha256"), "final replay submission")
+    _sha256(final.get("prediction_file_sha256"), "final replay prediction file")
+    if (
+        type(final.get("row_count")) is not int
+        or cast(int, final["row_count"]) <= 0
+        or final_prediction != final_submission_prediction
+        or final_prediction not in {original_prediction_sha256, replay_prediction_sha256}
+        or original_prediction_sha256 != replay_prediction_sha256
+        or final_submission != submission_sha256
+        or final.get("finite_scores") is not True
+        or final.get("csv_round_trip_identity") is not True
+        or final.get("outcome_access") != "none"
+        or final.get("final_outcomes_accessed") is not False
+        or final.get("final_outcomes_scored") is not False
+    ):
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: final replay is not target-free exact evidence"
+        )
+    capabilities = clean_replay.get("capabilities")
+    if not isinstance(capabilities, Mapping) or frozenset(capabilities) != {
+        "validation_digest",
+        "final_digest",
+        "validation_phase",
+        "final_phase",
+        "labels_exposed_to_backend",
+        "raw_data_path_exposed_to_backend",
+    }:
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: replay capability schema differs"
+        )
+    validation_capability = _sha256(
+        capabilities.get("validation_digest"), "validation capability digest"
+    )
+    final_capability = _sha256(capabilities.get("final_digest"), "final capability digest")
+    if (
+        capabilities.get("validation_phase") != "outer_valid"
+        or capabilities.get("final_phase") != "final"
+        or capabilities.get("labels_exposed_to_backend") is not False
+        or capabilities.get("raw_data_path_exposed_to_backend") is not False
+    ):
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: replay capability boundary is unsafe"
+        )
+    workspace = clean_replay.get("workspace")
+    if not isinstance(workspace, Mapping) or dict(workspace) != {
+        "fresh_materialization": True,
+        "artifact_identities_reverified_after_inference": True,
+        "clean_workspace_removed": True,
+    }:
+        raise StateInvariantError(
+            "PRODUCTION_SCORING_RECEIPT_INVALID: clean workspace evidence differs"
+        )
+    clean_replay_digest = hashlib.sha256(
+        json.dumps(
+            dict(clean_replay),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+    expected_receipt_evidence = {
+        "kind": "clean_replay",
+        "clean_replay_sha256": clean_replay_digest,
+        "candidate_id": clean_replay.get("candidate_id"),
+        "frozen_identity": dict(identity),
+        "equality": equality.get("policy"),
+        "absolute_tolerance": equality.get("absolute_tolerance"),
+        "training_replay": clean_replay.get("training_replay"),
+        "validation": dict(validation),
+        "final": dict(final),
+        "capabilities": {
+            "validation_digest": validation_capability,
+            "final_digest": final_capability,
+        },
+        "clean_workspace_removed": True,
+        "conclusion": "stored and replayed prediction bytes have identical exact metrics",
+    }
+    try:
+        return validate_replay_grade_receipt_manifest(
+            value,
+            expected_grade=ReplayGrade.SCORING_EXACT,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+            expected_evidence=expected_receipt_evidence,
+        )
+    except ReplayGradeError as exc:
+        raise StateInvariantError(f"PRODUCTION_SCORING_RECEIPT_INVALID: {exc}") from exc
+
+
+def _production_same_backend_receipt(
+    value: object,
+    *,
+    scoring_receipt: ReplayGradeReceipt,
+    contract_id: str,
+    prediction_id: str,
+) -> ReplayGradeReceipt:
+    """Authenticate same-backend proof against the exact clean replay used for scoring."""
+
+    expected_evidence = dict(scoring_receipt.evidence)
+    expected_evidence["conclusion"] = (
+        "frozen trial artifacts in the frozen environment reproduced exact predictions"
+    )
+    try:
+        return validate_replay_grade_receipt_manifest(
+            value,
+            expected_grade=ReplayGrade.EXPERIMENT_SAME_BACKEND,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+            expected_evidence=expected_evidence,
+        )
+    except ReplayGradeError as exc:
+        raise StateInvariantError(f"PRODUCTION_SAME_BACKEND_RECEIPT_INVALID: {exc}") from exc
+
+
+def _normalize_production_replay(
+    value: Mapping[str, object],
+    *,
+    contract_id: str,
+    campaign_id: str,
+    selected_prediction_id: str,
+    scoring_exact_receipt: ReplayGradeReceipt | None = None,
+    same_backend_receipt: ReplayGradeReceipt | None = None,
+) -> dict[str, object]:
+    if frozenset(value) != _PRODUCTION_REPLAY_FIELDS:
+        raise StateInvariantError("production replay evidence does not match the exact schema")
+    if type(value.get("schema_version")) is not int or value.get("schema_version") != 3:
+        raise StateInvariantError("production replay schema_version must be integer 3")
+    lineage = (
+        _sha256(value.get("contract_id"), "production replay contract_id"),
+        _sha256(value.get("campaign_id"), "production replay campaign_id"),
+        _sha256(value.get("prediction_id"), "production replay prediction_id"),
+    )
+    if lineage != (contract_id, campaign_id, selected_prediction_id):
+        raise StateInvariantError("production replay evidence is outside terminal lineage")
+    achieved = value.get("achieved_replay_grades")
+    required = value.get("required_terminal_replay_grades")
+    if (
+        type(achieved) is not list
+        or tuple(cast(list[object], achieved)) != _PRODUCTION_PREPUBLICATION_REPLAY_GRADES
+        or type(required) is not list
+        or tuple(cast(list[object], required)) != _PRODUCTION_REQUIRED_REPLAY_GRADES
+    ):
+        raise StateInvariantError(
+            "production replay evidence confuses achieved and required grades"
+        )
+    if value.get("qualification_scope") != "FULL_DATA_CPU":
+        raise StateInvariantError("production replay qualification scope is unsupported")
+    if (
+        value.get("official_fm_qualified") is not True
+        or value.get("full_data_qualified") is not True
+        or value.get("final_period_outcomes_accessed") is not False
+    ):
+        raise StateInvariantError("production replay qualification or outcome evidence is unsafe")
+    digests = {
+        field_name: _sha256(value.get(field_name), f"production replay {field_name}")
+        for field_name in (
+            "qualification_manifest_digest",
+            "qualification_fallback_digest",
+            "original_prediction_sha256",
+            "replay_prediction_sha256",
+            "row_alignment_sha256",
+            "submission_sha256",
+            "organizer_check_sha256",
+        )
+    }
+    if digests["original_prediction_sha256"] != digests["replay_prediction_sha256"]:
+        raise StateInvariantError("production replay prediction bytes are not exact")
+    clean_replay = value.get("clean_replay_evidence")
+    if not isinstance(clean_replay, Mapping):
+        raise StateInvariantError("production replay lacks clean replay evidence")
+    clean_digest = _sha256(
+        value.get("clean_replay_evidence_sha256"), "clean_replay_evidence_sha256"
+    )
+    if canonical_json_sha256(dict(clean_replay)) != clean_digest:
+        raise StateInvariantError("production clean replay digest is invalid")
+    scoring = _production_scoring_receipt(
+        value.get("scoring_exact_receipt"),
+        clean_replay=clean_replay,
+        contract_id=contract_id,
+        prediction_id=selected_prediction_id,
+        original_prediction_sha256=digests["original_prediction_sha256"],
+        replay_prediction_sha256=digests["replay_prediction_sha256"],
+        submission_sha256=digests["submission_sha256"],
+    )
+    same_backend = _production_same_backend_receipt(
+        value.get("same_backend_receipt"),
+        scoring_receipt=scoring,
+        contract_id=contract_id,
+        prediction_id=selected_prediction_id,
+    )
+    if scoring_exact_receipt is not None:
+        if not isinstance(scoring_exact_receipt, ReplayGradeReceipt):
+            raise StateInvariantError("production preparation scoring receipt must be typed")
+        try:
+            typed = validate_replay_grade_receipt_manifest(
+                scoring_exact_receipt.manifest(),
+                expected_grade=ReplayGrade.SCORING_EXACT,
+                expected_contract_id=contract_id,
+                expected_prediction_id=selected_prediction_id,
+                expected_evidence=scoring.evidence,
+            )
+        except ReplayGradeError as exc:
+            raise StateInvariantError(f"PRODUCTION_SCORING_RECEIPT_INVALID: {exc}") from exc
+        if typed.manifest() != scoring.manifest():
+            raise StateInvariantError(
+                "production typed scoring receipt differs from replay payload"
+            )
+    if same_backend_receipt is not None:
+        if not isinstance(same_backend_receipt, ReplayGradeReceipt):
+            raise StateInvariantError("production preparation same-backend receipt must be typed")
+        try:
+            typed_same_backend = validate_replay_grade_receipt_manifest(
+                same_backend_receipt.manifest(),
+                expected_grade=ReplayGrade.EXPERIMENT_SAME_BACKEND,
+                expected_contract_id=contract_id,
+                expected_prediction_id=selected_prediction_id,
+                expected_evidence=same_backend.evidence,
+            )
+        except ReplayGradeError as exc:
+            raise StateInvariantError(f"PRODUCTION_SAME_BACKEND_RECEIPT_INVALID: {exc}") from exc
+        if typed_same_backend.manifest() != same_backend.manifest():
+            raise StateInvariantError(
+                "production typed same-backend receipt differs from replay payload"
+            )
+    organizer = value.get("organizer_check")
+    if not isinstance(organizer, Mapping):
+        raise StateInvariantError("production replay lacks organizer check evidence")
+    if canonical_json_sha256(dict(organizer)) != digests["organizer_check_sha256"]:
+        raise StateInvariantError("PRODUCTION_ORGANIZER_CHECK_INVALID: digest differs")
+    clean_final = cast(Mapping[str, object], clean_replay["final"])
+    organizer_starter = _sha256(
+        organizer.get("starter_manifest_sha256"), "organizer starter manifest"
+    )
+    try:
+        normalized_organizer = validate_organizer_check_manifest(
+            organizer,
+            expected_submission_sha256=digests["submission_sha256"],
+            expected_submission_size_bytes=None,
+            expected_starter_manifest_sha256=organizer_starter,
+            expected_final_rows=cast(int, clean_final["row_count"]),
+        )
+    except OrganizerCheckError as exc:
+        raise StateInvariantError(f"PRODUCTION_ORGANIZER_CHECK_INVALID: {exc}") from exc
+    normalized: dict[str, object] = {
+        "schema_version": 3,
+        "contract_id": contract_id,
+        "campaign_id": campaign_id,
+        "prediction_id": selected_prediction_id,
+        **digests,
+        "organizer_check": normalized_organizer,
+        "clean_replay_evidence_sha256": clean_digest,
+        "clean_replay_evidence": dict(clean_replay),
+        "scoring_exact_receipt": scoring.manifest(),
+        "same_backend_receipt": same_backend.manifest(),
+        "achieved_replay_grades": list(_PRODUCTION_PREPUBLICATION_REPLAY_GRADES),
+        "required_terminal_replay_grades": list(_PRODUCTION_REQUIRED_REPLAY_GRADES),
+        "qualification_scope": "FULL_DATA_CPU",
+        "official_fm_qualified": True,
+        "full_data_qualified": True,
+        "final_period_outcomes_accessed": False,
+    }
+    if canonical_json_bytes(dict(value)) != canonical_json_bytes(normalized):
+        raise StateInvariantError("production replay evidence contains forged fields")
+    return normalized
+
+
+def _normalize_production_bundle_claims(
+    value: Mapping[str, object], *, qualification_manifest_digest: str
+) -> dict[str, object]:
+    if frozenset(value) != _PRODUCTION_BUNDLE_CLAIM_FIELDS:
+        raise StateInvariantError("production bundle claims do not match the exact schema")
+    resource_receipt_id = _sha256(value.get("resource_receipt_id"), "resource_receipt_id")
+    claimed_qualification = _sha256(
+        value.get("qualification_manifest_digest"), "qualification_manifest_digest"
+    )
+    prepublication_grades = value.get("prepublication_replay_grades")
+    required_grades = value.get("required_replay_grades")
+    if (
+        value.get("schema_version") != 2
+        or type(prepublication_grades) is not list
+        or tuple(cast(list[object], prepublication_grades))
+        != _PRODUCTION_PREPUBLICATION_REPLAY_GRADES
+        or type(required_grades) is not list
+        or tuple(cast(list[object], required_grades)) != _PRODUCTION_REQUIRED_REPLAY_GRADES
+        or value.get("bundle_exact_status") != "PENDING_PUBLICATION_PROOF"
+    ):
+        raise StateInvariantError(
+            "production bundle claims confuse prepublication and required replay grades"
+        )
+    if (
+        type(value.get("protected_query_count")) is not int
+        or value.get("protected_query_count") != 0
+        or type(value.get("provider_operation_count")) is not int
+        or value.get("provider_operation_count") != 0
+    ):
+        raise StateInvariantError("production terminal claims require zero protected/provider use")
+    normalized: dict[str, object] = {
+        "schema_version": 2,
+        "resource_receipt_id": resource_receipt_id,
+        "prepublication_replay_grades": list(_PRODUCTION_PREPUBLICATION_REPLAY_GRADES),
+        "required_replay_grades": list(_PRODUCTION_REQUIRED_REPLAY_GRADES),
+        "bundle_exact_status": "PENDING_PUBLICATION_PROOF",
+        "submission_disposition": "FALLBACK_RETAINED",
+        "scientific_disposition": "INSUFFICIENT_VALID_EVIDENCE",
+        "campaign_kind": "PRODUCTION_FULL_DATA",
+        "qualification_scope": "FULL_DATA_CPU",
+        "protected_query_count": 0,
+        "provider_operation_count": 0,
+        "exact_metrics": None,
+        "official_fm_qualified": True,
+        "full_data_qualified": True,
+        "final_period_outcomes_accessed": False,
+        "qualification_manifest_digest": claimed_qualification,
+    }
+    if claimed_qualification != qualification_manifest_digest:
+        raise StateInvariantError("production bundle qualification identity differs from replay")
+    if canonical_json_bytes(dict(value)) != canonical_json_bytes(normalized):
+        raise StateInvariantError("production bundle claims overstate verified evidence")
+    return normalized
+
+
+def _normalize_production_evidence(
+    *,
+    contract_id: str,
+    campaign_id: str,
+    selected_prediction_id: str,
+    fallback_prediction_id: str,
+    replay_payload: Mapping[str, object],
+    bundle_claims: Mapping[str, object],
+    scoring_exact_receipt: ReplayGradeReceipt | None = None,
+    same_backend_receipt: ReplayGradeReceipt | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if selected_prediction_id != fallback_prediction_id:
+        raise StateInvariantError("production fallback-retained completion must select fallback")
+    replay = _normalize_production_replay(
+        replay_payload,
+        contract_id=contract_id,
+        campaign_id=campaign_id,
+        selected_prediction_id=selected_prediction_id,
+        scoring_exact_receipt=scoring_exact_receipt,
+        same_backend_receipt=same_backend_receipt,
+    )
+    claims = _normalize_production_bundle_claims(
+        bundle_claims,
+        qualification_manifest_digest=cast(str, replay["qualification_manifest_digest"]),
+    )
+    return replay, claims
+
+
 def _validate_stored_terminal_evidence(
     *,
     terminal_state: str,
     contract_id: str,
     campaign_id: str,
     selected_prediction_id: str,
+    fallback_prediction_id: str,
     replay_json: str,
     bundle_claims: Mapping[str, object],
-) -> None:
-    if terminal_state == "COMPLETED":
-        raise StateInvariantError(
-            "production terminal replay verification is not implemented; COMPLETED fails closed"
+) -> tuple[dict[str, object], dict[str, object]]:
+    replay = _json_mapping(replay_json)
+    if terminal_state == _PRODUCTION_TERMINAL_STATE:
+        return _normalize_production_evidence(
+            contract_id=contract_id,
+            campaign_id=campaign_id,
+            selected_prediction_id=selected_prediction_id,
+            fallback_prediction_id=fallback_prediction_id,
+            replay_payload=replay,
+            bundle_claims=bundle_claims,
         )
     if terminal_state != _OFFLINE_FIXTURE_TERMINAL_STATE:
         raise StateInvariantError("stored terminal state has no replay evidence verifier")
-    replay = _json_mapping(replay_json)
     if frozenset(replay) != _OFFLINE_FIXTURE_REPLAY_JOURNAL_FIELDS:
         raise StateInvariantError("stored replay evidence does not match the exact journal schema")
     if (
@@ -3522,10 +4340,459 @@ def _validate_stored_terminal_evidence(
         or replay.get("qualification_scope") != receipt["qualification_scope"]
     ):
         raise StateInvariantError("journaled replay grade is not derived from verified evidence")
-    _normalize_offline_fixture_bundle_claims(bundle_claims)
+    claims = _normalize_offline_fixture_bundle_claims(bundle_claims)
+    return dict(replay), claims
+
+
+def _validated_production_publication_proof(
+    publication: PublishedBundleReceipt,
+    *,
+    contract_id: str,
+    prediction_id: str,
+    bundle_id: str,
+    submission_sha256: str,
+    inventory_sha256: str,
+    scoring_exact_receipt_manifest: object,
+    same_backend_receipt_manifest: object,
+) -> dict[str, object]:
+    if not isinstance(publication.regeneration_evidence, BundleRegenerationEvidence):
+        raise StateInvariantError(
+            "PRODUCTION_BUNDLE_REGENERATION_INVALID: typed evidence is required"
+        )
+    if not isinstance(publication.bundle_exact_receipt, ReplayGradeReceipt):
+        raise StateInvariantError("PRODUCTION_BUNDLE_RECEIPT_INVALID: typed receipt is required")
+    try:
+        regeneration = validate_bundle_regeneration_evidence_manifest(
+            publication.regeneration_evidence.manifest()
+        )
+    except ReplayGradeError as exc:
+        raise StateInvariantError(f"PRODUCTION_BUNDLE_REGENERATION_INVALID: {exc}") from exc
+    if (
+        regeneration.contract_id != contract_id
+        or regeneration.prediction_id != prediction_id
+        or regeneration.first_bundle_id != bundle_id
+        or regeneration.regenerated_bundle_id != bundle_id
+        or regeneration.first_submission_sha256 != submission_sha256
+        or regeneration.regenerated_submission_sha256 != submission_sha256
+        or regeneration.first_inventory_sha256 != inventory_sha256
+        or regeneration.regenerated_inventory_sha256 != inventory_sha256
+    ):
+        raise StateInvariantError(
+            "PRODUCTION_BUNDLE_REGENERATION_INVALID: proof differs from publication"
+        )
+    try:
+        bundle_receipt = validate_replay_grade_receipt_manifest(
+            publication.bundle_exact_receipt.manifest(),
+            expected_grade=ReplayGrade.BUNDLE_EXACT,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+            expected_evidence=regeneration.manifest(),
+        )
+        scoring_receipt = validate_replay_grade_receipt_manifest(
+            scoring_exact_receipt_manifest,
+            expected_grade=ReplayGrade.SCORING_EXACT,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+        )
+        same_backend_receipt = validate_replay_grade_receipt_manifest(
+            same_backend_receipt_manifest,
+            expected_grade=ReplayGrade.EXPERIMENT_SAME_BACKEND,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+        )
+        scoring_evidence = dict(scoring_receipt.evidence)
+        same_backend_evidence = dict(same_backend_receipt.evidence)
+        scoring_evidence.pop("conclusion", None)
+        same_backend_evidence.pop("conclusion", None)
+        if same_backend_evidence != scoring_evidence:
+            raise ReplayGradeError(
+                "same-backend and scoring receipts do not bind the same clean replay"
+            )
+        report = combine_replay_grade_receipts(
+            (scoring_receipt, same_backend_receipt, bundle_receipt)
+        )
+    except ReplayGradeError as exc:
+        raise StateInvariantError(f"PRODUCTION_BUNDLE_RECEIPT_INVALID: {exc}") from exc
+    if report.achieved_grades != {
+        ReplayGrade.SCORING_EXACT,
+        ReplayGrade.EXPERIMENT_SAME_BACKEND,
+        ReplayGrade.BUNDLE_EXACT,
+    }:
+        raise StateInvariantError(
+            "PRODUCTION_REPLAY_GRADE_INCOMPLETE: terminal proof lacks required grades"
+        )
+    return {
+        "schema_version": 1,
+        "regeneration_evidence": regeneration.manifest(),
+        "bundle_exact_receipt": bundle_receipt.manifest(),
+        "replay_grade_receipts": {
+            ReplayGrade.SCORING_EXACT.value: scoring_receipt.manifest(),
+            ReplayGrade.EXPERIMENT_SAME_BACKEND.value: same_backend_receipt.manifest(),
+            ReplayGrade.BUNDLE_EXACT.value: bundle_receipt.manifest(),
+        },
+        "replay_grade_report": report.manifest(),
+    }
+
+
+def _validated_postpublication_resource_receipt(
+    value: PostpublicationResourceReceipt | None,
+    *,
+    terminal_state: str,
+    campaign_id: str,
+    contract_id: str,
+    selected_prediction_id: str,
+    prepublication_resource_receipt_id: str,
+    prepublication_resource_payload: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Authenticate and cap the strongest authority-bound resource observation."""
+
+    if terminal_state != _PRODUCTION_TERMINAL_STATE:
+        if value is not None:
+            raise StateInvariantError(
+                "offline publication cannot attach a production postpublication receipt"
+            )
+        return None
+    if not isinstance(value, PostpublicationResourceReceipt):
+        raise StateInvariantError(
+            "production publication requires a typed postpublication resource receipt"
+        )
+    expected_profile_digest = _sha256(
+        prepublication_resource_payload.get("performance_profile_digest"),
+        "authoritative performance_profile_digest",
+    )
+    if (
+        value.contract_id,
+        value.campaign_id,
+        value.prediction_id,
+        value.prepublication_resource_receipt_id,
+        value.performance_profile_digest,
+        value.scope,
+    ) != (
+        contract_id,
+        campaign_id,
+        selected_prediction_id,
+        prepublication_resource_receipt_id,
+        expected_profile_digest,
+        _POSTPUBLICATION_RESOURCE_SCOPE,
+    ):
+        raise StateInvariantError(
+            "postpublication resource receipt is outside terminal authority lineage"
+        )
+    reconstructed = PostpublicationResourceReceipt.from_measurement(
+        contract_id=contract_id,
+        campaign_id=campaign_id,
+        prediction_id=selected_prediction_id,
+        prepublication_resource_receipt_id=prepublication_resource_receipt_id,
+        performance_profile_digest=expected_profile_digest,
+        measurements=value.measurements,
+    )
+    if reconstructed.manifest() != value.manifest():
+        raise StateInvariantError("postpublication resource receipt identity is invalid")
+
+    declared = prepublication_resource_payload.get("declared_resource_profile")
+    qualified = prepublication_resource_payload.get("qualified_training_resources")
+    prepublication = prepublication_resource_payload.get("controller_resources")
+    if not all(isinstance(item, Mapping) for item in (declared, qualified, prepublication)):
+        raise StateInvariantError("authoritative production resource evidence is malformed")
+    declared_mapping = cast(Mapping[str, object], declared)
+    measurement_sets = (
+        cast(Mapping[str, object], qualified),
+        cast(Mapping[str, object], prepublication),
+        value.measurements,
+    )
+    wall_cap = _positive_int(
+        declared_mapping.get("wall_clock_seconds"), "declared wall_clock_seconds"
+    )
+    rss_cap = (
+        _positive_int(
+            declared_mapping.get("process_tree_rss_hard_cap_mb"),
+            "declared process_tree_rss_hard_cap_mb",
+        )
+        * 1024
+        * 1024
+    )
+    disk_cap = (
+        _positive_int(
+            declared_mapping.get("candidate_disk_hard_cap_mb"),
+            "declared candidate_disk_hard_cap_mb",
+        )
+        * 1024
+        * 1024
+    )
+    strongest_wall = max(cast(float, item["wall_seconds"]) for item in measurement_sets)
+    strongest_rss = max(cast(int, item["peak_rss_bytes"]) for item in measurement_sets)
+    strongest_disk = max(cast(int, item["disk_bytes"]) for item in measurement_sets)
+    if strongest_wall > wall_cap or strongest_rss > rss_cap or strongest_disk > disk_cap:
+        raise StateInvariantError(
+            "strongest authority-bound production resources exceed declared caps"
+        )
+    return value.manifest()
 
 
 def _validated_resource_receipt_payload(
+    connection: sqlite3.Connection,
+    *,
+    receipt_id: str,
+    campaign_id: str,
+    contract_id: str,
+    selected_prediction_id: str,
+    terminal_state: str,
+    expected_qualification_manifest_digest: str | None,
+    expected_qualification_fallback_digest: str | None,
+    expected_prediction_sha256: str | None,
+    expected_row_alignment_sha256: str | None,
+) -> dict[str, object]:
+    if terminal_state == _PRODUCTION_TERMINAL_STATE:
+        if None in {
+            expected_qualification_manifest_digest,
+            expected_qualification_fallback_digest,
+            expected_prediction_sha256,
+            expected_row_alignment_sha256,
+        }:
+            raise StateInvariantError("production resource validation lacks replay identities")
+        return _validated_production_resource_receipt_payload(
+            connection,
+            receipt_id=receipt_id,
+            campaign_id=campaign_id,
+            contract_id=contract_id,
+            selected_prediction_id=selected_prediction_id,
+            expected_qualification_manifest_digest=cast(
+                str, expected_qualification_manifest_digest
+            ),
+            expected_qualification_fallback_digest=cast(
+                str, expected_qualification_fallback_digest
+            ),
+            expected_prediction_sha256=cast(str, expected_prediction_sha256),
+            expected_row_alignment_sha256=cast(str, expected_row_alignment_sha256),
+        )
+    if terminal_state != _OFFLINE_FIXTURE_TERMINAL_STATE:
+        raise StateInvariantError("resource receipt has no terminal evidence verifier")
+    return _validated_offline_fixture_resource_receipt_payload(
+        connection,
+        receipt_id=receipt_id,
+        campaign_id=campaign_id,
+        contract_id=contract_id,
+        selected_prediction_id=selected_prediction_id,
+    )
+
+
+def _validate_production_resource_measurements(
+    value: object,
+    *,
+    fields: frozenset[str],
+    location: str,
+    peak_rss_positive: bool,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping) or frozenset(value) != fields:
+        raise StateInvariantError(f"{location} does not match the exact schema")
+    normalized = dict(value)
+    for field_name in ("wall_seconds", "cpu_seconds"):
+        observed = normalized.get(field_name)
+        if (
+            type(observed) not in {int, float}
+            or not math.isfinite(cast(int | float, observed))
+            or cast(int | float, observed) < 0
+        ):
+            raise StateInvariantError(f"{location} {field_name} is invalid")
+    peak_rss = normalized.get("peak_rss_bytes")
+    disk = normalized.get("disk_bytes")
+    if type(peak_rss) is not int or peak_rss < int(peak_rss_positive):
+        raise StateInvariantError(f"{location} peak_rss_bytes is invalid")
+    if type(disk) is not int or disk < 0:
+        raise StateInvariantError(f"{location} disk_bytes is invalid")
+    if normalized.get("device") != "cpu":
+        raise StateInvariantError(f"{location} must attest CPU execution")
+    return normalized
+
+
+def _validated_production_resource_receipt_payload(
+    connection: sqlite3.Connection,
+    *,
+    receipt_id: str,
+    campaign_id: str,
+    contract_id: str,
+    selected_prediction_id: str,
+    expected_qualification_manifest_digest: str,
+    expected_qualification_fallback_digest: str,
+    expected_prediction_sha256: str,
+    expected_row_alignment_sha256: str,
+) -> dict[str, object]:
+    row = connection.execute(
+        """
+        SELECT attempt_id, payload_json FROM resource_receipts
+        WHERE receipt_id = ? AND campaign_id = ? AND contract_id = ?
+        """,
+        (receipt_id, campaign_id, contract_id),
+    ).fetchone()
+    if row is None:
+        raise StateInvariantError(
+            "production resource_receipt_id is outside campaign/contract authority"
+        )
+    if row[0] is not None:
+        raise StateInvariantError("production qualification resource receipt must omit attempt_id")
+    payload = dict(_json_mapping(str(row[1])))
+    if frozenset(payload) != _PRODUCTION_RESOURCE_FIELDS:
+        raise StateInvariantError("production resource receipt does not match exact schema")
+    if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
+        raise StateInvariantError("production resource receipt schema_version must be integer 1")
+    lineage = (
+        _sha256(payload.get("contract_id"), "production resource contract_id"),
+        _sha256(payload.get("campaign_id"), "production resource campaign_id"),
+        _sha256(payload.get("prediction_id"), "production resource prediction_id"),
+    )
+    if lineage != (contract_id, campaign_id, selected_prediction_id):
+        raise StateInvariantError("production resource receipt is outside prediction lineage")
+    qualification_manifest_digest = _sha256(
+        payload.get("qualification_manifest_digest"), "qualification_manifest_digest"
+    )
+    qualification_fallback_digest = _sha256(
+        payload.get("qualification_fallback_digest"), "qualification_fallback_digest"
+    )
+    performance_profile_digest = _sha256(
+        payload.get("performance_profile_digest"), "performance_profile_digest"
+    )
+    if (
+        qualification_manifest_digest != expected_qualification_manifest_digest
+        or qualification_fallback_digest != expected_qualification_fallback_digest
+    ):
+        raise StateInvariantError("production resource qualification identity differs from replay")
+    if (
+        payload.get("campaign_kind") != "PRODUCTION_FULL_DATA"
+        or payload.get("qualification_scope") != "FULL_DATA_CPU"
+        or payload.get("actual_trainer_backend") != "organizer-numpy-fm"
+        or payload.get("actual_trainer_device") != "cpu"
+        or payload.get("controller_resource_scope") != "PREPUBLICATION_SELF_EXCLUDING"
+        or payload.get("preferred_backend_qualified") is not False
+        or payload.get("official_fm_qualified") is not True
+        or payload.get("full_data_qualified") is not True
+        or payload.get("final_period_outcomes_accessed") is not False
+    ):
+        raise StateInvariantError("production resource receipt qualification evidence is unsafe")
+    declared_profile = payload.get("declared_resource_profile")
+    if not isinstance(declared_profile, Mapping) or not declared_profile:
+        raise StateInvariantError("production declared resource profile must be a mapping")
+    try:
+        canonical_json_bytes(dict(declared_profile))
+    except (TypeError, ValueError) as exc:
+        raise StateInvariantError("production declared resource profile is not canonical") from exc
+    if (
+        declared_profile.get("name") != "competition-cpu"
+        or declared_profile.get("preferred_backend") != "lightgbm-cpu"
+        or declared_profile.get("device") != "cpu"
+    ):
+        raise StateInvariantError("production declared resource profile differs from CPU policy")
+    qualified_resources = _validate_production_resource_measurements(
+        payload.get("qualified_training_resources"),
+        fields=_PRODUCTION_QUALIFIED_RESOURCE_FIELDS,
+        location="qualified training resources",
+        peak_rss_positive=False,
+    )
+    controller_resources = _validate_production_resource_measurements(
+        payload.get("controller_resources"),
+        fields=_PRODUCTION_CONTROLLER_RESOURCE_FIELDS,
+        location="production controller resources",
+        peak_rss_positive=True,
+    )
+    wall_cap = declared_profile.get("wall_clock_seconds")
+    rss_cap_mb = declared_profile.get("process_tree_rss_hard_cap_mb")
+    disk_cap_mb = declared_profile.get("candidate_disk_hard_cap_mb")
+    if (
+        type(wall_cap) is not int
+        or wall_cap <= 0
+        or type(rss_cap_mb) is not int
+        or rss_cap_mb <= 0
+        or type(disk_cap_mb) is not int
+        or disk_cap_mb <= 0
+    ):
+        raise StateInvariantError("production declared resource caps are invalid")
+    for location, measurements in (
+        ("qualified training", qualified_resources),
+        ("prepublication controller", controller_resources),
+    ):
+        if (
+            cast(float, measurements["wall_seconds"]) > wall_cap
+            or cast(int, measurements["peak_rss_bytes"]) > rss_cap_mb * 1024 * 1024
+            or cast(int, measurements["disk_bytes"]) > disk_cap_mb * 1024 * 1024
+        ):
+            raise StateInvariantError(f"production {location} resources exceed declared caps")
+    authority = connection.execute(
+        """
+        SELECT p.prediction_bytes_sha256, p.ordered_rows_sha256, p.payload_json, c.config_json
+        FROM predictions AS p
+        JOIN campaigns AS c
+          ON c.campaign_id = p.campaign_id AND c.contract_id = p.contract_id
+        WHERE p.prediction_id = ? AND p.campaign_id = ? AND p.contract_id = ?
+        """,
+        (selected_prediction_id, campaign_id, contract_id),
+    ).fetchone()
+    if authority is None:
+        raise StateInvariantError("production resource receipt lacks a registered prediction")
+    if (
+        str(authority[0]) != expected_prediction_sha256
+        or str(authority[1]) != expected_row_alignment_sha256
+    ):
+        raise StateInvariantError("production replay differs from registered prediction bytes")
+    prediction_payload = _json_mapping(str(authority[2]))
+    campaign_config = _json_mapping(str(authority[3]))
+    if (
+        prediction_payload.get("qualification_manifest_digest") != qualification_manifest_digest
+        or prediction_payload.get("qualification_fallback_digest") != qualification_fallback_digest
+        or prediction_payload.get("final_period_outcomes_accessed") is not False
+    ):
+        raise StateInvariantError("registered fallback prediction lacks qualification lineage")
+    if (
+        campaign_config.get("qualification_manifest_digest") != qualification_manifest_digest
+        or campaign_config.get("performance_profile_digest") != performance_profile_digest
+        or campaign_config.get("resource_profile") != dict(declared_profile)
+    ):
+        raise StateInvariantError("campaign admission identities differ from resource receipt")
+    normalized: dict[str, object] = {
+        "schema_version": 1,
+        "contract_id": contract_id,
+        "campaign_id": campaign_id,
+        "prediction_id": selected_prediction_id,
+        "campaign_kind": "PRODUCTION_FULL_DATA",
+        "qualification_scope": "FULL_DATA_CPU",
+        "qualification_manifest_digest": qualification_manifest_digest,
+        "qualification_fallback_digest": qualification_fallback_digest,
+        "performance_profile_digest": performance_profile_digest,
+        "declared_resource_profile": dict(declared_profile),
+        "actual_trainer_backend": "organizer-numpy-fm",
+        "actual_trainer_device": "cpu",
+        "qualified_training_resources": qualified_resources,
+        "controller_resources": controller_resources,
+        "controller_resource_scope": "PREPUBLICATION_SELF_EXCLUDING",
+        "preferred_backend_qualified": False,
+        "official_fm_qualified": True,
+        "full_data_qualified": True,
+        "final_period_outcomes_accessed": False,
+    }
+    if canonical_json_bytes(payload) != canonical_json_bytes(normalized):
+        raise StateInvariantError("production resource receipt contains forged fields")
+    if hashlib.sha256(canonical_json_bytes(normalized)).hexdigest() != receipt_id:
+        raise StateInvariantError("authoritative resource receipt identity is invalid")
+    return normalized
+
+
+def _validate_production_authority_counts(
+    connection: sqlite3.Connection, *, campaign_id: str
+) -> None:
+    counts = connection.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM protected_query_reservations WHERE campaign_id = ?),
+          (SELECT COUNT(*) FROM protected_evaluations WHERE campaign_id = ?),
+          (SELECT COUNT(*) FROM provider_operations WHERE campaign_id = ?)
+        """,
+        (campaign_id, campaign_id, campaign_id),
+    ).fetchone()
+    if counts is None or tuple(int(value) for value in counts) != (0, 0, 0):
+        raise StateInvariantError(
+            "production terminal authority contains protected queries or provider operations"
+        )
+
+
+def _validated_offline_fixture_resource_receipt_payload(
     connection: sqlite3.Connection,
     *,
     receipt_id: str,
@@ -3851,6 +5118,61 @@ def _verify_published_bundle(
         raise PublishedBundleVerificationError(
             "replay receipt is not bound by the prepared replay payload"
         )
+    if replay_receipt.get("schema_version") == 3:
+        try:
+            campaign_evidence = json.loads((root / "campaign-manifest.json").read_text("utf-8"))
+            scientific_evidence = json.loads((root / "scientific-decision.json").read_text("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PublishedBundleVerificationError(
+                "production organizer evidence wrappers are unreadable"
+            ) from exc
+        if not isinstance(campaign_evidence, dict) or not isinstance(scientific_evidence, dict):
+            raise PublishedBundleVerificationError(
+                "production organizer evidence wrappers must be objects"
+            )
+        admission = campaign_evidence.get("production_admission")
+        admission_data = admission.get("data") if isinstance(admission, Mapping) else None
+        organizer = replay_receipt.get("organizer_check")
+        if (
+            campaign_evidence.get("contract_id") != contract_id
+            or campaign_evidence.get("campaign_id") != campaign_id
+            or not isinstance(admission, Mapping)
+            or not isinstance(admission_data, Mapping)
+            or not isinstance(organizer, Mapping)
+            or scientific_evidence.get("organizer_check") != dict(organizer)
+            or scientific_evidence.get("exact_replay_evidence")
+            != {
+                "clean_replay_evidence_sha256": replay_receipt.get("clean_replay_evidence_sha256"),
+                "clean_replay_evidence": replay_receipt.get("clean_replay_evidence"),
+                "scoring_exact_receipt": replay_receipt.get("scoring_exact_receipt"),
+                "same_backend_receipt": replay_receipt.get("same_backend_receipt"),
+            }
+        ):
+            raise PublishedBundleVerificationError(
+                "production decision evidence differs from retained replay proof"
+            )
+        organizer_digest = replay_receipt.get("organizer_check_sha256")
+        if canonical_json_sha256(dict(organizer)) != organizer_digest:
+            raise PublishedBundleVerificationError(
+                "production organizer evidence digest differs from replay receipt"
+            )
+        try:
+            validate_organizer_check_manifest(
+                organizer,
+                expected_submission_sha256=submission_sha256,
+                expected_submission_size_bytes=members["submission.csv"][1],
+                expected_starter_manifest_sha256=_sha256(
+                    admission.get("starter_manifest_sha256"),
+                    "production admission starter manifest",
+                ),
+                expected_final_rows=_positive_int(
+                    admission_data.get("final_rows"), "production admission final_rows"
+                ),
+            )
+        except (OrganizerCheckError, StateError) as exc:
+            raise PublishedBundleVerificationError(
+                f"production organizer evidence is invalid: {exc}"
+            ) from exc
     derived_bundle = BundleId.derive(
         selected_prediction_id=PredictionId(selected_prediction_id),
         replay_output_sha256={"replay-receipt.json": replay_receipt_sha},
@@ -3897,7 +5219,13 @@ def _verify_published_bundle(
     ) != projection_terminal.get("source_revision"):
         raise PublishedBundleVerificationError("manifest source revision differs from projection")
     expected_events = b"".join(
-        canonical_json_bytes(event) + b"\n" for event in projection_value["events"]
+        (
+            _canonical_json_preserve_numbers(event, "terminal event").encode("ascii")
+            if replay_receipt.get("schema_version") == 3
+            else canonical_json_bytes(event)
+        )
+        + b"\n"
+        for event in projection_value["events"]
     )
     try:
         actual_events = (root / "event-export.jsonl").read_bytes()
@@ -4409,6 +5737,48 @@ def _canonical_json(value: object, name: str) -> str:
     return encoded
 
 
+def _canonical_json_preserve_numbers(value: object, name: str) -> str:
+    """Encode finite canonical JSON without rewriting receipt-significant float spellings."""
+
+    try:
+        normalized = _json_value_preserve_numbers(value, location=name)
+        encoded = json.dumps(
+            normalized,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        decoded: object = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise StateInvariantError(f"{name} must be finite JSON") from exc
+    if not isinstance(decoded, dict):
+        raise StateInvariantError(f"{name} must be a JSON object")
+    return encoded
+
+
+def _json_value_preserve_numbers(value: object, *, location: str) -> object:
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{location} contains a non-finite number")
+        return value
+    if isinstance(value, Mapping):
+        normalized: dict[str, object] = {}
+        for key, candidate in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{location} contains a non-text object key")
+            normalized[key] = _json_value_preserve_numbers(candidate, location=f"{location}.{key}")
+        return normalized
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [
+            _json_value_preserve_numbers(candidate, location=f"{location}[{index}]")
+            for index, candidate in enumerate(value)
+        ]
+    raise TypeError(f"{location} contains unsupported type {type(value).__name__}")
+
+
 def _json_mapping(value: str) -> Mapping[str, object]:
     decoded = json.loads(value)
     if not isinstance(decoded, dict):
@@ -4432,6 +5802,7 @@ __all__ = [
     "IdInput",
     "Lease",
     "LeaseConflictError",
+    "PostpublicationResourceReceipt",
     "PreparedFinalizationRequiredError",
     "PreparedProjectionArtifacts",
     "PreparedSourceStaleError",

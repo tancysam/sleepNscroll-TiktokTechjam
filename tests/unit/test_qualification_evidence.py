@@ -256,10 +256,10 @@ def _build_qualification(root: Path) -> Path:
             "encoding_digest": encoding.digest,
             "organizer_parity_passed": True,
             "resources": {
-                "cpu_seconds": 1.0,
+                "cpu_seconds": seed + 0.5,
                 "device": "cpu",
-                "peak_rss_bytes": 1,
-                "wall_seconds": 1.0,
+                "peak_rss_bytes": seed + 1,
+                "wall_seconds": float(seed + 1),
             },
             "seed": seed,
             "starter_manifest_digest": _STARTER,
@@ -607,6 +607,40 @@ def test_loads_exact_matching_seed_public_evidence_and_fallback(tmp_path: Path) 
     assert evidence.fallback.seed == 4
     assert evidence.fallback.metrics.primary == 0.6020370721817017
     assert evidence.fallback.model_dir == (root / "fallback" / "model").resolve()
+
+
+def test_exposes_verified_fallback_final_submission_and_seed_four_resources(
+    tmp_path: Path,
+) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+
+    fallback = load_official_fm_qualification(
+        root,
+        expectations=_expectations(),
+    ).fallback
+
+    final_submission = root / "final" / "submission.csv"
+    assert fallback.final_submission_path == final_submission.resolve()
+    assert (
+        fallback.final_submission_file_sha256
+        == hashlib.sha256(final_submission.read_bytes()).hexdigest()
+    )
+    assert fallback.final_prediction_digest == "b" * 64
+    assert fallback.final_row_count == _FINAL_ROWS
+    assert fallback.resources.wall_seconds == 5.0
+    assert fallback.resources.cpu_seconds == 4.5
+    assert fallback.resources.peak_rss_bytes == 5
+    assert fallback.resources.disk_bytes > 0
+    assert fallback.resources.device == "cpu"
+
+
+def test_rejects_tampered_fallback_final_submission_before_exposure(tmp_path: Path) -> None:
+    root = _build_qualification(tmp_path / "qualification")
+    final_submission = root / "final" / "submission.csv"
+    final_submission.write_bytes(final_submission.read_bytes() + b"tamper")
+
+    with pytest.raises(QualificationEvidenceError, match="artifact changed"):
+        load_official_fm_qualification(root, expectations=_expectations())
 
 
 def test_rejects_tampered_indexed_model_artifact(tmp_path: Path) -> None:

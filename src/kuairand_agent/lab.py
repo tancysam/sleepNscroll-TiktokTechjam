@@ -52,10 +52,30 @@ from kuairand_agent.finalization.bundle import (
     FrozenFileReceipt,
     TerminalProjectionBinding,
 )
+from kuairand_agent.finalization.organizer_check import (
+    OrganizerCheckError,
+    validate_organizer_check_manifest,
+)
+from kuairand_agent.finalization.replay_grades import (
+    ReplayGradeError,
+    combine_replay_grade_receipts,
+    validate_bundle_regeneration_evidence_manifest,
+    validate_replay_grade_receipt_manifest,
+)
 from kuairand_agent.observability.receipts import (
     ReceiptError,
     ScriptedReplayReceipt,
     StartupReceipt,
+)
+from kuairand_agent.production.admission import (
+    ProductionAdmission,
+    ProductionAdmissionError,
+    admit_cpu_fallback,
+)
+from kuairand_agent.production.controller import (
+    ProductionControllerError,
+    ProductionCPUFallbackController,
+    ProductionCPUFallbackRequest,
 )
 from kuairand_agent.resource_profiles import ResourceProfile, load_resource_profile
 from kuairand_agent.scoring.submission import (
@@ -65,9 +85,11 @@ from kuairand_agent.scoring.submission import (
 )
 from kuairand_agent.state.repository import (
     DurableRecord,
+    PostpublicationResourceReceipt,
     PreparedTerminalProjection,
     PublishedBundleReceipt,
     RecordKind,
+    StateInvariantError,
     StateRepository,
     TerminalPreparation,
 )
@@ -83,6 +105,18 @@ LAB_SCHEMA_VERSION: Final = 1
 CAMPAIGN_KIND: Final = "OFFLINE_SCRIPTED_FIXTURE"
 SCRIPTED_DISPOSITION: Final = "SCRIPTED_FALLBACK_RETAINED"
 SCRIPTED_QUALIFICATION_SCOPE: Final = "SCRIPTED_FIXTURE_ONLY"
+PRODUCTION_CAMPAIGN_KIND: Final = "PRODUCTION_FULL_DATA"
+PRODUCTION_DISPOSITION: Final = "FALLBACK_RETAINED"
+PRODUCTION_QUALIFICATION_SCOPE: Final = "FULL_DATA_CPU"
+_PRODUCTION_PREPUBLICATION_REPLAY_GRADES: Final = (
+    ReplayGrade.SCORING_EXACT.value,
+    ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+)
+_PRODUCTION_TERMINAL_REPLAY_GRADES: Final = (
+    *_PRODUCTION_PREPUBLICATION_REPLAY_GRADES,
+    ReplayGrade.BUNDLE_EXACT.value,
+)
+_POSTPUBLICATION_RESOURCE_SCOPE: Final = "THROUGH_BUNDLE_PUBLICATION_EXCLUDING_TERMINAL_COMMIT"
 _EXPECTED_PROFILE: Final[Mapping[str, str]] = MappingProxyType(
     {
         "cpu": "competition-cpu",
@@ -140,6 +174,7 @@ class CampaignOptions:
     data_root: Path | None = None
     starter_root: Path | None = None
     qualification_receipt: Path | None = None
+    performance_profile: Path | None = None
     allow_test_fixture: bool = False
 
     def __post_init__(self) -> None:
@@ -149,7 +184,12 @@ class CampaignOptions:
             raise LabAdmissionError(
                 "execution must be 'competition' or the gated 'offline-scripted' test seam"
             )
-        for name in ("data_root", "starter_root", "qualification_receipt"):
+        for name in (
+            "data_root",
+            "starter_root",
+            "qualification_receipt",
+            "performance_profile",
+        ):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Path):
                 raise LabAdmissionError(f"{name} must be pathlib.Path when provided")
@@ -195,14 +235,35 @@ class CampaignResult:
             "resource_receipt_id",
         ):
             _require_sha256(getattr(self, name), name)
-        if self.protected_query_count != 0:
-            raise LabError("offline scripted campaigns cannot spend protected queries")
-        if self.exact_metrics is not None:
-            raise LabError("offline scripted campaigns have no protected exact metrics")
-        if self.campaign_kind != CAMPAIGN_KIND:
-            raise LabError("campaign_kind must identify the offline scripted fixture")
-        if self.qualification_scope != SCRIPTED_QUALIFICATION_SCOPE:
-            raise LabError("scripted campaigns must not claim production qualification")
+        if self.campaign_kind == CAMPAIGN_KIND:
+            if self.protected_query_count != 0:
+                raise LabError("offline scripted campaigns cannot spend protected queries")
+            if self.exact_metrics is not None:
+                raise LabError("offline scripted campaigns have no protected exact metrics")
+            if self.qualification_scope != SCRIPTED_QUALIFICATION_SCOPE:
+                raise LabError("scripted campaigns must not claim production qualification")
+            return
+        if self.campaign_kind != PRODUCTION_CAMPAIGN_KIND:
+            raise LabError("campaign_kind is not a supported laboratory campaign kind")
+        if self.terminal_state != "COMPLETED":
+            raise LabError("production campaigns must be atomically COMPLETED")
+        if self.qualification_scope != PRODUCTION_QUALIFICATION_SCOPE:
+            raise LabError("production fallback must carry FULL_DATA_CPU qualification")
+        if self.submission_disposition != PRODUCTION_DISPOSITION:
+            raise LabError("bounded production completion must retain the official fallback")
+        if self.selected_prediction_id != self.fallback_prediction_id:
+            raise LabError("fallback-retained production campaigns must select the fallback")
+        if self.protected_query_count != 0 or self.exact_metrics is not None:
+            raise LabError(
+                "bounded production fallback has no campaign protected query or exact metric"
+            )
+        if (
+            self.replay_grade != ReplayGrade.BUNDLE_EXACT.value
+            or self.replay_grades != _PRODUCTION_TERMINAL_REPLAY_GRADES
+        ):
+            raise LabError(
+                "production fallback lacks exact scoring, same-backend, and bundle replay evidence"
+            )
 
     def manifest(self) -> dict[str, object]:
         return {
@@ -214,7 +275,7 @@ class CampaignResult:
             "scientific_disposition": self.scientific_disposition,
             "selected_prediction_id": self.selected_prediction_id,
             "fallback_prediction_id": self.fallback_prediction_id,
-            "exact_metrics": None,
+            "exact_metrics": None if self.exact_metrics is None else dict(self.exact_metrics),
             "bundle_path": str(self.bundle_path),
             "bundle_sha256": self.bundle_sha256,
             "replay_grade": self.replay_grade,
@@ -224,8 +285,8 @@ class CampaignResult:
             "evidence_manifest_path": str(self.evidence_manifest_path),
             "campaign_kind": self.campaign_kind,
             "qualification_scope": self.qualification_scope,
-            "official_fm_qualified": False,
-            "full_data_qualified": False,
+            "official_fm_qualified": self.campaign_kind == PRODUCTION_CAMPAIGN_KIND,
+            "full_data_qualified": self.campaign_kind == PRODUCTION_CAMPAIGN_KIND,
         }
 
 
@@ -399,8 +460,12 @@ class AutonomousExperimentLab:
         profile = self._load_profile(options.config_path)
         config_sha256 = _file_sha256(options.config_path)
         if options.execution == "competition":
-            self._admit_competition_or_refuse(options, profile=profile)
-            raise AssertionError("competition admission must either return a controller or refuse")
+            return self._compete_production_cpu_fallback(
+                options=options,
+                key=key,
+                profile=profile,
+                config_sha256=config_sha256,
+            )
         return self._compete_scripted_fixture(
             options=options,
             key=key,
@@ -605,22 +670,18 @@ class AutonomousExperimentLab:
         )
         return self._result_from_snapshot(repository.inspect(campaign_id=campaign_id))
 
-    def _admit_competition_or_refuse(
+    def _compete_production_cpu_fallback(
         self,
-        options: CampaignOptions,
         *,
+        options: CampaignOptions,
+        key: str,
         profile: ResourceProfile,
-    ) -> None:
-        """Fail closed before ``CampaignId`` creation until real inputs are admissible.
-
-        Local fixture qualifications prove the trainer adapters, but they do not provide the
-        full-data official-FM parity, measured p95 resource envelope, or production controller
-        receipt required by the frozen plan. GPU is therefore preflighted to the CPU policy before
-        this typed refusal; it is never relabelled as a GPU campaign.
-        """
+        config_sha256: str,
+    ) -> CampaignResult:
+        """Run the admitted, provider-free full-data CPU fallback to atomic completion."""
 
         selected_profile = profile.name
-        missing: list[str] = []
+        preflight_missing: tuple[str, ...] = ()
         if profile.name == "competition-gpu":
             cpu_config = self._repository_root / "configs/competition-cpu.toml"
             try:
@@ -637,42 +698,251 @@ class AutonomousExperimentLab:
                     requested_profile=profile.name,
                 )
             selected_profile = cpu_profile.name
-            missing.append("same-backend GPU qualification (GPU preflight selected CPU)")
+            preflight_missing = ("same-backend GPU qualification (GPU preflight selected CPU)",)
 
-        required_paths = (
-            ("verified KuaiRand-Pure data root", options.data_root),
-            ("hash-verified organizer starter root", options.starter_root),
-            (
-                "full-data parity and measured-p95 qualification receipt",
-                options.qualification_receipt,
-            ),
+        required = {
+            "verified KuaiRand-Pure data root": options.data_root,
+            "hash-verified organizer starter root": options.starter_root,
+            "full-data official-FM qualification run": options.qualification_receipt,
+            "measured full-data performance profile": options.performance_profile,
+        }
+        missing = preflight_missing + tuple(
+            label for label, path in required.items() if path is None
         )
-        for label, path in required_paths:
-            if path is None:
-                missing.append(label)
-                continue
-            try:
-                resolved = path.expanduser().resolve(strict=True)
-            except OSError:
-                missing.append(label)
-                continue
-            if label.endswith("receipt"):
-                if not resolved.is_file():
-                    missing.append(label)
-            elif not resolved.is_dir():
-                missing.append(label)
+        if missing:
+            raise LabAdmissionError(
+                "competition admission refused before CampaignId creation; missing verified "
+                "evidence: " + ", ".join(missing),
+                requested_profile=profile.name,
+                selected_profile=selected_profile,
+                missing_evidence=missing,
+            )
+        data_root = cast(Path, options.data_root)
+        starter_root = cast(Path, options.starter_root)
+        qualification_run = cast(Path, options.qualification_receipt)
+        performance_profile = cast(Path, options.performance_profile)
+        try:
+            admission = admit_cpu_fallback(
+                repository_root=self._repository_root,
+                startup_receipt=self._startup_receipt,
+                resource_profile=profile,
+                resource_profile_file_sha256=config_sha256,
+                data_root=data_root,
+                starter_root=starter_root,
+                qualification_run_dir=qualification_run,
+                performance_profile_path=performance_profile,
+            )
+        except ProductionAdmissionError as exc:
+            raise LabAdmissionError(
+                f"competition admission refused before CampaignId creation: {exc}",
+                requested_profile=profile.name,
+                selected_profile=profile.name,
+            ) from exc
 
-        # The replacement controller is not yet admitted to consume those capabilities. Keeping
-        # this item explicit prevents a directory-shaped placeholder from becoming a live run.
-        missing.append("admitted full-data scientific controller receipt")
-        raise LabAdmissionError(
-            "competition admission refused before CampaignId creation; missing verified evidence: "
-            + ", ".join(missing),
-            code=TrainerFailureCode.ADMISSION_REJECTED,
-            requested_profile=profile.name,
-            selected_profile=selected_profile,
-            missing_evidence=tuple(missing),
+        identity_config = {
+            "schema_version": LAB_SCHEMA_VERSION,
+            "campaign_kind": PRODUCTION_CAMPAIGN_KIND,
+            "execution": options.execution,
+            "resource_profile": profile.manifest(),
+            "resource_profile_file_sha256": config_sha256,
+            "startup_receipt_id": self._startup_receipt.receipt_id,
+            "production_admission_receipt_id": admission.receipt_id,
+            "qualification_manifest_digest": admission.qualification_manifest_digest,
+            "qualification_fallback_digest": admission.fallback_manifest_digest,
+            "performance_profile_digest": admission.performance_profile_digest,
+            "controller_receipt_id": admission.controller_receipt_id,
+            "qualification_scope": PRODUCTION_QUALIFICATION_SCOPE,
+            "provider_request_limit": 0,
+            "protected_query_limit": 0,
+            "final_period_outcomes_accessed": False,
+        }
+        campaign_id = CampaignId.derive(
+            contract_id=CONTRACT_ID,
+            campaign_config=identity_config,
+            start_nonce=key,
         )
+        campaign_run_root = self._campaign_run_root(campaign_id)
+        durable_config = identity_config | {"run_root": str(campaign_run_root)}
+
+        # Admission above is deliberately read-only. This re-verification closes its final
+        # time-of-check gap and StateRepository.open remains the first durable campaign write.
+        self._reverify_contract_before_state()
+        repository = StateRepository.open(self._state_root)
+        handle = repository.create_campaign(
+            campaign_id=campaign_id,
+            contract_id=CONTRACT_ID,
+            contract_manifest=CONTRACT_MANIFEST.manifest(),
+            config=durable_config,
+            idempotency_key=key,
+            protected_query_limit=0,
+            initial_state="READY",
+        )
+        if not handle.created and handle.state == "COMPLETED":
+            return self._result_from_snapshot(repository.inspect(campaign_id=campaign_id))
+        if not handle.created and handle.state == "RUNNING":
+            return self._resume_production_cpu_fallback(
+                repository=repository,
+                campaign_id=campaign_id,
+                campaign_revision=handle.revision,
+                admission=admission,
+                campaign_run_root=campaign_run_root,
+            )
+        if not handle.created and handle.state != "READY":
+            raise LabConflictError(f"campaign is not resumable from state {handle.state!r}")
+        if handle.state == "READY":
+            transitioned = repository.transition(
+                campaign_id=campaign_id,
+                entity_kind="campaign",
+                entity_id=campaign_id,
+                expected_state="READY",
+                expected_revision=handle.revision,
+                new_state="RUNNING",
+                event_type="production_cpu_fallback_started",
+                payload={
+                    "campaign_kind": PRODUCTION_CAMPAIGN_KIND,
+                    "qualification_scope": PRODUCTION_QUALIFICATION_SCOPE,
+                    "admission_receipt_id": admission.receipt_id,
+                },
+            )
+            revision = transitioned.revision
+        else:
+            revision = handle.revision
+
+        try:
+            completed = ProductionCPUFallbackController().run(
+                ProductionCPUFallbackRequest(
+                    repository=repository,
+                    admission=admission,
+                    campaign_id=campaign_id.value,
+                    contract_id=CONTRACT_ID.value,
+                    campaign_revision=revision,
+                    run_dir=campaign_run_root,
+                    repository_root=self._repository_root,
+                    startup_receipt=self._startup_receipt.manifest(),
+                )
+            )
+        except ProductionControllerError as exc:
+            raise LabError(f"production CPU fallback failed: {exc}") from exc
+        return self._result_from_snapshot(completed.snapshot)
+
+    def _resume_production_cpu_fallback(
+        self,
+        *,
+        repository: StateRepository,
+        campaign_id: CampaignId,
+        campaign_revision: int,
+        admission: ProductionAdmission,
+        campaign_run_root: Path,
+    ) -> CampaignResult:
+        """Re-enter one unambiguous deterministic controller run at its durable boundary.
+
+        With no preparation, the controller exact-reuses any compatible partial registrations.
+        With one preparation, this facade first authenticates that immutable intent against the
+        current admission, then lets the controller rebuild/reuse evidence and publication through
+        its normal resource-measurement and atomic-finalization path.  A sealed destination is
+        accepted only by :class:`BundleFinalizer`, after clean regeneration proves every byte.
+        """
+
+        snapshot = repository.inspect(campaign_id=campaign_id)
+        campaign = _mapping(snapshot.get("campaign"), "campaign")
+        entities = _mapping(snapshot.get("entities"), "entities")
+        preparations = _mapping_list(
+            entities.get("terminal_preparations"), "entities.terminal_preparations"
+        )
+        publications = _mapping_list(
+            entities.get("bundle_publications"), "entities.bundle_publications"
+        )
+        if (
+            campaign.get("state") != "RUNNING"
+            or campaign.get("revision") != campaign_revision
+            or campaign.get("terminal") is not False
+            or len(preparations) > 1
+            or publications
+        ):
+            raise LabConflictError(
+                "production RUNNING campaign has ambiguous durable recovery state"
+            )
+        destination = campaign_run_root / "final" / "submission-bundle"
+        if not preparations and os.path.lexists(destination):
+            raise LabConflictError(
+                "production bundle destination exists without a terminal preparation"
+            )
+        if preparations:
+            self._validate_production_resume_preparation(
+                preparations[0],
+                campaign_id=campaign_id,
+                campaign_revision=campaign_revision,
+                admission=admission,
+            )
+        try:
+            completed = ProductionCPUFallbackController().run(
+                ProductionCPUFallbackRequest(
+                    repository=repository,
+                    admission=admission,
+                    campaign_id=campaign_id.value,
+                    contract_id=CONTRACT_ID.value,
+                    campaign_revision=campaign_revision,
+                    run_dir=campaign_run_root,
+                    repository_root=self._repository_root,
+                    startup_receipt=self._startup_receipt.manifest(),
+                ),
+            )
+        except ProductionControllerError as exc:
+            raise LabConflictError("production campaign recovery failed exact validation") from exc
+        return self._result_from_snapshot(completed.snapshot)
+
+    @staticmethod
+    def _validate_production_resume_preparation(
+        prepared: Mapping[str, object],
+        *,
+        campaign_id: CampaignId,
+        campaign_revision: int,
+        admission: ProductionAdmission,
+    ) -> None:
+        """Authenticate an existing terminal intent before resuming expensive work."""
+
+        selected_prediction_id = _require_sha256(
+            prepared.get("selected_prediction_id"), "prepared selected_prediction_id"
+        )
+        fallback_prediction_id = _require_sha256(
+            prepared.get("fallback_prediction_id"), "prepared fallback_prediction_id"
+        )
+        _require_sha256(prepared.get("preparation_id"), "preparation_id")
+        _require_sha256(prepared.get("prepared_projection_sha256"), "prepared projection_sha256")
+        _require_sha256(prepared.get("decision_id"), "prepared decision_id")
+        source_revision = prepared.get("source_campaign_revision")
+        replay_payload = _mapping(prepared.get("replay_payload"), "prepared replay payload")
+        bundle_claims = _mapping(prepared.get("bundle_claims"), "prepared bundle claims")
+        if (
+            prepared.get("campaign_id") != campaign_id.value
+            or prepared.get("contract_id") != CONTRACT_ID.value
+            or prepared.get("source_state") != "RUNNING"
+            or source_revision != campaign_revision
+            or prepared.get("terminal_state") != "COMPLETED"
+            or selected_prediction_id != fallback_prediction_id
+            or replay_payload.get("contract_id") != CONTRACT_ID.value
+            or replay_payload.get("campaign_id") != campaign_id.value
+            or replay_payload.get("prediction_id") != selected_prediction_id
+            or replay_payload.get("qualification_manifest_digest")
+            != admission.qualification_manifest_digest
+            or replay_payload.get("qualification_fallback_digest")
+            != admission.fallback_manifest_digest
+            or replay_payload.get("qualification_scope") != PRODUCTION_QUALIFICATION_SCOPE
+            or replay_payload.get("final_period_outcomes_accessed") is not False
+            or bundle_claims.get("campaign_kind") != PRODUCTION_CAMPAIGN_KIND
+            or bundle_claims.get("qualification_scope") != PRODUCTION_QUALIFICATION_SCOPE
+            or bundle_claims.get("qualification_manifest_digest")
+            != admission.qualification_manifest_digest
+            or bundle_claims.get("protected_query_count") != 0
+            or bundle_claims.get("provider_operation_count") != 0
+            or type(source_revision) is not int
+            or type(prepared.get("source_last_event_seq")) is not int
+            or type(prepared.get("projection_schema_version")) is not int
+            or type(prepared.get("redaction_policy_version")) is not int
+        ):
+            raise LabConflictError(
+                "production terminal preparation differs from admitted fallback evidence"
+            )
 
     def inspect(self, *, campaign_id: str | CampaignId) -> Mapping[str, object]:
         """Return a projection using SQLite's read-only mode and perform no reconciliation."""
@@ -696,17 +966,31 @@ class AutonomousExperimentLab:
             )
         except (AttributeError, ValueError) as exc:
             raise LabAdmissionError("grade must name a supported ReplayGrade") from exc
-        if requested not in {ReplayGrade.EXPERIMENT_SAME_BACKEND, ReplayGrade.BUNDLE_EXACT}:
+        if requested not in {
+            ReplayGrade.SCORING_EXACT,
+            ReplayGrade.EXPERIMENT_SAME_BACKEND,
+            ReplayGrade.BUNDLE_EXACT,
+        }:
             raise LabAdmissionError(
-                "the unscored scripted slice supports EXPERIMENT_SAME_BACKEND and BUNDLE_EXACT"
+                "campaign replay supports SCORING_EXACT, EXPERIMENT_SAME_BACKEND, and BUNDLE_EXACT"
             )
         snapshot = self.inspect(campaign_id=campaign_id)
         campaign = _mapping(snapshot.get("campaign"), "campaign")
         entities = _mapping(snapshot.get("entities"), "entities")
         bundles = _mapping_list(entities.get("bundles"), "entities.bundles")
-        if campaign.get("state") != "COMPLETED_OFFLINE_FIXTURE" or len(bundles) != 1:
-            raise LabError("campaign has no terminal scripted bundle to replay")
+        state = campaign.get("state")
+        if state not in {"COMPLETED", "COMPLETED_OFFLINE_FIXTURE"} or len(bundles) != 1:
+            raise LabError("campaign has no terminal bundle to replay")
         bundle_payload = _mapping(bundles[0].get("payload"), "bundle payload")
+        campaign_kind = _string(bundle_payload.get("campaign_kind"), "campaign_kind")
+        qualification_scope = _string(
+            bundle_payload.get("qualification_scope"), "qualification_scope"
+        )
+        if (state, campaign_kind, qualification_scope) not in {
+            ("COMPLETED_OFFLINE_FIXTURE", CAMPAIGN_KIND, SCRIPTED_QUALIFICATION_SCOPE),
+            ("COMPLETED", PRODUCTION_CAMPAIGN_KIND, PRODUCTION_QUALIFICATION_SCOPE),
+        }:
+            raise LabError("terminal campaign state and evidence kind disagree")
         achieved = _string_tuple(bundle_payload.get("replay_grades"), "replay_grades")
         if requested.value not in achieved:
             raise LabError(f"campaign did not achieve replay grade {requested.value}")
@@ -721,10 +1005,12 @@ class AutonomousExperimentLab:
             raise LabError("bundle differs from authoritative ContractId")
         if validation.bundle_id != _string(bundles[0].get("bundle_id"), "bundle_id"):
             raise LabError("bundle bytes differ from authoritative BundleId")
+        if campaign_kind == PRODUCTION_CAMPAIGN_KIND:
+            _validate_authority_publication_proof(bundle_payload, validation)
         replay_receipt = _read_json_object(
             validation.bundle_path / EvidenceRole.REPLAY_RECEIPT.value
         )
-        if requested is ReplayGrade.EXPERIMENT_SAME_BACKEND:
+        if campaign_kind == CAMPAIGN_KIND and requested is ReplayGrade.EXPERIMENT_SAME_BACKEND:
             if replay_receipt.get("grade") != ReplayGrade.EXPERIMENT_SAME_BACKEND.value:
                 raise LabError("scripted replay receipt does not prove EXPERIMENT_SAME_BACKEND")
             if replay_receipt.get("qualification_scope") != SCRIPTED_QUALIFICATION_SCOPE:
@@ -736,6 +1022,7 @@ class AutonomousExperimentLab:
             grade=requested.value,
             bundle_id=validation.bundle_id,
             verified=True,
+            qualification_scope=qualification_scope,
         )
 
     @staticmethod
@@ -868,6 +1155,14 @@ class AutonomousExperimentLab:
             campaign_id=campaign_id,
             location="campaign manifest",
         )
+        campaign_kind = _string(campaign_evidence.get("campaign_kind"), "campaign_kind")
+        if campaign_kind not in {CAMPAIGN_KIND, PRODUCTION_CAMPAIGN_KIND}:
+            raise BundleValidationError("campaign manifest names an unsupported campaign kind")
+        expected_terminal_state = (
+            "COMPLETED"
+            if campaign_kind == PRODUCTION_CAMPAIGN_KIND
+            else "COMPLETED_OFFLINE_FIXTURE"
+        )
         startup = _mapping(campaign_evidence.get("startup_receipt"), "startup_receipt")
         if startup.get("contract_id") != contract_id or startup.get("verified") is not True:
             raise BundleValidationError("campaign startup receipt differs from contract lineage")
@@ -907,12 +1202,24 @@ class AutonomousExperimentLab:
         )
         if replay_receipt.get("prediction_id") != selected_prediction:
             raise BundleValidationError("replay receipt differs from selected PredictionId")
-        if replay_receipt.get("grade") == ReplayGrade.SCORING_EXACT.value:
-            raise BundleValidationError("unscored scripted replay cannot claim SCORING_EXACT")
+        if campaign_kind == CAMPAIGN_KIND:
+            if replay_receipt.get("grade") == ReplayGrade.SCORING_EXACT.value:
+                raise BundleValidationError("unscored scripted replay cannot claim SCORING_EXACT")
+        else:
+            _validate_embedded_production_replay(
+                replay_receipt,
+                campaign_evidence=campaign_evidence,
+                scientific_evidence=scientific,
+                contract_id=contract_id,
+                campaign_id=campaign_id,
+                prediction_id=selected_prediction,
+                submission_sha256=submission_sha256,
+                submission_size_bytes=(root / EvidenceRole.SUBMISSION.value).stat().st_size,
+            )
 
         resource_rows = _read_json_lines(root / EvidenceRole.RESOURCE_RECEIPTS.value)
         if len(resource_rows) != 1:
-            raise BundleValidationError("scripted bundle must contain one resource receipt")
+            raise BundleValidationError("terminal bundle must contain one resource receipt")
         resource_receipt = resource_rows[0]
         _require_lineage(
             resource_receipt,
@@ -929,6 +1236,23 @@ class AutonomousExperimentLab:
             raise BundleValidationError("resource receipt id differs from its exact content")
         if resource_receipt.get("prediction_id") != selected_prediction:
             raise BundleValidationError("resource receipt differs from selected PredictionId")
+        if campaign_kind == PRODUCTION_CAMPAIGN_KIND:
+            declared = _mapping(
+                resource_receipt.get("declared_resource_profile"),
+                "declared_resource_profile",
+            )
+            if (
+                declared.get("name") != "competition-cpu"
+                or declared.get("preferred_backend") != "lightgbm-cpu"
+                or resource_receipt.get("actual_trainer_backend") != "organizer-numpy-fm"
+                or resource_receipt.get("actual_trainer_device") != "cpu"
+                or resource_receipt.get("preferred_backend_qualified") is not False
+                or resource_receipt.get("controller_resource_scope")
+                != "PREPUBLICATION_SELF_EXCLUDING"
+            ):
+                raise BundleValidationError(
+                    "production resource receipt overstates preferred-backend or run scope"
+                )
         _validate_terminal_projection_evidence(
             root,
             terminal_projection=terminal_projection,
@@ -939,6 +1263,7 @@ class AutonomousExperimentLab:
             decision_id=decision_id,
             resource_receipt_id=resource_receipt_id,
             selected_prediction_id=selected_prediction,
+            expected_terminal_state=expected_terminal_state,
         )
         for member in root.iterdir():
             if stat.S_IMODE(member.lstat().st_mode) != 0o444:
@@ -1583,6 +1908,8 @@ class AutonomousExperimentLab:
             raise LabError("bundle payload differs from exact manifest digest")
         if payload.get("submission_sha256") != validation.submission_sha256:
             raise LabError("bundle payload differs from exact submission digest")
+        if payload.get("campaign_kind") == PRODUCTION_CAMPAIGN_KIND:
+            _validate_authority_publication_proof(payload, validation)
         return CampaignResult(
             campaign_id=campaign_id,
             contract_id=contract_id,
@@ -1606,6 +1933,554 @@ class AutonomousExperimentLab:
             campaign_kind=_string(payload.get("campaign_kind"), "campaign_kind"),
             qualification_scope=_string(payload.get("qualification_scope"), "qualification_scope"),
         )
+
+
+def _validate_embedded_production_replay(
+    replay: Mapping[str, object],
+    *,
+    campaign_evidence: Mapping[str, object],
+    scientific_evidence: Mapping[str, object],
+    contract_id: str,
+    campaign_id: str,
+    prediction_id: str,
+    submission_sha256: str,
+    submission_size_bytes: int,
+) -> None:
+    expected_fields = {
+        "schema_version",
+        "contract_id",
+        "campaign_id",
+        "prediction_id",
+        "qualification_manifest_digest",
+        "qualification_fallback_digest",
+        "original_prediction_sha256",
+        "replay_prediction_sha256",
+        "row_alignment_sha256",
+        "submission_sha256",
+        "organizer_check_sha256",
+        "organizer_check",
+        "clean_replay_evidence_sha256",
+        "clean_replay_evidence",
+        "scoring_exact_receipt",
+        "same_backend_receipt",
+        "achieved_replay_grades",
+        "required_terminal_replay_grades",
+        "qualification_scope",
+        "official_fm_qualified",
+        "full_data_qualified",
+        "final_period_outcomes_accessed",
+    }
+    if frozenset(replay) != expected_fields or replay.get("schema_version") != 3:
+        raise BundleValidationError("production replay evidence must use the exact schema v3")
+    if (
+        replay.get("contract_id") != contract_id
+        or replay.get("campaign_id") != campaign_id
+        or replay.get("prediction_id") != prediction_id
+    ):
+        raise BundleValidationError("production replay evidence is outside bundle lineage")
+    if (
+        _string_tuple(replay.get("achieved_replay_grades"), "achieved_replay_grades")
+        != _PRODUCTION_PREPUBLICATION_REPLAY_GRADES
+        or _string_tuple(
+            replay.get("required_terminal_replay_grades"),
+            "required_terminal_replay_grades",
+        )
+        != _PRODUCTION_TERMINAL_REPLAY_GRADES
+    ):
+        raise BundleValidationError(
+            "production replay evidence confuses achieved and required replay grades"
+        )
+    if (
+        replay.get("official_fm_qualified") is not True
+        or replay.get("full_data_qualified") is not True
+        or replay.get("final_period_outcomes_accessed") is not False
+    ):
+        raise BundleValidationError("production replay evidence overstates safe qualification")
+    for name in (
+        "qualification_manifest_digest",
+        "qualification_fallback_digest",
+        "original_prediction_sha256",
+        "replay_prediction_sha256",
+        "row_alignment_sha256",
+        "submission_sha256",
+        "organizer_check_sha256",
+    ):
+        _require_sha256(replay.get(name), f"production replay {name}")
+    if replay.get("original_prediction_sha256") != replay.get("replay_prediction_sha256"):
+        raise BundleValidationError("production replay prediction bytes are not exact")
+    clean = _mapping(replay.get("clean_replay_evidence"), "clean_replay_evidence")
+    clean_digest = _require_sha256(
+        replay.get("clean_replay_evidence_sha256"), "clean_replay_evidence_sha256"
+    )
+    if canonical_json_sha256(dict(clean)) != clean_digest:
+        raise BundleValidationError("production clean replay digest differs")
+    if frozenset(clean) != {
+        "schema_version",
+        "candidate_id",
+        "identity",
+        "equality",
+        "training_replay",
+        "validation",
+        "final",
+        "capabilities",
+        "workspace",
+    } or (
+        clean.get("schema_version") != 1
+        or type(clean.get("candidate_id")) is not str
+        or not clean.get("candidate_id")
+        or type(clean.get("training_replay")) is not str
+        or not clean.get("training_replay")
+    ):
+        raise BundleValidationError("production clean replay has an unexpected schema")
+    identity = _mapping(clean.get("identity"), "clean replay identity")
+    equality = _mapping(clean.get("equality"), "clean replay equality")
+    validation = _mapping(clean.get("validation"), "clean replay validation")
+    final = _mapping(clean.get("final"), "clean replay final")
+    csv = _mapping(validation.get("csv_serialization"), "clean replay CSV evidence")
+    metrics = _mapping(validation.get("metrics"), "clean replay metrics")
+    capabilities = _mapping(clean.get("capabilities"), "clean replay capabilities")
+    workspace = _mapping(clean.get("workspace"), "clean replay workspace")
+    if (
+        frozenset(identity)
+        != {
+            "source_sha256",
+            "config_sha256",
+            "features_sha256",
+            "checkpoint_sha256",
+            "validation_prediction_artifact_sha256",
+            "validation_prediction_digest",
+            "data_sha256",
+            "environment_sha256",
+        }
+        or frozenset(equality) != {"policy", "absolute_tolerance"}
+        or frozenset(validation)
+        != {
+            "row_count",
+            "reference_prediction_digest",
+            "replay_prediction_digest",
+            "replay_prediction_file_sha256",
+            "exact_prediction_bytes",
+            "maximum_absolute_difference",
+            "top5_order_identical",
+            "protected_metrics_identical",
+            "metrics",
+            "public_submission_sha256",
+            "public_submission_prediction_digest",
+            "csv_serialization",
+        }
+        or frozenset(metrics) != {"GAUC", "nDCG@5", "primary"}
+        or frozenset(csv)
+        != {
+            "float64_round_trip_identity",
+            "within_user_order_preserved",
+            "top5_preserved",
+            "protected_metrics_preserved",
+        }
+        or frozenset(final)
+        != {
+            "row_count",
+            "prediction_digest",
+            "prediction_file_sha256",
+            "submission_sha256",
+            "submission_prediction_digest",
+            "finite_scores",
+            "csv_round_trip_identity",
+            "outcome_access",
+            "final_outcomes_accessed",
+            "final_outcomes_scored",
+        }
+        or frozenset(capabilities)
+        != {
+            "validation_digest",
+            "final_digest",
+            "validation_phase",
+            "final_phase",
+            "labels_exposed_to_backend",
+            "raw_data_path_exposed_to_backend",
+        }
+        or dict(workspace)
+        != {
+            "fresh_materialization": True,
+            "artifact_identities_reverified_after_inference": True,
+            "clean_workspace_removed": True,
+        }
+    ):
+        raise BundleValidationError("production clean replay nested schema differs")
+    for name, value in identity.items():
+        _require_sha256(value, f"clean replay identity {name}")
+    for name in (
+        "reference_prediction_digest",
+        "replay_prediction_digest",
+        "replay_prediction_file_sha256",
+        "public_submission_sha256",
+        "public_submission_prediction_digest",
+    ):
+        _require_sha256(validation.get(name), f"clean replay validation {name}")
+    for name in (
+        "prediction_digest",
+        "prediction_file_sha256",
+        "submission_sha256",
+        "submission_prediction_digest",
+    ):
+        _require_sha256(final.get(name), f"clean replay final {name}")
+    for name in ("validation_digest", "final_digest"):
+        _require_sha256(capabilities.get(name), f"clean replay capability {name}")
+    if (
+        equality.get("policy") != "exact_same_host_bytes"
+        or equality.get("absolute_tolerance") != 0.0
+        or type(validation.get("row_count")) is not int
+        or cast(int, validation.get("row_count")) <= 0
+        or validation.get("exact_prediction_bytes") is not True
+        or validation.get("reference_prediction_digest")
+        != validation.get("replay_prediction_digest")
+        or validation.get("maximum_absolute_difference") != 0.0
+        or validation.get("top5_order_identical") is not True
+        or validation.get("protected_metrics_identical") is not True
+        or validation.get("public_submission_prediction_digest")
+        != validation.get("replay_prediction_digest")
+        or csv.get("float64_round_trip_identity") is not True
+        or csv.get("within_user_order_preserved") is not True
+        or csv.get("top5_preserved") is not True
+        or csv.get("protected_metrics_preserved") is not True
+        or identity.get("validation_prediction_digest")
+        != validation.get("reference_prediction_digest")
+        or type(final.get("row_count")) is not int
+        or cast(int, final.get("row_count")) <= 0
+        or final.get("finite_scores") is not True
+        or final.get("csv_round_trip_identity") is not True
+        or final.get("prediction_digest") != final.get("submission_prediction_digest")
+        or final.get("prediction_digest") != replay.get("original_prediction_sha256")
+        or final.get("prediction_digest") != replay.get("replay_prediction_sha256")
+        or final.get("submission_sha256") != submission_sha256
+        or replay.get("submission_sha256") != submission_sha256
+        or final.get("outcome_access") != "none"
+        or final.get("final_outcomes_accessed") is not False
+        or final.get("final_outcomes_scored") is not False
+        or capabilities.get("validation_phase") != "outer_valid"
+        or capabilities.get("final_phase") != "final"
+        or capabilities.get("labels_exposed_to_backend") is not False
+        or capabilities.get("raw_data_path_exposed_to_backend") is not False
+    ):
+        raise BundleValidationError(
+            "production replay evidence does not prove exact scoring and same-backend replay"
+        )
+    metric_values: dict[str, float] = {}
+    for name, value in metrics.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise BundleValidationError(f"production replay metric {name} is invalid")
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            raise BundleValidationError(f"production replay metric {name} is non-finite")
+        metric_values[name] = numeric
+    if not np.isclose(
+        metric_values["primary"],
+        (metric_values["GAUC"] + metric_values["nDCG@5"]) / 2.0,
+        rtol=0.0,
+        atol=2e-7,
+    ):
+        raise BundleValidationError("production replay primary metric is inconsistent")
+    legacy_clean_digest = hashlib.sha256(
+        json.dumps(
+            dict(clean),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+    try:
+        scoring = validate_replay_grade_receipt_manifest(
+            replay.get("scoring_exact_receipt"),
+            expected_grade=ReplayGrade.SCORING_EXACT,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+        )
+        same_backend_expected = dict(scoring.evidence)
+        same_backend_expected["conclusion"] = (
+            "frozen trial artifacts in the frozen environment reproduced exact predictions"
+        )
+        same_backend = validate_replay_grade_receipt_manifest(
+            replay.get("same_backend_receipt"),
+            expected_grade=ReplayGrade.EXPERIMENT_SAME_BACKEND,
+            expected_contract_id=contract_id,
+            expected_prediction_id=prediction_id,
+            expected_evidence=same_backend_expected,
+        )
+    except ReplayGradeError as exc:
+        raise BundleValidationError(f"production exact replay receipt is invalid: {exc}") from exc
+    scoring_evidence = scoring.evidence
+    expected_scoring_evidence = {
+        "kind": "clean_replay",
+        "clean_replay_sha256": legacy_clean_digest,
+        "candidate_id": clean.get("candidate_id"),
+        "frozen_identity": dict(identity),
+        "equality": equality.get("policy"),
+        "absolute_tolerance": equality.get("absolute_tolerance"),
+        "training_replay": clean.get("training_replay"),
+        "validation": dict(validation),
+        "final": dict(final),
+        "capabilities": {
+            "validation_digest": capabilities.get("validation_digest"),
+            "final_digest": capabilities.get("final_digest"),
+        },
+        "clean_workspace_removed": True,
+        "conclusion": "stored and replayed prediction bytes have identical exact metrics",
+    }
+    if dict(scoring_evidence) != expected_scoring_evidence:
+        raise BundleValidationError("production scoring receipt differs from clean replay proof")
+    expected_same_backend_evidence = dict(expected_scoring_evidence)
+    expected_same_backend_evidence["conclusion"] = (
+        "frozen trial artifacts in the frozen environment reproduced exact predictions"
+    )
+    if dict(same_backend.evidence) != expected_same_backend_evidence:
+        raise BundleValidationError("production same-backend receipt differs from clean replay")
+    organizer = _mapping(replay.get("organizer_check"), "organizer_check")
+    if canonical_json_sha256(dict(organizer)) != replay.get("organizer_check_sha256"):
+        raise BundleValidationError("production organizer digest differs")
+    if scientific_evidence.get("organizer_check") != dict(organizer):
+        raise BundleValidationError("scientific decision differs from organizer proof")
+    expected_exact = {
+        "clean_replay_evidence_sha256": clean_digest,
+        "clean_replay_evidence": dict(clean),
+        "scoring_exact_receipt": scoring.manifest(),
+        "same_backend_receipt": same_backend.manifest(),
+    }
+    if scientific_evidence.get("exact_replay_evidence") != expected_exact:
+        raise BundleValidationError("scientific decision differs from exact replay proof")
+    admission = _mapping(campaign_evidence.get("production_admission"), "production_admission")
+    admission_data = _mapping(admission.get("data"), "production_admission.data")
+    try:
+        validate_organizer_check_manifest(
+            organizer,
+            expected_submission_sha256=submission_sha256,
+            expected_submission_size_bytes=submission_size_bytes,
+            expected_starter_manifest_sha256=_require_sha256(
+                admission.get("starter_manifest_sha256"),
+                "production admission starter_manifest_sha256",
+            ),
+            expected_final_rows=cast(int, admission_data.get("final_rows")),
+        )
+    except (OrganizerCheckError, TypeError, ValueError) as exc:
+        raise BundleValidationError(f"production organizer evidence is invalid: {exc}") from exc
+
+
+def _validate_authority_publication_proof(
+    payload: Mapping[str, object], validation: BundleValidationResult
+) -> None:
+    if (
+        payload.get("bundle_exact_status") != "VERIFIED"
+        or _string_tuple(payload.get("prepublication_replay_grades"), "prepublication grades")
+        != _PRODUCTION_PREPUBLICATION_REPLAY_GRADES
+        or _string_tuple(payload.get("required_replay_grades"), "required replay grades")
+        != _PRODUCTION_TERMINAL_REPLAY_GRADES
+        or _string_tuple(payload.get("replay_grades"), "achieved replay grades")
+        != _PRODUCTION_TERMINAL_REPLAY_GRADES
+        or payload.get("replay_grade") != ReplayGrade.BUNDLE_EXACT.value
+    ):
+        raise LabError("authoritative bundle record lacks verified terminal replay grades")
+    proof = _mapping(payload.get("publication_proof"), "publication_proof")
+    if (
+        frozenset(proof)
+        != {
+            "schema_version",
+            "regeneration_evidence",
+            "bundle_exact_receipt",
+            "replay_grade_receipts",
+            "replay_grade_report",
+        }
+        or proof.get("schema_version") != 1
+    ):
+        raise LabError("publication proof must use the exact schema v1")
+    embedded_replay = _read_json_object(validation.bundle_path / EvidenceRole.REPLAY_RECEIPT.value)
+    try:
+        regeneration = validate_bundle_regeneration_evidence_manifest(
+            proof.get("regeneration_evidence")
+        )
+        bundle_receipt = validate_replay_grade_receipt_manifest(
+            proof.get("bundle_exact_receipt"),
+            expected_grade=ReplayGrade.BUNDLE_EXACT,
+            expected_contract_id=validation.contract_id,
+            expected_prediction_id=validation.selected_prediction_id,
+            expected_evidence=regeneration.manifest(),
+        )
+        receipts = _mapping(proof.get("replay_grade_receipts"), "replay_grade_receipts")
+        if frozenset(receipts) != {
+            ReplayGrade.SCORING_EXACT.value,
+            ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+            ReplayGrade.BUNDLE_EXACT.value,
+        }:
+            raise ReplayGradeError("authority replay receipt map is not the exact terminal set")
+        scoring_receipt = validate_replay_grade_receipt_manifest(
+            receipts.get(ReplayGrade.SCORING_EXACT.value),
+            expected_grade=ReplayGrade.SCORING_EXACT,
+            expected_contract_id=validation.contract_id,
+            expected_prediction_id=validation.selected_prediction_id,
+        )
+        same_backend_receipt = validate_replay_grade_receipt_manifest(
+            receipts.get(ReplayGrade.EXPERIMENT_SAME_BACKEND.value),
+            expected_grade=ReplayGrade.EXPERIMENT_SAME_BACKEND,
+            expected_contract_id=validation.contract_id,
+            expected_prediction_id=validation.selected_prediction_id,
+        )
+        persisted_bundle_receipt = validate_replay_grade_receipt_manifest(
+            receipts.get(ReplayGrade.BUNDLE_EXACT.value),
+            expected_grade=ReplayGrade.BUNDLE_EXACT,
+            expected_contract_id=validation.contract_id,
+            expected_prediction_id=validation.selected_prediction_id,
+            expected_evidence=regeneration.manifest(),
+        )
+        report = combine_replay_grade_receipts(
+            (scoring_receipt, same_backend_receipt, persisted_bundle_receipt)
+        )
+    except ReplayGradeError as exc:
+        raise LabError(f"authoritative publication proof is invalid: {exc}") from exc
+    if (
+        regeneration.contract_id != validation.contract_id
+        or regeneration.prediction_id != validation.selected_prediction_id
+        or regeneration.first_bundle_id != validation.bundle_id
+        or regeneration.regenerated_bundle_id != validation.bundle_id
+        or regeneration.first_submission_sha256 != validation.submission_sha256
+        or regeneration.regenerated_submission_sha256 != validation.submission_sha256
+        or regeneration.first_inventory_sha256 != validation.inventory_sha256
+        or regeneration.regenerated_inventory_sha256 != validation.inventory_sha256
+        or bundle_receipt.manifest() != persisted_bundle_receipt.manifest()
+        or scoring_receipt.manifest() != embedded_replay.get("scoring_exact_receipt")
+        or same_backend_receipt.manifest() != embedded_replay.get("same_backend_receipt")
+        or proof.get("replay_grade_report") != report.manifest()
+    ):
+        raise LabError("authoritative publication proof differs from published bundle bytes")
+    _validate_postpublication_resource_receipt(payload, validation)
+
+
+def _validate_postpublication_resource_receipt(
+    payload: Mapping[str, object], validation: BundleValidationResult
+) -> None:
+    """Re-derive the authority-only resource receipt and enforce its lineage and caps."""
+
+    resource_rows = _read_json_lines(validation.bundle_path / EvidenceRole.RESOURCE_RECEIPTS.value)
+    if len(resource_rows) != 1:
+        raise LabError("production bundle must contain one prepublication resource receipt")
+    resource = resource_rows[0]
+    resource_receipt_id = _require_sha256(
+        resource.get("receipt_id"), "prepublication resource_receipt_id"
+    )
+    performance_profile_digest = _require_sha256(
+        resource.get("performance_profile_digest"), "performance_profile_digest"
+    )
+    if (
+        resource_receipt_id != validation.resource_receipt_id
+        or resource_receipt_id != payload.get("resource_receipt_id")
+        or resource.get("contract_id") != validation.contract_id
+        or resource.get("campaign_id") != validation.campaign_id
+        or resource.get("prediction_id") != validation.selected_prediction_id
+    ):
+        raise LabError("postpublication resource proof differs from prepublication lineage")
+    campaign_evidence = _read_json_object(
+        validation.bundle_path / EvidenceRole.CAMPAIGN_MANIFEST.value
+    )
+    admission = _mapping(campaign_evidence.get("production_admission"), "production_admission")
+    performance = _mapping(admission.get("performance"), "production_admission.performance")
+    if performance.get("profile_digest") != performance_profile_digest:
+        raise LabError("postpublication resource proof differs from admitted performance profile")
+
+    manifest = _mapping(
+        payload.get("postpublication_resource_receipt"),
+        "postpublication_resource_receipt",
+    )
+    measurements = _mapping(manifest.get("measurements"), "postpublication resource measurements")
+    try:
+        reconstructed = PostpublicationResourceReceipt.from_measurement(
+            contract_id=validation.contract_id,
+            campaign_id=validation.campaign_id,
+            prediction_id=validation.selected_prediction_id,
+            prepublication_resource_receipt_id=resource_receipt_id,
+            performance_profile_digest=performance_profile_digest,
+            measurements=measurements,
+        )
+    except StateInvariantError as exc:
+        raise LabError(f"postpublication resource receipt is invalid: {exc}") from exc
+    if (
+        reconstructed.manifest() != dict(manifest)
+        or manifest.get("scope") != _POSTPUBLICATION_RESOURCE_SCOPE
+    ):
+        raise LabError("postpublication resource receipt identity or scope is invalid")
+
+    declared = _mapping(resource.get("declared_resource_profile"), "declared_resource_profile")
+    qualified = _mapping(
+        resource.get("qualified_training_resources"), "qualified_training_resources"
+    )
+    prepublication = _mapping(resource.get("controller_resources"), "controller_resources")
+    normalized_measurements = tuple(
+        _validate_production_resource_measurement(value, location=location)
+        for value, location in (
+            (qualified, "qualified training resources"),
+            (prepublication, "prepublication controller resources"),
+            (measurements, "postpublication controller resources"),
+        )
+    )
+    wall_cap = _positive_int(declared.get("wall_clock_seconds"), "wall_clock_seconds")
+    rss_cap = (
+        _positive_int(
+            declared.get("process_tree_rss_hard_cap_mb"),
+            "process_tree_rss_hard_cap_mb",
+        )
+        * 1024
+        * 1024
+    )
+    disk_cap = (
+        _positive_int(
+            declared.get("candidate_disk_hard_cap_mb"),
+            "candidate_disk_hard_cap_mb",
+        )
+        * 1024
+        * 1024
+    )
+    if (
+        max(item[0] for item in normalized_measurements) > wall_cap
+        or max(item[1] for item in normalized_measurements) > rss_cap
+        or max(item[2] for item in normalized_measurements) > disk_cap
+    ):
+        raise LabError("strongest authority-bound production resources exceed declared caps")
+
+
+def _validate_production_resource_measurement(
+    value: Mapping[str, object], *, location: str
+) -> tuple[float, int, int]:
+    if frozenset(value) != {
+        "wall_seconds",
+        "cpu_seconds",
+        "peak_rss_bytes",
+        "disk_bytes",
+        "device",
+    }:
+        raise LabError(f"{location} does not match the exact resource schema")
+    wall = value.get("wall_seconds")
+    cpu = value.get("cpu_seconds")
+    rss = value.get("peak_rss_bytes")
+    disk = value.get("disk_bytes")
+    if (
+        isinstance(wall, bool)
+        or not isinstance(wall, (int, float))
+        or not np.isfinite(float(wall))
+        or float(wall) < 0.0
+        or isinstance(cpu, bool)
+        or not isinstance(cpu, (int, float))
+        or not np.isfinite(float(cpu))
+        or float(cpu) < 0.0
+        or type(rss) is not int
+        or rss <= 0
+        or type(disk) is not int
+        or disk < 0
+        or value.get("device") != "cpu"
+    ):
+        raise LabError(f"{location} contains invalid CPU resource measurements")
+    return float(wall), rss, disk
+
+
+def _positive_int(value: object, location: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise LabError(f"{location} must be a positive integer")
+    return value
 
 
 def _execution_entity(
@@ -1885,6 +2760,7 @@ def _validate_terminal_projection_evidence(
     decision_id: str,
     resource_receipt_id: str,
     selected_prediction_id: str,
+    expected_terminal_state: str,
 ) -> None:
     snapshot_path = root / EvidenceRole.CAMPAIGN_STATE_SNAPSHOT.value
     try:
@@ -1923,7 +2799,7 @@ def _validate_terminal_projection_evidence(
         projected_campaign.get("contract_id") != contract_id
         or projected_campaign.get("campaign_id") != campaign_id
         or projected_campaign.get("selected_prediction_id") != selected_prediction_id
-        or projected_campaign.get("state") != "COMPLETED_OFFLINE_FIXTURE"
+        or projected_campaign.get("state") != expected_terminal_state
         or projected_campaign.get("terminal") is not True
     ):
         raise BundleValidationError("terminal projection differs from committed campaign lineage")
@@ -1962,7 +2838,21 @@ def _validate_terminal_projection_evidence(
     events = projection.get("events")
     if not isinstance(events, list):
         raise BundleValidationError("terminal projection lacks its event horizon")
-    expected_export = b"".join(canonical_json_bytes(event) + b"\n" for event in events)
+    expected_export = b"".join(
+        (
+            json.dumps(
+                event,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+            if expected_terminal_state == "COMPLETED"
+            else canonical_json_bytes(event)
+        )
+        + b"\n"
+        for event in events
+    )
     try:
         observed_export = (root / EvidenceRole.EVENT_EXPORT.value).read_bytes()
     except OSError as exc:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 from collections.abc import Mapping
@@ -11,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from kuairand_agent.data.canonical import OUTCOME_FIELDS
 from kuairand_agent.domain.decisions import ReplayGrade
 from kuairand_agent.domain.identity import (
     BundleId,
@@ -20,6 +22,26 @@ from kuairand_agent.domain.identity import (
     FamilyId,
     PredictionId,
     canonical_json_bytes,
+    canonical_json_sha256,
+)
+from kuairand_agent.finalization.bundle import (
+    REQUIRED_EVIDENCE_ROLES,
+    BundleFinalizationRequest,
+    BundleFinalizer,
+    FrozenFileReceipt,
+    TerminalProjectionBinding,
+)
+from kuairand_agent.finalization.organizer_check import REQUIRED_DATA_FILENAMES
+from kuairand_agent.finalization.replay import (
+    CleanReplayEvidence,
+    FinalReplayEvidence,
+    FrozenReplayIdentity,
+    ReplayEquality,
+    ValidationReplayEvidence,
+)
+from kuairand_agent.finalization.replay_grades import (
+    ReplayGradeReceipt,
+    derive_clean_replay_grade_receipts,
 )
 from kuairand_agent.observability.receipts import ScriptedReplayReceipt
 from kuairand_agent.state import (
@@ -39,6 +61,7 @@ from kuairand_agent.state import (
     TerminalPreparation,
 )
 from kuairand_agent.state import projections as state_projections
+from kuairand_agent.state.repository import PostpublicationResourceReceipt
 
 
 def _digest(label: str) -> str:
@@ -73,12 +96,14 @@ def _campaign(
     campaign: CampaignId,
     key: str,
     limit: int,
+    config: Mapping[str, object] | None = None,
 ) -> None:
     repository.create_campaign(
         campaign_id=campaign,
         contract_id=contract,
         contract_manifest={"contract": "frozen"},
-        config={
+        config=config
+        or {
             "campaign": campaign.value,
             "resource_profile": {
                 "name": "state-test-scripted-fixture",
@@ -97,6 +122,7 @@ def _lineage(
     contract: ContractId,
     campaign: CampaignId,
     suffix: str,
+    prediction_payload: Mapping[str, object] | None = None,
 ) -> _Lineage:
     family = FamilyId(_digest(f"family-{suffix}"))
     experiment = _digest(f"experiment-{suffix}")
@@ -206,6 +232,7 @@ def _lineage(
                     "resources": resources,
                     "timing": timing,
                 },
+                **({} if prediction_payload is None else dict(prediction_payload)),
             },
         )
     )
@@ -1288,6 +1315,9 @@ def _publish_prepared_bundle(
     evidence_schema_version: int = 1,
     tamper_receipt_id_for_role: str | None = None,
     resource_receipts_override: bytes | None = None,
+    campaign_manifest_override: Mapping[str, object] | None = None,
+    scientific_decision_override: Mapping[str, object] | None = None,
+    derive_production_proof: bool = False,
 ) -> PublishedBundleReceipt:
     evidence_roles = (
         "contract-manifest.json",
@@ -1305,7 +1335,6 @@ def _publish_prepared_bundle(
         "submission.csv",
         "report.md",
     )
-    root.mkdir(parents=True)
     projected_entities = prepared.projection["entities"]
     assert isinstance(projected_entities, dict)
     projected_replays = projected_entities["replays"]
@@ -1314,9 +1343,11 @@ def _publish_prepared_bundle(
     assert isinstance(projected_replay, dict)
     projected_replay_payload = projected_replay["payload"]
     assert isinstance(projected_replay_payload, dict)
-    scripted_receipt = projected_replay_payload["scripted_replay_receipt"]
-    assert isinstance(scripted_receipt, dict)
-    replay_receipt = replay_receipt_override or scripted_receipt
+    prepared_receipt = projected_replay_payload.get(
+        "scripted_replay_receipt", projected_replay_payload
+    )
+    assert isinstance(prepared_receipt, dict)
+    replay_receipt = replay_receipt_override or prepared_receipt
     projected_resources = projected_entities["resource_receipts"]
     assert isinstance(projected_resources, list) and len(projected_resources) == 1
     projected_resource = projected_resources[0]
@@ -1326,11 +1357,15 @@ def _publish_prepared_bundle(
     assert isinstance(resource_payload, dict) and isinstance(resource_receipt_id, str)
     payloads: dict[str, bytes] = {
         "contract-manifest.json": canonical_json_bytes({"contract": prepared.contract_id}) + b"\n",
-        "campaign-manifest.json": canonical_json_bytes({"campaign": prepared.campaign_id}) + b"\n",
+        "campaign-manifest.json": canonical_json_bytes(
+            campaign_manifest_override or {"campaign": prepared.campaign_id}
+        )
+        + b"\n",
         "campaign-state-snapshot.sqlite3": snapshot_path.read_bytes(),
         "event-export.jsonl": event_path.read_bytes(),
         "selection-evidence.json": b"{}\n",
-        "scientific-decision.json": b"{}\n",
+        "scientific-decision.json": canonical_json_bytes(scientific_decision_override or {})
+        + b"\n",
         "submission-decision.json": b"{}\n",
         "replay-receipt.json": canonical_json_bytes(replay_receipt) + b"\n",
         "resource-receipts.jsonl": resource_receipts_override
@@ -1341,24 +1376,74 @@ def _publish_prepared_bundle(
         "submission.csv": b"row_id,prediction\n0,0.0\n",
         "report.md": b"# Prepared bundle\n",
     }
+    if derive_production_proof:
+        if (
+            any(
+                value is not None
+                for value in (
+                    omit_role,
+                    manifest_extra,
+                    declared_submission_sha256,
+                    tamper_receipt_id_for_role,
+                )
+            )
+            or manifest_schema_version != 2
+            or evidence_schema_version != 1
+        ):
+            raise AssertionError("typed production proof requires the canonical bundle layout")
+        source_root = root.parent / f".{root.name}-frozen-sources"
+        source_root.mkdir(parents=True)
+        receipts: list[FrozenFileReceipt] = []
+        for role in REQUIRED_EVIDENCE_ROLES:
+            source = source_root / role.value
+            source.write_bytes(payloads[role.value])
+            receipts.append(FrozenFileReceipt.capture(role, source))
+        result = BundleFinalizer().finalize(
+            BundleFinalizationRequest(
+                destination=root,
+                contract_id=ContractId(prepared.contract_id),
+                campaign_id=CampaignId(prepared.campaign_id),
+                selected_prediction_id=selected_prediction_id,
+                terminal_projection=TerminalProjectionBinding(
+                    preparation_id=prepared.preparation_id,
+                    projection_sha256=prepared.projection_sha256,
+                    campaign_revision=prepared.source.campaign_revision,
+                    last_event_seq=prepared.source.last_event_seq,
+                ),
+                receipts=tuple(receipts),
+            )
+        )
+        return PublishedBundleReceipt(
+            root=result.root,
+            bundle_id=result.bundle_id,
+            manifest_sha256=result.manifest_sha256,
+            inventory_sha256=result.inventory_sha256,
+            submission_sha256=result.submission_sha256,
+            file_count=result.file_count,
+            total_size_bytes=result.total_size_bytes,
+            regeneration_evidence=result.regeneration_evidence,
+            bundle_exact_receipt=result.replay_grade,
+        )
+
+    root.mkdir(parents=True)
     evidence = []
-    for role in evidence_roles:
-        if role == omit_role:
+    for role_name in evidence_roles:
+        if role_name == omit_role:
             continue
-        path = root / role
-        path.write_bytes(payloads[role])
-        sha256 = hashlib.sha256(payloads[role]).hexdigest()
+        path = root / role_name
+        path.write_bytes(payloads[role_name])
+        sha256 = hashlib.sha256(payloads[role_name]).hexdigest()
         receipt_body = {
             "schema_version": evidence_schema_version,
-            "role": role,
+            "role": role_name,
             "sha256": sha256,
-            "size_bytes": len(payloads[role]),
+            "size_bytes": len(payloads[role_name]),
         }
         receipt_id = hashlib.sha256(
             b"kuairand-frozen-bundle-file-v1\0" + canonical_json_bytes(receipt_body)
         ).hexdigest()
-        if role == tamper_receipt_id_for_role:
-            receipt_id = _digest(f"tampered-receipt:{role}")
+        if role_name == tamper_receipt_id_for_role:
+            receipt_id = _digest(f"tampered-receipt:{role_name}")
         evidence.append(
             {
                 **receipt_body,
@@ -1430,6 +1515,751 @@ def _publish_prepared_bundle(
         file_count=len(entries),
         total_size_bytes=total_size,
     )
+
+
+def _production_clean_replay(
+    *,
+    contract: ContractId,
+    prediction: PredictionId,
+    prediction_sha256: str,
+    submission_sha256: str,
+    suffix: str,
+) -> tuple[CleanReplayEvidence, ReplayGradeReceipt, ReplayGradeReceipt]:
+    validation_prediction_digest = _digest(f"{suffix}:validation-predictions")
+    evidence = CleanReplayEvidence(
+        candidate_id=f"official-fm-seed-4-{suffix}",
+        identity=FrozenReplayIdentity(
+            source_sha256=_digest(f"{suffix}:source"),
+            config_sha256=_digest(f"{suffix}:config"),
+            features_sha256=_digest(f"{suffix}:features"),
+            checkpoint_sha256=_digest(f"{suffix}:checkpoint"),
+            validation_prediction_artifact_sha256=_digest(
+                f"{suffix}:validation-prediction-artifact"
+            ),
+            validation_prediction_digest=validation_prediction_digest,
+            data_sha256=_digest(f"{suffix}:data"),
+            environment_sha256=_digest(f"{suffix}:environment"),
+        ),
+        equality=ReplayEquality.EXACT,
+        absolute_tolerance=0.0,
+        training_replay="checkpoint_replay",
+        validation=ValidationReplayEvidence(
+            row_count=2,
+            reference_prediction_digest=validation_prediction_digest,
+            replay_prediction_digest=validation_prediction_digest,
+            replay_prediction_file_sha256=_digest(f"{suffix}:validation-prediction-file"),
+            exact_prediction_bytes=True,
+            maximum_absolute_difference=0.0,
+            top5_order_identical=True,
+            protected_metrics_identical=True,
+            metrics={"GAUC": 0.6, "nDCG@5": 0.4, "primary": 0.5},
+            public_submission_sha256=_digest(f"{suffix}:validation-submission"),
+            public_submission_prediction_digest=validation_prediction_digest,
+            csv_round_trip_identity=True,
+            csv_within_user_order_preserved=True,
+            csv_top5_preserved=True,
+            csv_protected_metrics_preserved=True,
+        ),
+        final=FinalReplayEvidence(
+            row_count=1,
+            prediction_digest=prediction_sha256,
+            prediction_file_sha256=_digest(f"{suffix}:final-prediction-file"),
+            submission_sha256=submission_sha256,
+            submission_prediction_digest=prediction_sha256,
+            finite_scores=True,
+            csv_round_trip_identity=True,
+        ),
+        validation_capability_digest=_digest(f"{suffix}:validation-capability"),
+        final_capability_digest=_digest(f"{suffix}:final-capability"),
+    )
+    receipts = derive_clean_replay_grade_receipts(
+        contract_id=contract,
+        prediction_id=prediction,
+        evidence=evidence,
+    )
+    scoring = tuple(receipt for receipt in receipts if receipt.grade is ReplayGrade.SCORING_EXACT)
+    same_backend = tuple(
+        receipt for receipt in receipts if receipt.grade is ReplayGrade.EXPERIMENT_SAME_BACKEND
+    )
+    assert len(scoring) == len(same_backend) == 1
+    return evidence, scoring[0], same_backend[0]
+
+
+def _production_organizer_check(
+    *, submission_sha256: str, submission_size_bytes: int, starter_manifest_sha256: str
+) -> dict[str, object]:
+    files: list[dict[str, object]] = []
+    for relative_path in sorted(REQUIRED_DATA_FILENAMES):
+        is_video = relative_path == "video_features_basic_pure.csv"
+        files.append(
+            {
+                "relative_path": relative_path,
+                "sha256": _digest(f"masked:{relative_path}"),
+                "size_bytes": 1,
+                "data_rows": None if is_video else 1,
+                "final_rows_masked": (
+                    None if is_video else int(relative_path == "log_standard_4_22_to_5_08_pure.csv")
+                ),
+            }
+        )
+    digest_body = {
+        "schema_version": 1,
+        "files": files,
+        "registered_outcome_fields": list(OUTCOME_FIELDS),
+        "final_rows_masked": 1,
+        "final_outcome_cells_replaced": len(OUTCOME_FIELDS),
+    }
+    stdout = "submission check passed\n"
+    stderr = ""
+    return {
+        "schema_version": 1,
+        "checker": "hash-pinned organizer submit.py",
+        "mode": "check_only",
+        "split": "test",
+        "starter_manifest_sha256": starter_manifest_sha256,
+        "submission": {"sha256": submission_sha256, "size_bytes": submission_size_bytes},
+        "masked_data_view": {
+            "schema_version": 1,
+            "files": files,
+            "final_outcome_isolation": {
+                "registered_fields": list(OUTCOME_FIELDS),
+                "final_rows_masked": 1,
+                "final_outcome_cells_replaced": len(OUTCOME_FIELDS),
+                "outcome_cells_sliced": 0,
+                "outcome_cells_decoded": 0,
+                "outcome_cells_converted": 0,
+                "outcome_cells_validated": 0,
+                "outcome_cells_logged": 0,
+                "outcome_cells_hashed": 0,
+                "outcome_cells_scored": 0,
+            },
+            "digest": hashlib.sha256(canonical_json_bytes(digest_body)).hexdigest(),
+        },
+        "command": [
+            "python",
+            "-B",
+            "submit.py",
+            "submission.csv",
+            "--data_dir",
+            "<private-masked-data-view>",
+            "--split",
+            "test",
+            "--check",
+        ],
+        "returncode": 0,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
+    }
+
+
+def _production_terminal_preparation(
+    repository: StateRepository,
+    *,
+    contract: ContractId,
+    campaign: CampaignId,
+    lineage: _Lineage,
+    suffix: str,
+    qualification_manifest_digest: str,
+    qualification_fallback_digest: str,
+    performance_profile_digest: str,
+    resource_profile: Mapping[str, object],
+) -> TerminalPreparation:
+    submission = b"row_id,prediction\n0,0.0\n"
+    submission_sha256 = hashlib.sha256(submission).hexdigest()
+    prediction_sha256 = _digest(f"prediction-bytes-{suffix}")
+    clean_replay, scoring_receipt, same_backend_receipt = _production_clean_replay(
+        contract=contract,
+        prediction=lineage.prediction_id,
+        prediction_sha256=prediction_sha256,
+        submission_sha256=submission_sha256,
+        suffix=suffix,
+    )
+    clean_replay_manifest = clean_replay.manifest()
+    organizer_check = _production_organizer_check(
+        submission_sha256=submission_sha256,
+        submission_size_bytes=len(submission),
+        starter_manifest_sha256=_digest(f"{suffix}:starter-manifest"),
+    )
+    resource_body: dict[str, object] = {
+        "schema_version": 1,
+        "contract_id": contract.value,
+        "campaign_id": campaign.value,
+        "prediction_id": lineage.prediction_id.value,
+        "campaign_kind": "PRODUCTION_FULL_DATA",
+        "qualification_scope": "FULL_DATA_CPU",
+        "qualification_manifest_digest": qualification_manifest_digest,
+        "qualification_fallback_digest": qualification_fallback_digest,
+        "performance_profile_digest": performance_profile_digest,
+        "declared_resource_profile": dict(resource_profile),
+        "actual_trainer_backend": "organizer-numpy-fm",
+        "actual_trainer_device": "cpu",
+        "qualified_training_resources": {
+            "wall_seconds": 12.5,
+            "cpu_seconds": 12.0,
+            "peak_rss_bytes": 1_900_000_000,
+            "disk_bytes": 4_000_000,
+            "device": "cpu",
+        },
+        "controller_resources": {
+            "wall_seconds": 1.5,
+            "cpu_seconds": 1.0,
+            "peak_rss_bytes": 2_000_000_000,
+            "disk_bytes": 5_000_000,
+            "device": "cpu",
+        },
+        "controller_resource_scope": "PREPUBLICATION_SELF_EXCLUDING",
+        "preferred_backend_qualified": False,
+        "official_fm_qualified": True,
+        "full_data_qualified": True,
+        "final_period_outcomes_accessed": False,
+    }
+    resource_receipt_id = hashlib.sha256(canonical_json_bytes(resource_body)).hexdigest()
+    repository.register(
+        DurableRecord(
+            RecordKind.RESOURCE_RECEIPT,
+            resource_receipt_id,
+            campaign,
+            contract,
+            payload=resource_body,
+        )
+    )
+    replay_payload = {
+        "schema_version": 3,
+        "contract_id": contract.value,
+        "campaign_id": campaign.value,
+        "prediction_id": lineage.prediction_id.value,
+        "qualification_manifest_digest": qualification_manifest_digest,
+        "qualification_fallback_digest": qualification_fallback_digest,
+        "original_prediction_sha256": prediction_sha256,
+        "replay_prediction_sha256": prediction_sha256,
+        "row_alignment_sha256": _digest(f"rows-{suffix}"),
+        "submission_sha256": submission_sha256,
+        "organizer_check_sha256": canonical_json_sha256(organizer_check),
+        "organizer_check": organizer_check,
+        "clean_replay_evidence_sha256": canonical_json_sha256(clean_replay_manifest),
+        "clean_replay_evidence": clean_replay_manifest,
+        "scoring_exact_receipt": scoring_receipt.manifest(),
+        "same_backend_receipt": same_backend_receipt.manifest(),
+        "achieved_replay_grades": [
+            ReplayGrade.SCORING_EXACT.value,
+            ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+        ],
+        "required_terminal_replay_grades": [
+            ReplayGrade.SCORING_EXACT.value,
+            ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+            ReplayGrade.BUNDLE_EXACT.value,
+        ],
+        "qualification_scope": "FULL_DATA_CPU",
+        "official_fm_qualified": True,
+        "full_data_qualified": True,
+        "final_period_outcomes_accessed": False,
+    }
+    return TerminalPreparation(
+        decision_id=DecisionId(_digest(f"{suffix}:production-decision")),
+        replay_id=_digest(f"{suffix}:production-replay"),
+        selected_prediction_id=lineage.prediction_id,
+        fallback_prediction_id=lineage.prediction_id,
+        terminal_state="COMPLETED",
+        decision_payload={"disposition": "qualified fallback retained"},
+        replay_payload=replay_payload,
+        scoring_exact_receipt=scoring_receipt,
+        same_backend_receipt=same_backend_receipt,
+        bundle_claims={
+            "schema_version": 2,
+            "resource_receipt_id": resource_receipt_id,
+            "prepublication_replay_grades": [
+                ReplayGrade.SCORING_EXACT.value,
+                ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+            ],
+            "required_replay_grades": [
+                ReplayGrade.SCORING_EXACT.value,
+                ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+                ReplayGrade.BUNDLE_EXACT.value,
+            ],
+            "bundle_exact_status": "PENDING_PUBLICATION_PROOF",
+            "submission_disposition": "FALLBACK_RETAINED",
+            "scientific_disposition": "INSUFFICIENT_VALID_EVIDENCE",
+            "campaign_kind": "PRODUCTION_FULL_DATA",
+            "qualification_scope": "FULL_DATA_CPU",
+            "protected_query_count": 0,
+            "provider_operation_count": 0,
+            "exact_metrics": None,
+            "official_fm_qualified": True,
+            "full_data_qualified": True,
+            "final_period_outcomes_accessed": False,
+            "qualification_manifest_digest": qualification_manifest_digest,
+        },
+    )
+
+
+def _production_terminal_fixture(
+    tmp_path: Path, *, suffix: str
+) -> tuple[StateRepository, ContractId, CampaignId, _Lineage, TerminalPreparation]:
+    repository = StateRepository.open(tmp_path / f"production-{suffix}-state")
+    contract = ContractId(_digest(f"production-{suffix}-contract"))
+    campaign = CampaignId(_digest(f"production-{suffix}-campaign"))
+    qualification_manifest_digest = _digest(f"production-{suffix}-qualification")
+    qualification_fallback_digest = _digest(f"production-{suffix}-fallback")
+    performance_profile_digest = _digest(f"production-{suffix}-performance")
+    resource_profile = {
+        "name": "competition-cpu",
+        "preferred_backend": "lightgbm-cpu",
+        "device": "cpu",
+        "wall_clock_seconds": 300,
+        "process_tree_rss_hard_cap_mb": 4096,
+        "candidate_disk_hard_cap_mb": 64,
+    }
+    _campaign(
+        repository,
+        contract=contract,
+        campaign=campaign,
+        key=f"production-{suffix}",
+        limit=0,
+        config={
+            "campaign": campaign.value,
+            "resource_profile": resource_profile,
+            "qualification_manifest_digest": qualification_manifest_digest,
+            "performance_profile_digest": performance_profile_digest,
+        },
+    )
+    lineage = _lineage(
+        repository,
+        contract=contract,
+        campaign=campaign,
+        suffix=suffix,
+        prediction_payload={
+            "qualification_manifest_digest": qualification_manifest_digest,
+            "qualification_fallback_digest": qualification_fallback_digest,
+            "final_period_outcomes_accessed": False,
+        },
+    )
+    _close_lineage(repository, campaign=campaign, lineage=lineage)
+    preparation = _production_terminal_preparation(
+        repository,
+        contract=contract,
+        campaign=campaign,
+        lineage=lineage,
+        suffix=suffix,
+        qualification_manifest_digest=qualification_manifest_digest,
+        qualification_fallback_digest=qualification_fallback_digest,
+        performance_profile_digest=performance_profile_digest,
+        resource_profile=resource_profile,
+    )
+    return repository, contract, campaign, lineage, preparation
+
+
+def _production_postpublication_receipt(
+    *,
+    contract: ContractId,
+    campaign: CampaignId,
+    lineage: _Lineage,
+    preparation: TerminalPreparation,
+    suffix: str,
+    measurements: Mapping[str, object] | None = None,
+) -> PostpublicationResourceReceipt:
+    return PostpublicationResourceReceipt.from_measurement(
+        contract_id=contract,
+        campaign_id=campaign,
+        prediction_id=lineage.prediction_id,
+        prepublication_resource_receipt_id=cast(
+            str, preparation.bundle_claims["resource_receipt_id"]
+        ),
+        performance_profile_digest=_digest(f"production-{suffix}-performance"),
+        measurements=measurements
+        or {
+            "wall_seconds": 2.5,
+            "cpu_seconds": 2.0,
+            "peak_rss_bytes": 2_100_000_000,
+            "disk_bytes": 6_000_000,
+            "device": "cpu",
+        },
+    )
+
+
+def test_production_fallback_terminal_requires_flat_exact_evidence_and_sealed_bundle(
+    tmp_path: Path,
+) -> None:
+    repository, contract, campaign, lineage, preparation = _production_terminal_fixture(
+        tmp_path, suffix="production-success"
+    )
+    prepared = repository.prepare_terminal_projection(
+        campaign_id=campaign,
+        contract_id=contract,
+        expected_state="READY",
+        expected_revision=0,
+        preparation=preparation,
+    )
+    projected_entities = cast(dict[str, object], prepared.projection["entities"])
+    projected_replays = cast(list[object], projected_entities["replays"])
+    projected_replay = cast(dict[str, object], projected_replays[0])
+    assert projected_replay["payload"] == preparation.replay_payload
+    artifacts = repository.materialize_prepared_terminal_projection(
+        preparation_id=prepared.preparation_id,
+        snapshot_destination=tmp_path / "production-evidence" / "campaign-state-snapshot.sqlite3",
+        event_export_destination=tmp_path / "production-evidence" / "event-export.jsonl",
+    )
+    replay_payload = cast(dict[str, object], preparation.replay_payload)
+    organizer_check = cast(dict[str, object], replay_payload["organizer_check"])
+    campaign_manifest = {
+        "contract_id": contract.value,
+        "campaign_id": campaign.value,
+        "production_admission": {
+            "starter_manifest_sha256": organizer_check["starter_manifest_sha256"],
+            "data": {"final_rows": 1},
+        },
+    }
+    scientific_decision = {
+        "organizer_check": organizer_check,
+        "exact_replay_evidence": {
+            "clean_replay_evidence_sha256": replay_payload["clean_replay_evidence_sha256"],
+            "clean_replay_evidence": replay_payload["clean_replay_evidence"],
+            "scoring_exact_receipt": replay_payload["scoring_exact_receipt"],
+            "same_backend_receipt": replay_payload["same_backend_receipt"],
+        },
+    }
+    publication = _publish_prepared_bundle(
+        root=tmp_path / "production-published-bundle",
+        prepared=prepared,
+        snapshot_path=artifacts.snapshot_path,
+        event_path=artifacts.event_export_path,
+        selected_prediction_id=lineage.prediction_id,
+        campaign_manifest_override=campaign_manifest,
+        scientific_decision_override=scientific_decision,
+        derive_production_proof=True,
+    )
+    publication = replace(
+        publication,
+        postpublication_resource_receipt=_production_postpublication_receipt(
+            contract=contract,
+            campaign=campaign,
+            lineage=lineage,
+            preparation=preparation,
+            suffix="production-success",
+        ),
+    )
+    unbound = _publish_prepared_bundle(
+        root=tmp_path / "production-unbound-bundle",
+        prepared=prepared,
+        snapshot_path=artifacts.snapshot_path,
+        event_path=artifacts.event_export_path,
+        selected_prediction_id=lineage.prediction_id,
+        replay_receipt_override={"forged": True},
+        campaign_manifest_override=campaign_manifest,
+        scientific_decision_override=scientific_decision,
+        derive_production_proof=True,
+    )
+    unbound = replace(
+        unbound,
+        postpublication_resource_receipt=publication.postpublication_resource_receipt,
+    )
+    with pytest.raises(PublishedBundleVerificationError, match="prepared replay payload"):
+        repository.finalize_prepared_campaign(
+            preparation_id=prepared.preparation_id,
+            publication=unbound,
+        )
+    with pytest.raises(StateInvariantError, match="typed evidence is required"):
+        repository.finalize_prepared_campaign(
+            preparation_id=prepared.preparation_id,
+            publication=replace(
+                publication,
+                regeneration_evidence=None,
+                bundle_exact_receipt=None,
+            ),
+        )
+    with pytest.raises(StateInvariantError, match="proof differs from publication"):
+        repository.finalize_prepared_campaign(
+            preparation_id=prepared.preparation_id,
+            publication=replace(
+                publication,
+                regeneration_evidence=unbound.regeneration_evidence,
+                bundle_exact_receipt=unbound.bundle_exact_receipt,
+            ),
+        )
+    with pytest.raises(StateInvariantError, match="typed postpublication resource receipt"):
+        repository.finalize_prepared_campaign(
+            preparation_id=prepared.preparation_id,
+            publication=replace(publication, postpublication_resource_receipt=None),
+        )
+    over_cap = _production_postpublication_receipt(
+        contract=contract,
+        campaign=campaign,
+        lineage=lineage,
+        preparation=preparation,
+        suffix="production-success",
+        measurements={
+            "wall_seconds": 301.0,
+            "cpu_seconds": 2.0,
+            "peak_rss_bytes": 2_100_000_000,
+            "disk_bytes": 6_000_000,
+            "device": "cpu",
+        },
+    )
+    with pytest.raises(StateInvariantError, match="strongest authority-bound"):
+        repository.finalize_prepared_campaign(
+            preparation_id=prepared.preparation_id,
+            publication=replace(publication, postpublication_resource_receipt=over_cap),
+        )
+    transition = repository.finalize_prepared_campaign(
+        preparation_id=prepared.preparation_id,
+        publication=publication,
+    )
+    replayed_transition = repository.finalize_prepared_campaign(
+        preparation_id=prepared.preparation_id,
+        publication=publication,
+    )
+    assert replayed_transition == transition
+    assert transition.terminal and transition.new_state == "COMPLETED"
+    projected_campaign = repository.inspect(campaign_id=campaign)["campaign"]
+    assert isinstance(projected_campaign, dict)
+    assert projected_campaign["selected_prediction_id"] == lineage.prediction_id.value
+    assert projected_campaign["fallback_prediction_id"] == lineage.prediction_id.value
+    finalized_entities = cast(
+        dict[str, object], repository.inspect(campaign_id=campaign)["entities"]
+    )
+    bundles = cast(list[dict[str, object]], finalized_entities["bundles"])
+    bundle_payload = cast(dict[str, object], bundles[0]["payload"])
+    publication_proof = cast(dict[str, object], bundle_payload["publication_proof"])
+    assert (
+        publication_proof["bundle_exact_receipt"]
+        == cast(ReplayGradeReceipt, publication.bundle_exact_receipt).manifest()
+    )
+    grade_report = cast(dict[str, object], publication_proof["replay_grade_report"])
+    assert grade_report["achieved_grades"] == [
+        ReplayGrade.BUNDLE_EXACT.value,
+        ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+        ReplayGrade.SCORING_EXACT.value,
+    ]
+    assert (
+        bundle_payload["postpublication_resource_receipt"]
+        == cast(
+            PostpublicationResourceReceipt, publication.postpublication_resource_receipt
+        ).manifest()
+    )
+
+
+def test_production_fallback_terminal_rejects_forged_replay_claims_and_resources(
+    tmp_path: Path,
+) -> None:
+    repository, contract, campaign, _lineage_record, preparation = _production_terminal_fixture(
+        tmp_path, suffix="production-forgery"
+    )
+    mismatched_replay = dict(preparation.replay_payload)
+    mismatched_replay["replay_prediction_sha256"] = _digest("different-replay-bytes")
+    with pytest.raises(StateInvariantError, match="prediction bytes are not exact"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, replay_payload=mismatched_replay),
+        )
+    forged_scoring_replay = dict(preparation.replay_payload)
+    forged_scoring_receipt = dict(
+        cast(Mapping[str, object], forged_scoring_replay["scoring_exact_receipt"])
+    )
+    forged_scoring_receipt["receipt_id"] = _digest("forged-scoring-receipt")
+    forged_scoring_replay["scoring_exact_receipt"] = forged_scoring_receipt
+    with pytest.raises(StateInvariantError, match="PRODUCTION_SCORING_RECEIPT_INVALID"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, replay_payload=forged_scoring_replay),
+        )
+    with pytest.raises(StateInvariantError, match="typed same-backend receipt"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, same_backend_receipt=None),
+        )
+    forged_same_backend_replay = dict(preparation.replay_payload)
+    forged_same_backend_receipt = dict(
+        cast(Mapping[str, object], forged_same_backend_replay["same_backend_receipt"])
+    )
+    forged_same_backend_receipt["receipt_id"] = _digest("forged-same-backend-receipt")
+    forged_same_backend_replay["same_backend_receipt"] = forged_same_backend_receipt
+    with pytest.raises(StateInvariantError, match="PRODUCTION_SAME_BACKEND_RECEIPT_INVALID"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, replay_payload=forged_same_backend_replay),
+        )
+    forged_prediction_replay = dict(preparation.replay_payload)
+    forged_prediction_replay["original_prediction_sha256"] = _digest("forged-original-prediction")
+    forged_prediction_replay["replay_prediction_sha256"] = _digest("forged-original-prediction")
+    with pytest.raises(StateInvariantError, match="final replay is not target-free exact evidence"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, replay_payload=forged_prediction_replay),
+        )
+    with pytest.raises(StateInvariantError, match="must select fallback"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(
+                preparation,
+                fallback_prediction_id=PredictionId(_digest("different-production-fallback")),
+            ),
+        )
+    leaked_replay = dict(preparation.replay_payload)
+    leaked_replay["final_period_outcomes_accessed"] = True
+    with pytest.raises(StateInvariantError, match="qualification or outcome evidence is unsafe"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, replay_payload=leaked_replay),
+        )
+    provider_claims = dict(preparation.bundle_claims)
+    provider_claims["provider_operation_count"] = 1
+    with pytest.raises(StateInvariantError, match="zero protected/provider use"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, bundle_claims=provider_claims),
+        )
+    original_resource_id = cast(str, preparation.bundle_claims["resource_receipt_id"])
+    with sqlite3.connect(repository.database_path) as connection:
+        resource_payload = json.loads(
+            cast(
+                str,
+                connection.execute(
+                    "SELECT payload_json FROM resource_receipts WHERE receipt_id = ?",
+                    (original_resource_id,),
+                ).fetchone()[0],
+            )
+        )
+    preferred_resource = json.loads(canonical_json_bytes(resource_payload))
+    preferred_resource["preferred_backend_qualified"] = True
+    preferred_resource_id = hashlib.sha256(canonical_json_bytes(preferred_resource)).hexdigest()
+    repository.register(
+        DurableRecord(
+            RecordKind.RESOURCE_RECEIPT,
+            preferred_resource_id,
+            campaign,
+            contract,
+            payload=preferred_resource,
+        )
+    )
+    preferred_claims = dict(preparation.bundle_claims)
+    preferred_claims["resource_receipt_id"] = preferred_resource_id
+    with pytest.raises(StateInvariantError, match="qualification evidence is unsafe"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, bundle_claims=preferred_claims),
+        )
+    scoped_resource = json.loads(canonical_json_bytes(resource_payload))
+    scoped_resource["controller_resource_scope"] = "FULL_PROCESS_TREE"
+    scoped_resource_id = hashlib.sha256(canonical_json_bytes(scoped_resource)).hexdigest()
+    repository.register(
+        DurableRecord(
+            RecordKind.RESOURCE_RECEIPT,
+            scoped_resource_id,
+            campaign,
+            contract,
+            payload=scoped_resource,
+        )
+    )
+    scoped_claims = dict(preparation.bundle_claims)
+    scoped_claims["resource_receipt_id"] = scoped_resource_id
+    with pytest.raises(StateInvariantError, match="qualification evidence is unsafe"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, bundle_claims=scoped_claims),
+        )
+    resource_payload["controller_resources"]["disk_bytes"] = -1
+    forged_resource_id = hashlib.sha256(canonical_json_bytes(resource_payload)).hexdigest()
+    repository.register(
+        DurableRecord(
+            RecordKind.RESOURCE_RECEIPT,
+            forged_resource_id,
+            campaign,
+            contract,
+            payload=resource_payload,
+        )
+    )
+    forged_resource_claims = dict(preparation.bundle_claims)
+    forged_resource_claims["resource_receipt_id"] = forged_resource_id
+    with pytest.raises(StateInvariantError, match="disk_bytes is invalid"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, bundle_claims=forged_resource_claims),
+        )
+    wrong_identity = _digest("wrong-production-resource-identity")
+    repository.register(
+        DurableRecord(
+            RecordKind.RESOURCE_RECEIPT,
+            wrong_identity,
+            campaign,
+            contract,
+            payload={
+                **resource_payload,
+                "controller_resources": {
+                    **resource_payload["controller_resources"],
+                    "disk_bytes": 1,
+                },
+            },
+        )
+    )
+    wrong_identity_claims = dict(preparation.bundle_claims)
+    wrong_identity_claims["resource_receipt_id"] = wrong_identity
+    with pytest.raises(StateInvariantError, match="resource receipt identity is invalid"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=replace(preparation, bundle_claims=wrong_identity_claims),
+        )
+
+
+def test_production_fallback_terminal_rejects_nonzero_durable_provider_usage(
+    tmp_path: Path,
+) -> None:
+    repository, contract, campaign, _lineage_record, preparation = _production_terminal_fixture(
+        tmp_path, suffix="production-provider"
+    )
+    repository.register(
+        DurableRecord(
+            RecordKind.PROVIDER_OPERATION,
+            _digest("production-provider-operation"),
+            campaign,
+            contract,
+            state="PENDING",
+        )
+    )
+    with pytest.raises(StateInvariantError, match="protected queries or provider operations"):
+        repository.prepare_terminal_projection(
+            campaign_id=campaign,
+            contract_id=contract,
+            expected_state="READY",
+            expected_revision=0,
+            preparation=preparation,
+        )
 
 
 def test_terminal_preparation_requires_authenticated_replay_and_resource_evidence(
@@ -1550,7 +2380,7 @@ def test_prepared_terminal_projection_materializes_and_finalizes_atomically(
     _campaign(repository, contract=contract, campaign=campaign, key="prepared", limit=0)
     lineage = _lineage(repository, contract=contract, campaign=campaign, suffix="prepared")
     _close_lineage(repository, campaign=campaign, lineage=lineage)
-    with pytest.raises(StateInvariantError, match="production terminal replay verification"):
+    with pytest.raises(StateInvariantError, match="typed same-backend receipt"):
         repository.prepare_terminal_projection(
             campaign_id=campaign,
             contract_id=contract,

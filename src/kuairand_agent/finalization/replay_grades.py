@@ -345,6 +345,123 @@ def derive_bundle_exact_grade(evidence: BundleRegenerationEvidence) -> ReplayGra
     )
 
 
+def validate_bundle_regeneration_evidence_manifest(
+    value: object,
+) -> BundleRegenerationEvidence:
+    """Reconstruct and authenticate a serialized two-pass bundle proof.
+
+    The public validator deliberately calls the same verified constructor used by the finalizer,
+    then requires byte-equivalent canonical content.  Callers therefore cannot smuggle additional
+    claims into an otherwise valid proof or weaken any of the exact-equality checks.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ReplayGradeError("bundle regeneration evidence must be a mapping")
+    expected_fields = {
+        "kind",
+        "contract_id",
+        "prediction_id",
+        "first_bundle_id",
+        "regenerated_bundle_id",
+        "first_submission_sha256",
+        "regenerated_submission_sha256",
+        "first_inventory_sha256",
+        "regenerated_inventory_sha256",
+        "conclusion",
+    }
+    if set(value) != expected_fields:
+        raise ReplayGradeError("bundle regeneration evidence has an unexpected schema")
+    reconstructed = BundleRegenerationEvidence._from_verified_projection(
+        contract_id=value.get("contract_id"),
+        prediction_id=value.get("prediction_id"),
+        first_bundle_id=_digest(value.get("first_bundle_id"), "first_bundle_id"),
+        regenerated_bundle_id=_digest(value.get("regenerated_bundle_id"), "regenerated_bundle_id"),
+        first_submission_sha256=_digest(
+            value.get("first_submission_sha256"), "first_submission_sha256"
+        ),
+        regenerated_submission_sha256=_digest(
+            value.get("regenerated_submission_sha256"),
+            "regenerated_submission_sha256",
+        ),
+        first_inventory_sha256=_digest(
+            value.get("first_inventory_sha256"), "first_inventory_sha256"
+        ),
+        regenerated_inventory_sha256=_digest(
+            value.get("regenerated_inventory_sha256"),
+            "regenerated_inventory_sha256",
+        ),
+    )
+    if _canonical_json(dict(value)) != _canonical_json(reconstructed.manifest()):
+        raise ReplayGradeError("bundle regeneration evidence contains forged fields")
+    return reconstructed
+
+
+def validate_replay_grade_receipt_manifest(
+    value: object,
+    *,
+    expected_grade: ReplayGrade | None = None,
+    expected_contract_id: object | None = None,
+    expected_prediction_id: object | None = None,
+    expected_evidence: Mapping[str, object] | None = None,
+) -> ReplayGradeReceipt:
+    """Authenticate a serialized evidence-derived replay-grade receipt.
+
+    Receipt IDs use this module's historical ASCII JSON contract, which is intentionally not
+    interchangeable with the domain identity canonicalizer.  Keeping validation here prevents
+    persistence and UI layers from accidentally reimplementing the receipt formula differently.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ReplayGradeError("replay grade receipt must be a mapping")
+    if set(value) != {
+        "schema_version",
+        "receipt_id",
+        "grade",
+        "contract_id",
+        "prediction_id",
+        "evidence_sha256",
+        "evidence",
+    }:
+        raise ReplayGradeError("replay grade receipt has an unexpected schema")
+    if value.get("schema_version") != REPLAY_GRADE_SCHEMA_VERSION:
+        raise ReplayGradeError("replay grade receipt schema_version is unsupported")
+    grade_value = value.get("grade")
+    if type(grade_value) is not str:
+        raise ReplayGradeError("replay grade receipt grade must be text")
+    try:
+        grade = ReplayGrade(grade_value)
+    except (TypeError, ValueError) as exc:
+        raise ReplayGradeError("replay grade receipt names an unsupported grade") from exc
+    if expected_grade is not None and grade is not expected_grade:
+        raise ReplayGradeError("replay grade receipt proves a different grade")
+    evidence = value.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise ReplayGradeError("replay grade receipt evidence must be a mapping")
+    if expected_evidence is not None and _canonical_json(dict(evidence)) != _canonical_json(
+        dict(expected_evidence)
+    ):
+        raise ReplayGradeError("replay grade receipt differs from expected evidence")
+    contract_id = value.get("contract_id")
+    prediction_id = value.get("prediction_id")
+    if expected_contract_id is not None and _identifier(contract_id, "contract_id") != _identifier(
+        expected_contract_id, "expected_contract_id"
+    ):
+        raise ReplayGradeError("replay grade receipt differs from expected contract")
+    if expected_prediction_id is not None and _identifier(
+        prediction_id, "prediction_id"
+    ) != _identifier(expected_prediction_id, "expected_prediction_id"):
+        raise ReplayGradeError("replay grade receipt differs from expected prediction")
+    reconstructed = ReplayGradeReceipt._from_verified_evidence(
+        grade=grade,
+        contract_id=contract_id,
+        prediction_id=prediction_id,
+        evidence=evidence,
+    )
+    if _canonical_json(dict(value)) != _canonical_json(reconstructed.manifest()):
+        raise ReplayGradeError("replay grade receipt identity or evidence digest is invalid")
+    return reconstructed
+
+
 @dataclass(frozen=True, slots=True)
 class ReplayGradeReport:
     """Canonical collection of non-conflicting evidence-derived receipts."""
@@ -419,4 +536,6 @@ __all__ = [
     "derive_bundle_exact_grade",
     "derive_clean_replay_grade_receipts",
     "derive_cross_backend_portability_grade",
+    "validate_bundle_regeneration_evidence_manifest",
+    "validate_replay_grade_receipt_manifest",
 ]

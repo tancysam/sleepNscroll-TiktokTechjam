@@ -2,17 +2,30 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import kuairand_agent.lab as lab_module
+import kuairand_agent.production.controller as production_controller_module
 from kuairand_agent.contract import CONTRACT_ID, ContractManifestError
+from kuairand_agent.domain.decisions import ReplayGrade
+from kuairand_agent.domain.identity import CampaignId
 from kuairand_agent.lab import (
     AutonomousExperimentLab,
     CampaignOptions,
+    CampaignResult,
     LabAdmissionError,
+    LabConflictError,
 )
 from kuairand_agent.observability.receipts import ReceiptError, ScriptedReplayReceipt
+from kuairand_agent.production.admission import ProductionAdmission
+from kuairand_agent.production.controller import (
+    ProductionCPUFallbackRequest,
+    ProductionCPUFallbackResult,
+)
+from kuairand_agent.state.repository import StateRepository
 
 
 def test_open_verifies_contract_before_creating_state_root(
@@ -158,4 +171,330 @@ def test_scripted_replay_receipt_rejects_different_prediction_bytes() -> None:
             replay_prediction_sha256=digest_b,
             first_result_sha256="d" * 64,
             replay_result_sha256="d" * 64,
+        )
+
+
+def test_running_retry_reenters_controller_for_exact_sealed_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_id = CampaignId("a" * 64)
+    campaign_revision = 1
+    selected_prediction_id = "b" * 64
+    qualification_manifest_digest = "c" * 64
+    qualification_fallback_digest = "d" * 64
+    preparation_id = "e" * 64
+    prepared = {
+        "preparation_id": preparation_id,
+        "campaign_id": campaign_id.value,
+        "contract_id": CONTRACT_ID.value,
+        "source_state": "RUNNING",
+        "source_campaign_revision": campaign_revision,
+        "source_last_event_seq": 7,
+        "terminal_state": "COMPLETED",
+        "decision_id": "f" * 64,
+        "selected_prediction_id": selected_prediction_id,
+        "fallback_prediction_id": selected_prediction_id,
+        "prepared_projection_sha256": "1" * 64,
+        "projection_schema_version": 1,
+        "redaction_policy_version": 1,
+        "replay_payload": {
+            "contract_id": CONTRACT_ID.value,
+            "campaign_id": campaign_id.value,
+            "prediction_id": selected_prediction_id,
+            "qualification_manifest_digest": qualification_manifest_digest,
+            "qualification_fallback_digest": qualification_fallback_digest,
+            "qualification_scope": "FULL_DATA_CPU",
+            "final_period_outcomes_accessed": False,
+        },
+        "bundle_claims": {
+            "campaign_kind": "PRODUCTION_FULL_DATA",
+            "qualification_scope": "FULL_DATA_CPU",
+            "qualification_manifest_digest": qualification_manifest_digest,
+            "protected_query_count": 0,
+            "provider_operation_count": 0,
+        },
+    }
+    running_snapshot = {
+        "campaign": {
+            "state": "RUNNING",
+            "revision": campaign_revision,
+            "terminal": False,
+        },
+        "entities": {
+            "terminal_preparations": [prepared],
+            "bundle_publications": [],
+        },
+    }
+    completed_snapshot = {"campaign": {"state": "COMPLETED"}, "entities": {}}
+    expected_campaign_id = campaign_id
+
+    class _Repository:
+        def inspect(self, *, campaign_id: object) -> dict[str, object]:
+            assert campaign_id == expected_campaign_id
+            return running_snapshot
+
+    repository = _Repository()
+    admission = cast(
+        ProductionAdmission,
+        SimpleNamespace(
+            qualification_manifest_digest=qualification_manifest_digest,
+            fallback_manifest_digest=qualification_fallback_digest,
+        ),
+    )
+    lab = AutonomousExperimentLab.open(
+        repository_root=Path.cwd(),
+        state_root=tmp_path / "state",
+        run_root=tmp_path / "run",
+        profile="cpu",
+    )
+    destination = tmp_path / "run" / "campaigns" / campaign_id.value / "final" / "submission-bundle"
+    destination.mkdir(parents=True)
+    destination.chmod(0o555)
+    expected_result = CampaignResult(
+        campaign_id=campaign_id.value,
+        contract_id=CONTRACT_ID.value,
+        terminal_state="COMPLETED",
+        submission_disposition="FALLBACK_RETAINED",
+        scientific_disposition="INSUFFICIENT_VALID_EVIDENCE",
+        selected_prediction_id=selected_prediction_id,
+        fallback_prediction_id=selected_prediction_id,
+        exact_metrics=None,
+        bundle_path=destination,
+        bundle_sha256="2" * 64,
+        replay_grade=ReplayGrade.BUNDLE_EXACT.value,
+        resource_receipt_id="3" * 64,
+        protected_query_count=0,
+        evidence_manifest_path=destination / "evidence-manifest.json",
+        replay_grades=(
+            ReplayGrade.SCORING_EXACT.value,
+            ReplayGrade.EXPERIMENT_SAME_BACKEND.value,
+            ReplayGrade.BUNDLE_EXACT.value,
+        ),
+        campaign_kind="PRODUCTION_FULL_DATA",
+        qualification_scope="FULL_DATA_CPU",
+    )
+    observed: list[ProductionCPUFallbackRequest] = []
+
+    def resume(
+        _controller: object,
+        request: ProductionCPUFallbackRequest,
+    ) -> ProductionCPUFallbackResult:
+        observed.append(request)
+        assert request.campaign_id == campaign_id.value
+        assert request.campaign_revision == campaign_revision
+        assert request.run_dir == destination.parents[1]
+        assert destination.is_dir()
+        return ProductionCPUFallbackResult(
+            snapshot=completed_snapshot,
+            bundle_path=destination,
+            bundle_id="2" * 64,
+            manifest_sha256="4" * 64,
+            inventory_sha256="5" * 64,
+            submission_sha256="6" * 64,
+            resource_receipt_id="3" * 64,
+        )
+
+    def result_from_snapshot(
+        _lab: AutonomousExperimentLab,
+        snapshot: object,
+    ) -> CampaignResult:
+        assert snapshot is completed_snapshot
+        return expected_result
+
+    monkeypatch.setattr(production_controller_module.ProductionCPUFallbackController, "run", resume)
+    monkeypatch.setattr(AutonomousExperimentLab, "_result_from_snapshot", result_from_snapshot)
+
+    result = lab._resume_production_cpu_fallback(
+        repository=cast(StateRepository, repository),
+        campaign_id=campaign_id,
+        campaign_revision=campaign_revision,
+        admission=admission,
+        campaign_run_root=destination.parents[1],
+    )
+
+    assert result is expected_result
+    assert len(observed) == 1
+    assert destination.stat().st_mode & 0o777 == 0o555
+
+
+def test_running_retry_without_preparation_reenters_controller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    campaign_id = CampaignId("a" * 64)
+    campaign_revision = 1
+    running_snapshot = {
+        "campaign": {
+            "state": "RUNNING",
+            "revision": campaign_revision,
+            "terminal": False,
+        },
+        "entities": {
+            "terminal_preparations": [],
+            "bundle_publications": [],
+        },
+    }
+
+    class _Repository:
+        def inspect(self, *, campaign_id: object) -> dict[str, object]:
+            return running_snapshot
+
+    repository = _Repository()
+    admission = cast(
+        ProductionAdmission,
+        SimpleNamespace(
+            qualification_manifest_digest="c" * 64,
+            fallback_manifest_digest="d" * 64,
+        ),
+    )
+    lab = AutonomousExperimentLab.open(
+        repository_root=Path.cwd(),
+        state_root=tmp_path / "state",
+        run_root=tmp_path / "run",
+        profile="cpu",
+    )
+    campaign_run_root = tmp_path / "run" / "campaigns" / campaign_id.value
+    completed_snapshot = {"campaign": {"state": "COMPLETED"}, "entities": {}}
+    observed: list[ProductionCPUFallbackRequest] = []
+    expected_result = object()
+
+    def resume(
+        _controller: object,
+        request: ProductionCPUFallbackRequest,
+    ) -> ProductionCPUFallbackResult:
+        observed.append(request)
+        return ProductionCPUFallbackResult(
+            snapshot=completed_snapshot,
+            bundle_path=campaign_run_root / "final" / "submission-bundle",
+            bundle_id="2" * 64,
+            manifest_sha256="4" * 64,
+            inventory_sha256="5" * 64,
+            submission_sha256="6" * 64,
+            resource_receipt_id="3" * 64,
+        )
+
+    def result_from_snapshot(
+        _lab: AutonomousExperimentLab,
+        snapshot: object,
+    ) -> CampaignResult:
+        assert snapshot is completed_snapshot
+        return cast(CampaignResult, expected_result)
+
+    monkeypatch.setattr(production_controller_module.ProductionCPUFallbackController, "run", resume)
+    monkeypatch.setattr(AutonomousExperimentLab, "_result_from_snapshot", result_from_snapshot)
+
+    result = lab._resume_production_cpu_fallback(
+        repository=cast(StateRepository, repository),
+        campaign_id=campaign_id,
+        campaign_revision=campaign_revision,
+        admission=admission,
+        campaign_run_root=campaign_run_root,
+    )
+
+    assert result is expected_result
+    assert len(observed) == 1
+    assert observed[0].run_dir == campaign_run_root
+
+
+def test_running_retry_rejects_bundle_without_terminal_preparation(
+    tmp_path: Path,
+) -> None:
+    campaign_id = CampaignId("a" * 64)
+    campaign_revision = 1
+    running_snapshot = {
+        "campaign": {
+            "state": "RUNNING",
+            "revision": campaign_revision,
+            "terminal": False,
+        },
+        "entities": {
+            "terminal_preparations": [],
+            "bundle_publications": [],
+        },
+    }
+
+    class _Repository:
+        def inspect(self, *, campaign_id: object) -> dict[str, object]:
+            return running_snapshot
+
+    lab = AutonomousExperimentLab.open(
+        repository_root=Path.cwd(),
+        state_root=tmp_path / "state",
+        run_root=tmp_path / "run",
+        profile="cpu",
+    )
+    campaign_run_root = tmp_path / "run" / "campaigns" / campaign_id.value
+    destination = campaign_run_root / "final" / "submission-bundle"
+    destination.mkdir(parents=True)
+
+    with pytest.raises(
+        LabConflictError,
+        match="destination exists without a terminal preparation",
+    ):
+        lab._resume_production_cpu_fallback(
+            repository=cast(StateRepository, _Repository()),
+            campaign_id=campaign_id,
+            campaign_revision=campaign_revision,
+            admission=cast(
+                ProductionAdmission,
+                SimpleNamespace(
+                    qualification_manifest_digest="c" * 64,
+                    fallback_manifest_digest="d" * 64,
+                ),
+            ),
+            campaign_run_root=campaign_run_root,
+        )
+
+
+def test_running_retry_rejects_preparation_from_different_admission() -> None:
+    campaign_id = CampaignId("a" * 64)
+    selected_prediction_id = "b" * 64
+    prepared = {
+        "preparation_id": "c" * 64,
+        "campaign_id": campaign_id.value,
+        "contract_id": CONTRACT_ID.value,
+        "source_state": "RUNNING",
+        "source_campaign_revision": 1,
+        "source_last_event_seq": 7,
+        "terminal_state": "COMPLETED",
+        "decision_id": "d" * 64,
+        "selected_prediction_id": selected_prediction_id,
+        "fallback_prediction_id": selected_prediction_id,
+        "prepared_projection_sha256": "e" * 64,
+        "projection_schema_version": 1,
+        "redaction_policy_version": 1,
+        "replay_payload": {
+            "contract_id": CONTRACT_ID.value,
+            "campaign_id": campaign_id.value,
+            "prediction_id": selected_prediction_id,
+            "qualification_manifest_digest": "f" * 64,
+            "qualification_fallback_digest": "1" * 64,
+            "qualification_scope": "FULL_DATA_CPU",
+            "final_period_outcomes_accessed": False,
+        },
+        "bundle_claims": {
+            "campaign_kind": "PRODUCTION_FULL_DATA",
+            "qualification_scope": "FULL_DATA_CPU",
+            "qualification_manifest_digest": "f" * 64,
+            "protected_query_count": 0,
+            "provider_operation_count": 0,
+        },
+    }
+
+    with pytest.raises(
+        LabConflictError,
+        match="differs from admitted fallback evidence",
+    ):
+        AutonomousExperimentLab._validate_production_resume_preparation(
+            prepared,
+            campaign_id=campaign_id,
+            campaign_revision=1,
+            admission=cast(
+                ProductionAdmission,
+                SimpleNamespace(
+                    qualification_manifest_digest="2" * 64,
+                    fallback_manifest_digest="1" * 64,
+                ),
+            ),
         )

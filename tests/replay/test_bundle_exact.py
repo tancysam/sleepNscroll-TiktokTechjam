@@ -121,16 +121,45 @@ def test_same_frozen_receipts_regenerate_same_bundle_without_runtime_metadata(
     assert "resource_usage" not in manifest
 
 
-def test_bundle_publication_is_exclusive_and_never_overwrites(tmp_path: Path) -> None:
+def test_exact_sealed_publication_is_recovered_without_overwrite(tmp_path: Path) -> None:
     receipts = _receipts(tmp_path)
     destination = tmp_path / "final"
     finalizer = BundleFinalizer()
     first = finalizer.finalize(_request(destination, receipts))
+    before = {
+        member.name: (member.stat().st_ino, member.stat().st_mtime_ns)
+        for member in destination.iterdir()
+    }
 
-    with pytest.raises(BundleProjectionError, match="already exists"):
-        finalizer.finalize(_request(destination, receipts))
+    recovered = finalizer.finalize(_request(destination, receipts))
 
+    assert recovered.root == first.root
+    assert recovered.bundle_id == first.bundle_id
+    assert recovered.inventory_sha256 == first.inventory_sha256
+    assert recovered.replay_grade.grade is ReplayGrade.BUNDLE_EXACT
     assert (destination / "bundle.sha256").read_text(encoding="ascii") == (first.bundle_id + "\n")
+    assert {
+        member.name: (member.stat().st_ino, member.stat().st_mtime_ns)
+        for member in destination.iterdir()
+    } == before
+
+
+def test_sealed_publication_recovery_rejects_different_frozen_inputs(tmp_path: Path) -> None:
+    receipts = _receipts(tmp_path)
+    destination = tmp_path / "final"
+    BundleFinalizer().finalize(_request(destination, receipts))
+
+    report = next(receipt for receipt in receipts if receipt.role is EvidenceRole.REPORT)
+    report.source.write_text("# Mutated recovery input\n", encoding="utf-8")
+    changed_report = FrozenFileReceipt.capture(EvidenceRole.REPORT, report.source)
+    changed = tuple(
+        changed_report if receipt.role is EvidenceRole.REPORT else receipt for receipt in receipts
+    )
+
+    with pytest.raises(BundleProjectionError, match="regeneration"):
+        BundleFinalizer().finalize(_request(destination, changed))
+
+    assert stat.S_IMODE(destination.lstat().st_mode) == 0o555
 
 
 def test_exact_orphan_after_exclusive_rename_is_verified_sealed_and_adopted(

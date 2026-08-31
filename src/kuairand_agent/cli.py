@@ -346,7 +346,13 @@ def _compete(args: argparse.Namespace) -> int:
         )
         key = args.idempotency_key or f"cli:{_absolute_cli_path(args.run_root)}"
         result = lab.compete(
-            options=CampaignOptions(config_path=config_path),
+            options=CampaignOptions(
+                config_path=config_path,
+                data_root=_absolute_cli_path(args.data_dir),
+                starter_root=_absolute_cli_path(args.starter_dir),
+                qualification_receipt=_absolute_cli_path(args.qualification_run_dir),
+                performance_profile=_absolute_cli_path(args.performance_profile),
+            ),
             idempotency_key=key,
         )
     except (LabError, ResourceProfileError, OSError, RuntimeError) as exc:
@@ -562,6 +568,30 @@ def build_parser() -> argparse.ArgumentParser:
     compete.add_argument("--config", required=True, type=Path)
     compete.add_argument("--state-root", type=Path, default=Path(".kuairand"))
     compete.add_argument("--run-root", required=True, type=Path)
+    compete.add_argument(
+        "--data-dir",
+        required=True,
+        type=Path,
+        help="verified KuaiRand-Pure data directory",
+    )
+    compete.add_argument(
+        "--starter-dir",
+        required=True,
+        type=Path,
+        help="hash-verified organizer starter directory",
+    )
+    compete.add_argument(
+        "--qualification-run-dir",
+        required=True,
+        type=Path,
+        help="completed official-FM qualification evidence directory",
+    )
+    compete.add_argument(
+        "--performance-profile",
+        required=True,
+        type=Path,
+        help="measured full-data performance profile receipt",
+    )
     compete.add_argument(
         "--profile",
         choices=("cpu", "gpu", "competition-cpu", "competition-gpu"),

@@ -14,11 +14,15 @@ from kuairand_agent.finalization.replay import (
     ValidationReplayEvidence,
 )
 from kuairand_agent.finalization.replay_grades import (
+    BundleRegenerationEvidence,
     ReplayGradeError,
     ReplayGradeReceipt,
     combine_replay_grade_receipts,
+    derive_bundle_exact_grade,
     derive_clean_replay_grade_receipts,
     derive_cross_backend_portability_grade,
+    validate_bundle_regeneration_evidence_manifest,
+    validate_replay_grade_receipt_manifest,
 )
 
 
@@ -163,3 +167,88 @@ def test_grade_report_is_canonical_and_rejects_duplicate_conclusions() -> None:
     )
     with pytest.raises(ReplayGradeError, match="duplicate grades"):
         combine_replay_grade_receipts((receipts[0], receipts[0]))
+
+
+def test_public_receipt_validator_authenticates_envelope_and_expected_lineage() -> None:
+    contract_id = "a" * 64
+    prediction_id = "b" * 64
+    receipt = derive_clean_replay_grade_receipts(
+        contract_id=contract_id,
+        prediction_id=prediction_id,
+        evidence=_clean_replay(),
+    )[0]
+
+    validated = validate_replay_grade_receipt_manifest(
+        receipt.manifest(),
+        expected_grade=ReplayGrade.SCORING_EXACT,
+        expected_contract_id=contract_id,
+        expected_prediction_id=prediction_id,
+        expected_evidence=receipt.evidence,
+    )
+
+    assert validated == receipt
+
+
+@pytest.mark.parametrize("field", ("receipt_id", "evidence_sha256"))
+def test_public_receipt_validator_rejects_tampered_envelope(field: str) -> None:
+    receipt = derive_clean_replay_grade_receipts(
+        contract_id="a" * 64,
+        prediction_id="b" * 64,
+        evidence=_clean_replay(),
+    )[0]
+    tampered = receipt.manifest()
+    tampered[field] = "0" * 64
+
+    with pytest.raises(ReplayGradeError, match="identity or evidence digest"):
+        validate_replay_grade_receipt_manifest(tampered)
+
+
+def test_bundle_regeneration_manifest_validator_reconstructs_exact_proof() -> None:
+    bundle_id = "c" * 64
+    submission_sha256 = "d" * 64
+    inventory_sha256 = "e" * 64
+    evidence = BundleRegenerationEvidence._from_verified_projection(
+        contract_id="a" * 64,
+        prediction_id="b" * 64,
+        first_bundle_id=bundle_id,
+        regenerated_bundle_id=bundle_id,
+        first_submission_sha256=submission_sha256,
+        regenerated_submission_sha256=submission_sha256,
+        first_inventory_sha256=inventory_sha256,
+        regenerated_inventory_sha256=inventory_sha256,
+    )
+
+    validated = validate_bundle_regeneration_evidence_manifest(evidence.manifest())
+    receipt = derive_bundle_exact_grade(validated)
+
+    assert validated == evidence
+    assert receipt.grade is ReplayGrade.BUNDLE_EXACT
+    assert receipt.evidence == evidence.manifest()
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (
+        ("regenerated_bundle_id", "regenerated bundle identity differs"),
+        ("conclusion", "contains forged fields"),
+    ),
+)
+def test_bundle_regeneration_manifest_validator_rejects_tampering(
+    field: str,
+    message: str,
+) -> None:
+    evidence = BundleRegenerationEvidence._from_verified_projection(
+        contract_id="a" * 64,
+        prediction_id="b" * 64,
+        first_bundle_id="c" * 64,
+        regenerated_bundle_id="c" * 64,
+        first_submission_sha256="d" * 64,
+        regenerated_submission_sha256="d" * 64,
+        first_inventory_sha256="e" * 64,
+        regenerated_inventory_sha256="e" * 64,
+    )
+    tampered = evidence.manifest()
+    tampered[field] = "f" * 64 if field.endswith("_id") else "forged conclusion"
+
+    with pytest.raises(ReplayGradeError, match=message):
+        validate_bundle_regeneration_evidence_manifest(tampered)
