@@ -1,0 +1,18 @@
+{
+  "checkpoint": {
+    "bias_f32_hex": "7dbf0134",
+    "embedding_sha256": "fbd83db397058ac1b01a93894d263e0a390e19a3a1532c27f577644a765b9db3",
+    "linear_sha256": "bcaacd30b34b44ebd877902ea3ae1050af30099fea26b57d32c688b1419e6a72"
+  },
+  "fixture": "tests.unit.test_starter_fm:test_first_update_matches_untouched_organizer_float32_golden",
+  "first_epoch_mean_loss": 0.693239152431488,
+  "prediction_digest": "e65c3885ed323036d583cb3382839c91286fc4965408c970286c828054370e07",
+  "predictions_f64": [
+    0.002868118928745389,
+    -0.0015314295887947083,
+    0.004123099613934755,
+    -0.005258315242826939
+  ],
+  "schema_version": 1,
+  "seed": 0
+}

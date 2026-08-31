@@ -18,13 +18,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from numbers import Integral, Real
-from typing import Any, Final, cast, no_type_check
+from typing import Any, Final, Protocol, cast, no_type_check, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
 
 from kuairand_agent.data.capabilities import DataPhase
-from kuairand_agent.scoring.protected import ScoreResult
 from kuairand_agent.scoring.submission import prediction_digest
 
 NEURAL_SCHEMA_VERSION: Final = 1
@@ -43,7 +42,19 @@ type Float32Matrix = npt.NDArray[np.float32]
 type Int8Vector = npt.NDArray[np.int8]
 type Int64Vector = npt.NDArray[np.int64]
 type Float64Vector = npt.NDArray[np.float64]
-type InnerValidScorer = Callable[[Float64Vector], ScoreResult]
+
+
+@runtime_checkable
+class _InnerAggregate(Protocol):
+    """Inner-fold aggregate shape, independent of protected-evaluation result types."""
+
+    gauc: float
+    ndcg_at_5: float
+    primary: float
+    rows: int
+
+
+type InnerValidScorer = Callable[[Float64Vector], _InnerAggregate]
 
 
 class NeuralPrimitiveError(ValueError):
@@ -1318,12 +1329,12 @@ def fit_neural(
         epoch_seconds.append(elapsed)
         throughputs.append(row_count / elapsed)
 
-    inner_score: ScoreResult | None = None
+    inner_score: _InnerAggregate | None = None
     if inner_valid_features is not None and inner_valid_scorer is not None:
         scores = _predict_module(built.module, inner_valid_features, device)
         inner_score = inner_valid_scorer(scores)
         if (
-            not isinstance(inner_score, ScoreResult)
+            not isinstance(inner_score, _InnerAggregate)
             or inner_score.rows != inner_valid_features.row_count
         ):
             raise NeuralPrimitiveError(

@@ -31,6 +31,14 @@ research-neural = [
 research-tree = [
   "lightgbm==4.7.0",
 ]
+tree-cpu = [
+  "lightgbm==4.7.0",
+]
+# LightGBM's GPU capability is a native build property which cannot be expressed by a
+# PyPI version pin. Keep this group explicit but empty until a reproducible GPU-enabled
+# build is locked; scripts/qualify_gpu.sh probes an operator-supplied build and never
+# treats the stock wheel above as GPU-qualified.
+tree-gpu = []
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kuairand_agent"]
@@ -64,3 +72,11 @@ warn_unreachable = true
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+  "reference_categorical_ranker",
+  "reference_listnet_ranker",
+  "reference_pointwise_ranker",
+]
+ignore_missing_imports = true

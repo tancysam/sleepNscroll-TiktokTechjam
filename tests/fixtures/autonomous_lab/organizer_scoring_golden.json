@@ -1,0 +1,21 @@
+{
+  "alignment": {
+    "row_count": 9,
+    "split": "outer_valid",
+    "split_token": "fixture-public-valid-v1",
+    "users": [10, 20, 30, 10, 40, 20, 30, 10, 10],
+    "videos": [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  },
+  "fixture": "tests.unit.test_protected_scorer:test_hardcoded_golden_mixed_and_degenerate_users",
+  "labels": [1, 0, 1, 0, 1, 0, 1, 1, 0],
+  "metrics": {
+    "GAUC": 0.5,
+    "nDCG@5": 0.7193038288345124,
+    "primary": 0.6096519144172562,
+    "rows": 9,
+    "users": 4
+  },
+  "prediction_digest": "a964a8f2bd174fce2835f74b0f2c4690ebc1baf60e8c507ecc12c57f6757645a",
+  "schema_version": 1,
+  "scores": [0.9, 0.7, 0.4, 0.8, 0.5, 0.6, 0.3, 0.1, 0.2]
+}

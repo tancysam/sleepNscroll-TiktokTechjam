@@ -68,9 +68,7 @@ class ConvergenceState:
         _primary(self.best_primary, "best_primary")
         _primary(self.patience_window_start_primary, "patience_window_start_primary")
         if Decimal(str(self.patience_window_start_primary)) > Decimal(str(self.best_primary)):
-            raise ConvergenceStateError(
-                "patience_window_start_primary cannot exceed best_primary"
-            )
+            raise ConvergenceStateError("patience_window_start_primary cannot exceed best_primary")
         if type(self.non_material_streak) is not int or self.non_material_streak < 0:
             raise ConvergenceStateError("non_material_streak must be a non-negative integer")
         if type(self.completed_iterations) is not int or self.completed_iterations < 0:

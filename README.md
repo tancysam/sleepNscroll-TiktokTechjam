@@ -9,14 +9,32 @@ The files in `kuairand-starter-kit/` are immutable, hash-pinned organizer refere
 data, campaign databases, caches, checkpoints, predictions, and final bundles stay in ignored
 local directories. Development never reads, aggregates, exposes, or scores final-period outcomes.
 
+## Reconstruction status
+
+The `newRevision` reconstruction adds the plan's typed contract and identity kernel, phase-specific
+label firewall, CPU/GPU trainer seams, deterministic proposal ladder, frozen promotion statistics,
+exact rank graphs, one SQLite state authority, replay grades, and sealed-bundle finalization. The
+The new `AutonomousExperimentLab` facade exposes the production-shaped competition admission gate
+and an explicitly enabled development/test fixture. Production admission currently fails closed
+before creating a campaign or state when the required full-data, parity, measured-runtime, and
+controller evidence is unavailable. The fixture proves authority, identity, same-backend replay,
+and bundle behavior; its receipts say `SCRIPTED_FIXTURE_ONLY`, use zero protected queries, and do
+not claim `SCORING_EXACT`, official-FM full-data, or GPU qualification.
+
+The production acceptance gate remains deliberately separate. A compatible GPU build, official
+KuaiRand-Pure data, measured CPU/GPU rehearsals, and explicit authorization are still required
+before production cutover or a live six-hour campaign. See
+`docs/migration/autonomous-lab-phase-minus-one-2026-08-31.md` for the exact phase decisions.
+
 ## Install the locked environment
 
-The lock targets CPython 3.12.13. A full LambdaRank campaign requires the pinned `research-tree`
-dependency group; the CPU path remains the reproducible reference path.
+The lock targets CPython 3.12.13. The reconstructed CPU path uses the pinned `tree-cpu`
+dependency group and remains the reproducible reference path. The legacy `research-tree` group is
+retained only for compatibility during cutover.
 
 ```bash
-UV_CACHE_DIR=.uv-cache uv sync --locked --group research-tree --no-group research-neural
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
+UV_CACHE_DIR=.uv-cache uv sync --locked --group tree-cpu --no-group research-neural
+UV_CACHE_DIR=.uv-cache uv run --locked --group tree-cpu --no-group research-neural \
   kuairand-agent --help
 ```
 
@@ -112,10 +130,12 @@ kuairand-agent data prepare --archive PATH --data-dir PATH
 kuairand-agent data prepare --download --data-dir PATH
 kuairand-agent data audit --data-dir PATH [--output-dir PATH] [--json]
 kuairand-agent qualify --data-dir PATH --run-dir PATH
-kuairand-agent run --config PATH [--qualification-run-dir PATH] [--run-dir PATH]
-kuairand-agent resume --run-dir PATH
+kuairand-agent compete --config configs/competition-cpu.toml --state-root PATH --run-root PATH
+kuairand-agent inspect --state-root PATH --campaign-id SHA256 [--json]
+kuairand-agent replay --state-root PATH --campaign-id SHA256 \
+  --grade experiment-same-backend|scoring-exact|bundle-exact
+kuairand-agent validate-bundle --bundle PATH
 kuairand-agent status --run-dir PATH [--json]
-kuairand-agent finalize --run-dir PATH
 kuairand-agent replay --project-root PATH --bundle PATH --data-dir PATH --expected-data-sha256 SHA256
 kuairand-agent validate-submission --split valid|test --data-dir PATH FILE
 kuairand-agent config validate FILE
@@ -123,27 +143,27 @@ kuairand-agent provider preflight --config FILE
 kuairand-agent contract verify-starter [--starter-dir PATH]
 ```
 
-`run` is a new-campaign operation: it verifies the configuration, canonical data, starter kit,
-and official-FM qualification, creates a no-overwrite durable campaign, runs the bounded
-research policy selected by the explicit run kind, and finalizes the retained eligible lineage.
-An autonomous run repeatedly proposes, implements, evaluates, and reflects until a frozen
-convergence, iteration, launch, outer-promotion, repeated-pre-admission, reserve, or deadline
-terminal condition. It never silently resumes or replaces an existing run directory.
+`compete` enters the production-shaped admission gate. In this reconstruction it exits nonzero,
+before creating a `CampaignId`, state database, or run directory, because the full-data controller
+and its qualification receipts have not passed the remaining phase gates. The deterministic
+scripted fixture is available only through the Python facade with `execution="offline-scripted"`
+and `allow_test_fixture=True`; it is not a weaker CLI competition mode. That fixture persists one
+exact prediction and an honest resource receipt, regenerates the required evidence bundle twice,
+then commits selection, replay, bundle publication, and terminal state through the single SQLite
+authority. `inspect` is a read-only authority snapshot. Campaign-ID `replay` and
+`validate-bundle` verify already sealed evidence without spending a protected query.
 
-`resume` verifies the original immutable campaign identity, reconciles unfinished subprocesses,
-continues only while the original launch/time policies permit, and then finalizes. It does not
-reset budgets or start a second deadline.
+The old `run`, `resume`, and `finalize` argument shapes remain parseable for compatibility, but
+they deliberately fail closed. They cannot create or mutate the retired run-directory campaign
+stores. Start or retry new work with the same idempotent `compete` invocation, then use `inspect`
+or campaign-ID `replay` against its `--state-root`. The legacy `status` and bundle replay commands
+remain read-only migration aids.
 
-`finalize` is the provider-free recovery entry point for a campaign whose research outcome was
-already retained. It deterministically tries the selected generated candidate and walks back
-through replayable ancestors to the immutable organizer-FM fallback. An exact retry verifies and
-returns the already published closed bundle; it does not overwrite it.
-
-`replay` accepts only a closed final bundle, verified canonical data, and the exact frozen data
-SHA-256. The trusted loader verifies the closed member inventory and SHA-bound allowlisted replay
-recipe before rebuilding label-free capabilities. Bundle-controlled import paths, shell commands,
-or arbitrary Python backends are never executed. An exact retry must reproduce the same immutable
-bundle and submission identities.
+Legacy bundle `replay` accepts only a closed final bundle, verified canonical data, and the exact
+frozen data SHA-256. The trusted loader verifies the closed member inventory and SHA-bound
+allowlisted replay recipe before rebuilding label-free capabilities. Bundle-controlled import
+paths, shell commands, or arbitrary Python backends are never executed. An exact retry must
+reproduce the same immutable bundle and submission identities.
 
 `status` is read-only and never reconciles or mutates a campaign.
 
@@ -189,14 +209,14 @@ predictions, and the immutable seed-4 fallback. The run directory must be new. I
 qualification evidence already exists, reuse it; do not rerun qualification merely to recreate a
 directory name.
 
-## Run the full autonomous campaign
+## Full autonomous campaign gate
 
-The convenience launcher synchronizes the exact tree-only environment, loads an ignored local API
-key file when present, and defaults to the frozen live-provider full-data configuration and
-official qualification directory. A full run can consume API credits and up to six hours, so
-launch it only when that spend and runtime are intended:
+Production cutover is not available in this reconstruction. The public mutating command surface
+has one authority: `compete` writes through `StateRepository`. The legacy `run`, `resume`, and
+`finalize` commands no longer drive `CampaignEngine` or its run-local stores; each exits nonzero
+with migration guidance. `scripts/run_full_campaign.sh` therefore also stops at that guard.
 
-First validate the frozen provider settings and credential without sending an API request:
+You can still validate frozen provider settings and credentials without sending an API request:
 
 ```bash
 set -a
@@ -207,82 +227,10 @@ UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research
 ```
 
 Successful output explicitly records `"api_request_sent": false`; it names the credential
-environment variable but never prints its value.
-
-Then, when API spend and the bounded full campaign are intended:
-
-```bash
-scripts/run_full_campaign.sh
-```
-
-Its complete interface is:
-
-```text
-scripts/run_full_campaign.sh [CONFIG_PATH [QUALIFICATION_RUN_DIR [RUN_DIR]]]
-```
-
-For an explicit new campaign path:
-
-```bash
-scripts/run_full_campaign.sh \
-  configs/full-pure.toml \
-  runs/wp3-official-qualification \
-  runs/full-pure
-```
-
-The equivalent direct command is:
-
-```bash
-set -a
-. ./.env.local
-set +a
-UV_CACHE_DIR=.uv-cache uv sync --locked --group research-tree --no-group research-neural
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
-  kuairand-agent run \
-  --config configs/full-pure.toml \
-  --qualification-run-dir runs/wp3-official-qualification \
-  --run-dir runs/full-pure
-```
-
-Configuration paths are interpreted relative to the invoking working directory. Run from the
-repository root unless intentionally supplying another complete project root. The default
-configuration enforces one process, four CPU threads, a 16 GiB memory ceiling, a 20 GiB disk
-ceiling, 50 total training launches, at most six distinct public promotions, a six-hour hard
-deadline, and a protected one-hour finalization reserve.
-
-If the process is interrupted, inspect without mutation and then resume the same campaign:
-
-`SIGINT` and `SIGTERM` request cooperative cancellation. The runner stops at a durable stage or
-launch-admission boundary, preserves the original budget and deadline evidence, and exits
-nonzero; it does not publish a partial success result.
-
-```bash
-UV_CACHE_DIR=.uv-cache uv run --locked kuairand-agent status \
-  --run-dir runs/full-pure \
-  --json
-
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
-  kuairand-agent resume \
-  --run-dir runs/full-pure
-```
-
-If research closed durably but automatic finalization was interrupted, finalize from the retained
-outcome without invoking a research provider:
-
-```bash
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
-  kuairand-agent finalize \
-  --run-dir runs/full-pure
-```
-
-The final JSON result reports the selected candidate, fallback count, closed bundle root, bundle
-manifest SHA-256, submission SHA-256, organizer-check evidence, and replay evidence. Research
-evidence separately counts attempted branches, accepted proposal/implementation/repair responses,
-pre-execution rejections, candidate admissions, training starts, and completed inner/outer
-evaluations. It also preserves bounded root/terminal rejection summaries, provider-route switches,
-and retry-wait evidence, so an accepted provider response cannot be described as trained or
-evaluated. A baseline result is reported as `baseline_reproduced` and explicitly remains the
-protected official FM fallback, not an agent-generated improvement.
+environment variable but never prints its value. Enabling a full-data, provider-backed campaign
+requires a future `AutonomousExperimentLab` execution mode plus the Phase 6 hardware, runtime,
+protected-budget, and authorization gates. It must not be restored by re-enabling the legacy
+run-directory writers.
 
 ## Replay a closed final bundle
 
@@ -321,14 +269,14 @@ This is a structural check only. Hidden-test labels and scores remain organizer-
 Offline checks after the locked artifacts are present:
 
 ```bash
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural pytest -q
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
+UV_CACHE_DIR=.uv-cache uv run --locked --group tree-cpu --no-group research-neural pytest -q
+UV_CACHE_DIR=.uv-cache uv run --locked --group tree-cpu --no-group research-neural \
   ruff check src tests
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
+UV_CACHE_DIR=.uv-cache uv run --locked --group tree-cpu --no-group research-neural \
   ruff format --check src tests
-UV_CACHE_DIR=.uv-cache uv run --locked --group research-tree --no-group research-neural \
+UV_CACHE_DIR=.uv-cache uv run --locked --group tree-cpu --no-group research-neural \
   mypy src tests
-sh -n scripts/run_full_campaign.sh
+sh -n scripts/*.sh
 ```
 
 Full-data and optional performance/replay gates require the verified local archive or their

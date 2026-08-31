@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from kuairand_agent.data.audit import DataAuditReport
-from kuairand_agent.data.canonical import CanonicalDataset
+from kuairand_agent.data.canonical import CanonicalDataset, CanonicalFinalSplit
 
 ROOT = Path(__file__).parents[2]
 RUN_ENV = "KUAIRAND_COMPLETED_RUN_DIR"
@@ -84,7 +84,7 @@ def test_completed_campaign_and_closed_bundle_replay_are_exact_and_label_free(
     assert replay_manifest["network_used"] is False
     assert replay_manifest["final_outcomes_accessed"] is False
     assert replay_manifest["final_outcomes_scored"] is False
-    assert official_dataset.final.targets is None
+    assert isinstance(official_dataset.final, CanonicalFinalSplit)
     assert official_dataset.final.outcome_trace.parsed_cell_count == 0
     assert official_audit.final_outcome_trace.manifest()["outcome_cells_scored"] == 0
 

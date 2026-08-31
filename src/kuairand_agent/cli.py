@@ -12,7 +12,6 @@ from typing import Final
 
 from kuairand_agent import __version__
 from kuairand_agent.campaign import CampaignControllerError, CampaignEngine, CampaignStatus
-from kuairand_agent.campaign.provenance import ProvenanceError, build_campaign_request
 from kuairand_agent.config import (
     ConfigError,
     OpenAIFailoverResearchConfig,
@@ -33,7 +32,12 @@ from kuairand_agent.scoring.submission import AlignmentRow, SubmissionError, rea
 EXIT_INVALID: Final = 2
 EXIT_CONTRACT: Final = 3
 DEFAULT_QUALIFICATION_RUN_DIR: Final = Path("runs/wp3-official-qualification")
-DEFAULT_CAMPAIGN_ROOT: Final = Path("runs")
+LEGACY_MUTATION_ERROR: Final = (
+    "run-directory campaign mutation is disabled because it bypasses the StateRepository "
+    "authority; start or retry work with 'kuairand-agent compete --config CONFIG "
+    "--state-root STATE_ROOT --run-root RUN_ROOT', then use 'inspect' or 'replay' with the "
+    "returned campaign id"
+)
 
 
 def _stable_json(value: object) -> str:
@@ -275,8 +279,6 @@ def _validate_submission(args: argparse.Namespace) -> int:
     try:
         dataset = load_canonical_dataset(args.data_dir)
         split = dataset.valid if args.split == "valid" else dataset.final
-        if args.split == "test" and split.targets is not None:
-            raise SubmissionError("final split unexpectedly exposes a target capability")
         alignment = tuple(
             AlignmentRow(row_id, user_id, video_id)
             for row_id, user_id, video_id in zip(
@@ -321,42 +323,107 @@ def _absolute_cli_path(path: Path) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
 
 
-def _drive_provider_free_campaign(
-    run_dir: Path,
-    *,
-    project_root: Path,
-    engine: CampaignEngine,
-    cancel_event: threading.Event,
-) -> object:
-    """Enter the fixed trusted production facade without widening its capability surface."""
+def _compete(args: argparse.Namespace) -> int:
+    """Enter the production-shaped facade and fail closed on missing admission evidence."""
 
-    from kuairand_agent.campaign.full_campaign import run_provider_free_campaign
-
-    return run_provider_free_campaign(
-        run_dir,
-        project_root=project_root,
-        engine=engine,
-        cancel_event=cancel_event,
+    from kuairand_agent.lab import (
+        AutonomousExperimentLab,
+        CampaignOptions,
+        LabError,
     )
+    from kuairand_agent.resource_profiles import ResourceProfileError, load_resource_profile
+
+    repository_root = Path.cwd().resolve(strict=True)
+    config_path = _absolute_cli_path(args.config)
+    try:
+        profile = load_resource_profile(config_path)
+        requested_profile = args.profile or profile.name
+        lab = AutonomousExperimentLab.open(
+            repository_root=repository_root,
+            state_root=_absolute_cli_path(args.state_root),
+            run_root=_absolute_cli_path(args.run_root),
+            profile=requested_profile,
+        )
+        key = args.idempotency_key or f"cli:{_absolute_cli_path(args.run_root)}"
+        result = lab.compete(
+            options=CampaignOptions(config_path=config_path),
+            idempotency_key=key,
+        )
+    except (LabError, ResourceProfileError, OSError, RuntimeError) as exc:
+        print(f"LAB_COMPETE_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    print(_stable_json(result.manifest()))
+    return 0
 
 
-def _finalize_provider_free_campaign(
-    run_dir: Path,
-    *,
-    project_root: Path,
-    engine: CampaignEngine,
-    cancel_event: threading.Event,
-) -> object:
-    """Delegate all campaign-to-finalization reconstruction to the trusted facade."""
+def _inspect_lab(args: argparse.Namespace) -> int:
+    """Inspect only the SQLite authority; never reconcile or rebuild projections."""
 
-    from kuairand_agent.finalization.production import finalize_provider_free_campaign
+    from kuairand_agent.lab import AutonomousExperimentLab, LabError
+    from kuairand_agent.state.projections import ProjectionError
+    from kuairand_agent.state.repository import StateError
 
-    return finalize_provider_free_campaign(
-        run_dir,
-        project_root=project_root,
-        engine=engine,
-        cancel_event=cancel_event,
-    )
+    try:
+        repository_root = Path.cwd().resolve(strict=True)
+        lab = AutonomousExperimentLab.open(
+            repository_root=repository_root,
+            state_root=_absolute_cli_path(args.state_root),
+            run_root=repository_root / "runs",
+            profile="cpu",
+        )
+        snapshot = lab.inspect(campaign_id=args.campaign_id)
+    except (LabError, ProjectionError, StateError, OSError, RuntimeError) as exc:
+        print(f"LAB_INSPECT_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    if args.json:
+        print(_stable_json(snapshot))
+    else:
+        campaign = snapshot.get("campaign")
+        if not isinstance(campaign, Mapping):
+            print("LAB_INSPECT_FAILED: authority projection has no campaign", file=sys.stderr)
+            return EXIT_CONTRACT
+        print(
+            f"{campaign.get('campaign_id')}: {campaign.get('state')}; "
+            f"revision {campaign.get('revision')}"
+        )
+    return 0
+
+
+def _validate_lab_bundle(args: argparse.Namespace) -> int:
+    """Validate one sealed bundle without opening or mutating campaign state."""
+
+    from kuairand_agent.lab import AutonomousExperimentLab, LabError
+
+    try:
+        result = AutonomousExperimentLab.validate_bundle(_absolute_cli_path(args.bundle))
+    except (LabError, OSError, RuntimeError) as exc:
+        print(f"BUNDLE_VALIDATION_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    print(_stable_json(result.manifest()))
+    return 0
+
+
+def _replay_lab(args: argparse.Namespace) -> int:
+    """Verify a named replay grade from the new authority and exact bundle."""
+
+    from kuairand_agent.lab import AutonomousExperimentLab, LabError
+    from kuairand_agent.state.projections import ProjectionError
+    from kuairand_agent.state.repository import StateError
+
+    try:
+        repository_root = Path.cwd().resolve(strict=True)
+        lab = AutonomousExperimentLab.open(
+            repository_root=repository_root,
+            state_root=_absolute_cli_path(args.state_root),
+            run_root=repository_root / "runs",
+            profile="cpu",
+        )
+        result = lab.replay(campaign_id=args.campaign_id, grade=args.grade)
+    except (LabError, ProjectionError, StateError, OSError, RuntimeError) as exc:
+        print(f"LAB_REPLAY_FAILED: {exc}", file=sys.stderr)
+        return EXIT_CONTRACT
+    print(_stable_json(result.manifest()))
+    return 0
 
 
 def _replay_final_bundle(
@@ -400,55 +467,38 @@ def _status(args: argparse.Namespace) -> int:
 
 
 def _resume(args: argparse.Namespace) -> int:
-    """Reconcile abandoned executions and continue the original durable campaign."""
+    """Fail closed rather than resume through the retired run-directory authority."""
 
-    project_root = Path.cwd().resolve(strict=True)
-    run_dir = _absolute_cli_path(args.run_dir)
-    engine = CampaignEngine()
-    try:
-        with cancellation_on_signals() as cancel_event:
-            _drive_provider_free_campaign(
-                run_dir,
-                project_root=project_root,
-                engine=engine,
-                cancel_event=cancel_event,
-            )
-            finalized = _finalize_provider_free_campaign(
-                run_dir,
-                project_root=project_root,
-                engine=engine,
-                cancel_event=cancel_event,
-            )
-    except (CampaignControllerError, OSError, RuntimeError) as exc:
-        print(f"CAMPAIGN_RESUME_FAILED: {exc}", file=sys.stderr)
-        return EXIT_CONTRACT
-    print(_stable_json(_result_manifest(finalized, location="campaign finalization")))
-    return 0
+    del args
+    print(f"LEGACY_CAMPAIGN_COMMAND_DISABLED: resume: {LEGACY_MUTATION_ERROR}", file=sys.stderr)
+    return EXIT_CONTRACT
 
 
 def _finalize(args: argparse.Namespace) -> int:
-    """Finalize the strictly retained outcome, walking back to the official FM if needed."""
+    """Fail closed rather than finalize through the retired run-directory authority."""
 
-    project_root = Path.cwd().resolve(strict=True)
-    run_dir = _absolute_cli_path(args.run_dir)
-    try:
-        with cancellation_on_signals() as cancel_event:
-            finalized = _finalize_provider_free_campaign(
-                run_dir,
-                project_root=project_root,
-                engine=CampaignEngine(),
-                cancel_event=cancel_event,
-            )
-        payload = _result_manifest(finalized, location="campaign finalization")
-    except (CampaignControllerError, OSError, RuntimeError) as exc:
-        print(f"CAMPAIGN_FINALIZE_FAILED: {exc}", file=sys.stderr)
-        return EXIT_CONTRACT
-    print(_stable_json(payload))
-    return 0
+    del args
+    print(f"LEGACY_CAMPAIGN_COMMAND_DISABLED: finalize: {LEGACY_MUTATION_ERROR}", file=sys.stderr)
+    return EXIT_CONTRACT
 
 
 def _replay(args: argparse.Namespace) -> int:
     """Replay a closed SHA-bound bundle with canonical label-free capabilities."""
+
+    if getattr(args, "campaign_id", None) is not None:
+        return _replay_lab(args)
+    if (
+        args.bundle is None
+        or args.project_root is None
+        or args.data_dir is None
+        or args.expected_data_sha256 is None
+    ):
+        print(
+            "CAMPAIGN_REPLAY_FAILED: legacy bundle replay requires --bundle, "
+            "--project-root, --data-dir, and --expected-data-sha256",
+            file=sys.stderr,
+        )
+        return EXIT_INVALID
 
     try:
         with cancellation_on_signals() as cancel_event:
@@ -467,74 +517,12 @@ def _replay(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolved_from(root: Path, path: Path) -> Path:
-    candidate = path if path.is_absolute() else root / path
-    return candidate.resolve(strict=False)
-
-
 def _run(args: argparse.Namespace) -> int:
-    """Create, drive, and deterministically finalize one new qualified campaign."""
+    """Fail closed rather than create state in the retired run-directory authority."""
 
-    try:
-        config = load_config(args.config)
-    except ConfigError as exc:
-        print(f"CONFIG_INVALID: {exc}", file=sys.stderr)
-        return EXIT_INVALID
-    try:
-        repository_root = Path.cwd().resolve(strict=True)
-        data_dir = _resolved_from(repository_root, config.benchmark.data_dir)
-        dataset = load_canonical_dataset(data_dir)
-        if dataset.final.targets is not None:
-            raise CanonicalDataError("final split unexpectedly exposes a target capability")
-        run_dir_arg: Path | None = args.run_dir
-        run_dir = (
-            _resolved_from(repository_root, run_dir_arg)
-            if run_dir_arg is not None
-            else repository_root / DEFAULT_CAMPAIGN_ROOT / f"campaign-{config.digest[:12]}"
-        )
-        qualification_run_dir = _resolved_from(
-            repository_root,
-            args.qualification_run_dir,
-        )
-        provenance = build_campaign_request(
-            repository_root=repository_root,
-            run_dir=run_dir,
-            qualification_run_dir=qualification_run_dir,
-            config=config,
-            dataset_manifest_digest=dataset.digest,
-        )
-        engine = CampaignEngine()
-        engine.create(provenance.request)
-    except (
-        CampaignControllerError,
-        CanonicalDataError,
-        OrganizerIntegrityError,
-        ProvenanceError,
-        OSError,
-        RuntimeError,
-    ) as exc:
-        print(f"CAMPAIGN_CREATE_FAILED: {exc}", file=sys.stderr)
-        return EXIT_CONTRACT
-    try:
-        with cancellation_on_signals() as cancel_event:
-            _drive_provider_free_campaign(
-                run_dir,
-                project_root=repository_root,
-                engine=engine,
-                cancel_event=cancel_event,
-            )
-            finalized = _finalize_provider_free_campaign(
-                run_dir,
-                project_root=repository_root,
-                engine=engine,
-                cancel_event=cancel_event,
-            )
-        payload = _result_manifest(finalized, location="campaign finalization")
-    except (CampaignControllerError, OSError, RuntimeError) as exc:
-        print(f"CAMPAIGN_RUN_FAILED: {exc}", file=sys.stderr)
-        return EXIT_CONTRACT
-    print(_stable_json(payload))
-    return 0
+    del args
+    print(f"LEGACY_CAMPAIGN_COMMAND_DISABLED: run: {LEGACY_MUTATION_ERROR}", file=sys.stderr)
+    return EXIT_CONTRACT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -567,7 +555,37 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--starter-dir", type=Path, default=Path("kuairand-starter-kit"))
     qualify.set_defaults(handler=_qualify, command_path=("qualify",))
 
-    run = commands.add_parser("run", help="create and drive a new campaign")
+    compete = commands.add_parser(
+        "compete",
+        help="enter the autonomous laboratory's production admission gate",
+    )
+    compete.add_argument("--config", required=True, type=Path)
+    compete.add_argument("--state-root", type=Path, default=Path(".kuairand"))
+    compete.add_argument("--run-root", required=True, type=Path)
+    compete.add_argument(
+        "--profile",
+        choices=("cpu", "gpu", "competition-cpu", "competition-gpu"),
+        help="optional explicit check against the profile named by --config",
+    )
+    compete.add_argument(
+        "--idempotency-key",
+        help="stable retry key (default: the absolute --run-root path)",
+    )
+    compete.set_defaults(handler=_compete, command_path=("compete",))
+
+    inspect = commands.add_parser(
+        "inspect",
+        help="read a laboratory campaign from the SQLite authority without mutation",
+    )
+    inspect.add_argument("--state-root", type=Path, default=Path(".kuairand"))
+    inspect.add_argument("--campaign-id", required=True, type=_sha256_argument)
+    inspect.add_argument("--json", action="store_true")
+    inspect.set_defaults(handler=_inspect_lab, command_path=("inspect",))
+
+    run = commands.add_parser(
+        "run",
+        help="legacy parser compatibility only; use compete for StateRepository campaigns",
+    )
     run.add_argument("--config", required=True, type=Path)
     run.add_argument(
         "--qualification-run-dir",
@@ -582,7 +600,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.set_defaults(handler=_run, command_path=("run",))
 
-    resume = commands.add_parser("resume", help="reconcile and continue a campaign")
+    resume = commands.add_parser(
+        "resume",
+        help="legacy parser compatibility only; retry the original compete command",
+    )
     resume.add_argument("--run-dir", required=True, type=Path)
     resume.set_defaults(handler=_resume, command_path=("resume",))
 
@@ -591,16 +612,47 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=_status, command_path=("status",))
 
-    finalize = commands.add_parser("finalize", help="stop research and finalize deterministically")
+    finalize = commands.add_parser(
+        "finalize",
+        help="legacy parser compatibility only; compete owns atomic finalization",
+    )
     finalize.add_argument("--run-dir", required=True, type=Path)
     finalize.set_defaults(handler=_finalize, command_path=("finalize",))
 
-    replay = commands.add_parser("replay", help="replay a frozen final bundle without a provider")
-    replay.add_argument("--bundle", required=True, type=Path)
-    replay.add_argument("--project-root", required=True, type=Path)
-    replay.add_argument("--data-dir", required=True, type=Path)
-    replay.add_argument("--expected-data-sha256", required=True, type=_sha256_argument)
+    replay = commands.add_parser(
+        "replay",
+        help="replay either a legacy bundle or a campaign in the new laboratory authority",
+    )
+    replay_source = replay.add_mutually_exclusive_group(required=True)
+    replay_source.add_argument("--bundle", type=Path)
+    replay_source.add_argument("--campaign-id", type=_sha256_argument)
+    replay.add_argument("--project-root", type=Path)
+    replay.add_argument("--data-dir", type=Path)
+    replay.add_argument("--expected-data-sha256", type=_sha256_argument)
+    replay.add_argument("--state-root", type=Path, default=Path(".kuairand"))
+    replay.add_argument(
+        "--grade",
+        choices=(
+            "experiment-same-backend",
+            "scoring-exact",
+            "bundle-exact",
+            "EXPERIMENT_SAME_BACKEND",
+            "SCORING_EXACT",
+            "BUNDLE_EXACT",
+        ),
+        default="experiment-same-backend",
+    )
     replay.set_defaults(handler=_replay, command_path=("replay",))
+
+    validate_bundle = commands.add_parser(
+        "validate-bundle",
+        help="verify exact bundle membership, hashes, and BundleId without state writes",
+    )
+    validate_bundle.add_argument("--bundle", required=True, type=Path)
+    validate_bundle.set_defaults(
+        handler=_validate_lab_bundle,
+        command_path=("validate-bundle",),
+    )
 
     validate = commands.add_parser(
         "validate-submission", help="validate a high-precision aligned submission"

@@ -1,0 +1,37 @@
+schema_version = 1
+
+[scientific_policy]
+policy_version = "competition-scientific-v1"
+benchmark = "kuairand-pure"
+target = "long_view"
+primary_metric = "(GAUC+nDCG@5)/2"
+strict_past_features = true
+inner_folds = ["20220416:20220418", "20220419:20220421"]
+confirmation_seeds = [0, 1, 2]
+practical_improvement_margin = 0.002
+convergence_patience = 3
+global_protected_evaluation_limit = 6
+final_period_outcomes_accessible = false
+required_replay_grades = ["SCORING_EXACT", "BUNDLE_EXACT"]
+
+[resource_profile]
+name = "competition-gpu"
+preferred_backend = "lightgbm-gpu"
+device = "gpu"
+dependency_group = "tree-gpu"
+wall_clock_seconds = 21600
+finalization_reserve_seconds = 3600
+latest_training_launch_seconds = 18000
+max_candidate_processes = 1
+threads_per_candidate = 4
+candidate_rss_target_mb = 12288
+process_tree_rss_hard_cap_mb = 14336
+candidate_disk_hard_cap_mb = 20480
+planned_full_scientific_screens = 8
+planned_frozen_finalists = 2
+planned_protected_evaluations = 2
+requires_measured_p95 = true
+in_attempt_device_fallback = false
+gpu_probe_allowed = true
+verified_gpu_build_required = true
+stock_lightgbm_gpu_qualified = false

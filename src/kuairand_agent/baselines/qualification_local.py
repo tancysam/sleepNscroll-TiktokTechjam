@@ -63,6 +63,7 @@ from kuairand_agent.data.audit import DataAuditReport, audit_dataset
 from kuairand_agent.data.canonical import (
     OUTCOME_FIELDS,
     CanonicalDataset,
+    CanonicalFinalSplit,
     CanonicalInputs,
     ProtectedTargets,
     TrainingTargets,
@@ -270,7 +271,7 @@ def _validate_data_identity(report: DataAuditReport, dataset: CanonicalDataset) 
         raise QualificationError("audit recorded skipped final-period values")
 
     canonical_trace = dataset.final.outcome_trace
-    if dataset.final.targets is not None:
+    if not isinstance(dataset.final, CanonicalFinalSplit):
         raise QualificationError("canonical final split unexpectedly exposes targets")
     if canonical_trace.parsed_fields:
         raise QualificationError("canonical final loader parsed an outcome field")
@@ -1031,7 +1032,7 @@ class LocalQualificationBackend:
     ) -> FinalPredictionEvidence:
         payload = _payload(snapshot)
         _require_starter(payload)
-        if payload.dataset.final.targets is not None:
+        if not isinstance(payload.dataset.final, CanonicalFinalSplit):
             raise QualificationError("final inference refuses a split with target capability")
         wall_started = time.perf_counter()
         cpu_started = time.process_time()

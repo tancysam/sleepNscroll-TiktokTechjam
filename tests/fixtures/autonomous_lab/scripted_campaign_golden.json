@@ -1,0 +1,26 @@
+{
+  "artifact_roles_required": [
+    "implementation_transcript",
+    "proposal_transcript",
+    "reflection_transcript",
+    "repair_transcript",
+    "source_diff",
+    "source_manifest"
+  ],
+  "best_primary": 1.0,
+  "completed_iterations": 2,
+  "evaluator_calls": 2,
+  "execution_count": 3,
+  "failure_categories_required": ["runtime_error", "syntax_error"],
+  "fallback_candidate_id": "fm-fallback",
+  "fixture": "tests.support.scripted_campaign:run_scripted_three_iteration_acceptance",
+  "incumbent_id": "iteration-02-repair-1",
+  "incumbent_primary": 1.0,
+  "launches_used": 3,
+  "operations_required": ["evaluate", "implement", "propose", "reflect", "repair", "run"],
+  "repairs": [0, 1, 0],
+  "schema_version": 1,
+  "selected_candidate_id": "iteration-02-repair-1",
+  "statuses": ["promoted", "promoted", "failed"],
+  "trusted_evaluation_present": [true, true, false]
+}

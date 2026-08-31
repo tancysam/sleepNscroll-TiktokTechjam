@@ -38,9 +38,7 @@ def _fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return features, targets, user_groups
 
 
-def test_protected_pointwise_ranker_is_deterministic_replayable_and_frozen_to_82_columns() -> (
-    None
-):
+def test_protected_pointwise_ranker_is_deterministic_replayable_and_frozen_to_82_columns() -> None:
     features, targets, groups = _fixture()
     kwargs = {
         "pairs_per_epoch": 8192,

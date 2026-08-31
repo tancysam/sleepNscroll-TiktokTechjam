@@ -689,9 +689,7 @@ class PureFeaturePair:
             )
         if self.feature_schema_version >= 8:
             if not isinstance(self.input_exposure, StrictPastExposurePair):
-                raise PureFeatureError(
-                    "schema-v8 input_exposure must be a StrictPastExposurePair"
-                )
+                raise PureFeatureError("schema-v8 input_exposure must be a StrictPastExposurePair")
             width = len(STRICT_PAST_EXPOSURE_FEATURE_NAMES)
             if (
                 self.prefix.feature_names[-width:] != STRICT_PAST_EXPOSURE_FEATURE_NAMES

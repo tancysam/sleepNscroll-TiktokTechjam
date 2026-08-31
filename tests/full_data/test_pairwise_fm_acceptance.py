@@ -17,7 +17,12 @@ from kuairand_agent.candidates.pairwise_fm import (
     PairwiseFMTrainingData,
 )
 from kuairand_agent.data.audit import DataAuditReport
-from kuairand_agent.data.canonical import CanonicalDataset, ProtectedTargets, TrainingTargets
+from kuairand_agent.data.canonical import (
+    CanonicalDataset,
+    CanonicalFinalSplit,
+    ProtectedTargets,
+    TrainingTargets,
+)
 from kuairand_agent.data.capabilities import DataPhase
 from kuairand_agent.scoring.protected import Alignment, ProtectedScorer, SplitIdentity
 
@@ -66,7 +71,7 @@ def test_pairwise_fm_objective_and_sampler_run_on_verified_official_data(
     valid = official_dataset.valid
     assert isinstance(train.targets, TrainingTargets)
     assert isinstance(valid.targets, ProtectedTargets)
-    assert official_dataset.final.targets is None
+    assert isinstance(official_dataset.final, CanonicalFinalSplit)
     assert official_audit.final_outcome_trace.manifest()["outcome_cells_scored"] == 0
 
     encoding = StarterEncoding.fit(train.inputs)

@@ -187,6 +187,7 @@ def test_runner_workspace_executor_trains_predicts_and_exactly_replays(
     )
 
     with monkeypatch.context() as validation_patch:
+
         def fail_train_validation(*_args: object, **_kwargs: object) -> None:
             raise ValueError("checkpoint manifest names the wrong path")
 

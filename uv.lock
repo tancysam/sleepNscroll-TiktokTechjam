@@ -165,6 +165,9 @@ research-neural = [
 research-tree = [
     { name = "lightgbm" },
 ]
+tree-cpu = [
+    { name = "lightgbm" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -181,6 +184,8 @@ dev = [
 ]
 research-neural = [{ name = "torch", specifier = "==2.13.0" }]
 research-tree = [{ name = "lightgbm", specifier = "==4.7.0" }]
+tree-cpu = [{ name = "lightgbm", specifier = "==4.7.0" }]
+tree-gpu = []
 
 [[package]]
 name = "librt"

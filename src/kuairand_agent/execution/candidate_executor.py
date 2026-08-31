@@ -668,8 +668,7 @@ class GeneratedCandidateExecutor:
                 journal=journal,
                 workspace=workspace,
                 diagnostic=(
-                    "generated training output validation failed: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"generated training output validation failed: {type(exc).__name__}: {exc}"
                 ),
             ) from exc
         entries = self._base_artifacts(result)
@@ -785,8 +784,7 @@ class GeneratedCandidateExecutor:
                 journal=journal,
                 workspace=workspace,
                 diagnostic=(
-                    "generated prediction output validation failed: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"generated prediction output validation failed: {type(exc).__name__}: {exc}"
                 ),
             ) from exc
         entries = self._base_artifacts(result)

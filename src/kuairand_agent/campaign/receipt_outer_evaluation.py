@@ -199,9 +199,7 @@ class ReceiptAwareOuterEvaluationLedger:
         completion: OuterPromotionCompletion,
     ) -> None:
         if not isinstance(reservation, OuterPromotionReservation):
-            raise ReceiptAwareOuterEvaluationError(
-                "reservation must be OuterPromotionReservation"
-            )
+            raise ReceiptAwareOuterEvaluationError("reservation must be OuterPromotionReservation")
         if not isinstance(completion, OuterPromotionCompletion):
             raise ReceiptAwareOuterEvaluationError("completion must be OuterPromotionCompletion")
         request = self._requests.get(completion.request_digest)

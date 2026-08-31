@@ -53,6 +53,7 @@ from kuairand_agent.contract import SplitName
 from kuairand_agent.data.canonical import (
     OUTCOME_FIELDS,
     CanonicalDataset,
+    CanonicalFinalSplit,
     CanonicalInputs,
     ProtectedTargets,
     TrainingTargets,
@@ -1756,7 +1757,7 @@ def prepare_campaign_data_plane(
     # construction normally proves all of it already; repeat the facts at the orchestration seam
     # so a future alternate loader cannot silently broaden authority.
     final = dataset.final
-    if final.name is not SplitName.TEST or final.targets is not None:
+    if final.name is not SplitName.TEST or not isinstance(final, CanonicalFinalSplit):
         raise FullCampaignError("final split must be label-free")
     if final.outcome_trace.parsed_fields or final.outcome_trace.parsed_cell_count != 0:
         raise FullCampaignError("final-period outcomes were parsed during development")

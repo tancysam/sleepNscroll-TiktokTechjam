@@ -54,9 +54,7 @@ def validate_model_generated_overlay(package: GeneratedPackage) -> None:
     if not isinstance(package, GeneratedPackage):
         raise CandidateMaterializationError("package must be a GeneratedPackage")
     try:
-        CANDIDATE_RUNTIME_CONTRACT.validate_overlay_paths(
-            value.path for value in package.files
-        )
+        CANDIDATE_RUNTIME_CONTRACT.validate_overlay_paths(value.path for value in package.files)
     except CandidateRuntimeContractError as exc:
         raise CandidateMaterializationError(str(exc)) from exc
 

@@ -10,7 +10,7 @@ from tests.support.scripted_campaign import run_scripted_three_iteration_accepta
 ROOT = Path(__file__).parents[2]
 
 
-def test_verified_data_gate_includes_three_iteration_failure_and_recovery_campaign(
+def test_verified_data_gate_includes_three_attempt_failure_and_recovery_campaign(
     tmp_path: Path,
     official_audit: DataAuditReport,
     official_dataset: CanonicalDataset,
@@ -21,8 +21,8 @@ def test_verified_data_gate_includes_three_iteration_failure_and_recovery_campai
     failures must never be manufactured inside a scored official-data run.  Requiring the official
     audit fixture here proves this controller gate is exercised in the same qualified acceptance
     invocation as the real-data model tests, while the fixture independently verifies three
-    scientific iterations, one syntax repair, one failed material runtime child, protected
-    scoring, reflection, durable failure records, and incumbent preservation.
+    attempts, two completed scientific iterations, one syntax repair, one failed material runtime
+    child, protected scoring, reflection, durable failure records, and incumbent preservation.
     """
 
     assert official_audit.final_outcome_trace.manifest()["outcome_cells_scored"] == 0
@@ -44,7 +44,8 @@ def test_verified_data_gate_includes_three_iteration_failure_and_recovery_campai
     assert evidence.incumbent_id == "iteration-02-repair-1"
     assert evidence.incumbent_primary == 1.0
     assert evidence.launches_used == 3
-    assert evidence.completed_iterations == 3
+    # Infrastructure failures are durable attempt evidence, not completed scientific losses.
+    assert evidence.completed_iterations == 2
     assert evidence.best_primary == 1.0
     assert {"propose", "implement", "repair", "run", "evaluate", "reflect"} <= (evidence.operations)
     assert {

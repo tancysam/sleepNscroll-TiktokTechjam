@@ -223,13 +223,12 @@ class _StrictSelector:
         incumbent_primary: float | None,
         candidate: CandidateEvidence,
     ) -> SelectionDecision:
+        candidate_primary = candidate.evaluation.summary.primary
         promote = (
             candidate.evaluation.eligible
             and candidate.evaluation.replay_verified
-            and (
-                incumbent_primary is None
-                or candidate.evaluation.summary.primary > incumbent_primary
-            )
+            and candidate_primary is not None
+            and (incumbent_primary is None or candidate_primary > incumbent_primary)
         )
         return SelectionDecision(
             promote=promote,

@@ -1048,9 +1048,7 @@ def _research_context_evidence(
                         "train_reference_duration_pairwise_fm(features, targets, user_groups, "
                         "*, seed)"
                     ),
-                    "predict_function": (
-                        "reference_observed_pair_fm_scores(features, checkpoint)"
-                    ),
+                    "predict_function": ("reference_observed_pair_fm_scores(features, checkpoint)"),
                     "duration_feature_position_zero_based": 46,
                     "duration_bucket_edges_seconds_csv": "5,10,18,30,60",
                     "treatment_pair_policy": (
@@ -1071,9 +1069,7 @@ def _research_context_evidence(
                         "retain as experimental specialist only: positive mean evidence did not "
                         "pass the worst-cell robustness gate"
                     ),
-                    "evidence_report": (
-                        "docs/research/observed_pair_duration_pilot-20260830.md"
-                    ),
+                    "evidence_report": ("docs/research/observed_pair_duration_pilot-20260830.md"),
                     "protected_from_generated_overlay": True,
                 },
             ),
@@ -1613,12 +1609,8 @@ def _research_context_evidence(
                     "train_function": (
                         "train_reference_pointwise_ranker(features, targets, user_groups, *, seed)"
                     ),
-                    "predict_function": (
-                        "reference_pointwise_ranker_scores(features, checkpoint)"
-                    ),
-                    "diagnostics_function": (
-                        "reference_pointwise_ranker_diagnostics(checkpoint)"
-                    ),
+                    "predict_function": ("reference_pointwise_ranker_scores(features, checkpoint)"),
+                    "diagnostics_function": ("reference_pointwise_ranker_diagnostics(checkpoint)"),
                     "checkpoint_prefixes_csv": "reference_,categorical_rank_,pointwise_",
                     "frozen_input_slice": "features[:, :82]",
                     "nested_categorical_video_type_policy": "neutral zero column",
@@ -1662,9 +1654,7 @@ def _research_context_evidence(
                         "train_reference_listnet_ranker(features, targets, user_groups, *, seed)"
                     ),
                     "predict_function": "reference_listnet_ranker_scores(features, checkpoint)",
-                    "diagnostics_function": (
-                        "reference_listnet_ranker_diagnostics(checkpoint)"
-                    ),
+                    "diagnostics_function": ("reference_listnet_ranker_diagnostics(checkpoint)"),
                     "checkpoint_prefixes_csv": "reference_,categorical_rank_,listwise_",
                     "frozen_input_slice": "features[:, :82]",
                     "nested_categorical_video_type_policy": "neutral zero column",
@@ -2072,9 +2062,7 @@ def _candidate_artifact_clears_deployment_gate(
     representative_metrics = representative_record.evidence.metrics
     if not isinstance(representative_metrics, OrganizerMetrics):
         return False
-    incumbent_seed_zero = tuple(
-        item for item in result.incumbent.outer_by_seed if item.seed == 0
-    )
+    incumbent_seed_zero = tuple(item for item in result.incumbent.outer_by_seed if item.seed == 0)
     if (
         len(incumbent_seed_zero) != 1
         or incumbent_seed_zero[0].metrics != representative_metrics
@@ -2441,11 +2429,7 @@ def _candidate_result_for(
 
 
 def _run_is_valid_scientific_evidence(run: ScientificRunEvidence) -> bool:
-    return (
-        run.metrics is not None
-        and run.gates.failures == ()
-        and run.replay_verified
-    )
+    return run.metrics is not None and run.gates.failures == () and run.replay_verified
 
 
 def _is_completed_scientific_rejection(candidate_result: CandidateCampaignResult) -> bool:
@@ -2471,15 +2455,11 @@ def _scientific_reflection_summary(
 
     candidate_result = _candidate_result_for(result, candidate_id=candidate_id)
     resource_run = (
-        None
-        if candidate_result is None or not candidate_result.runs
-        else candidate_result.runs[-1]
+        None if candidate_result is None or not candidate_result.runs else candidate_result.runs[-1]
     )
     runtime_seconds = None if resource_run is None else resource_run.resources.wall_seconds
     peak_memory_mb = (
-        None
-        if resource_run is None
-        else resource_run.resources.peak_rss_bytes / float(1024**2)
+        None if resource_run is None else resource_run.resources.peak_rss_bytes / float(1024**2)
     )
     outcome = None if candidate_result is None else candidate_result.outcome
     outer_outcomes = {
@@ -2614,9 +2594,7 @@ def _iteration_record(
             "candidate_reason": None if candidate_result is None else candidate_result.reason,
             "proposal_id": proposal_id,
             "proposal_family": family,
-            "proposal_family_blocked": (
-                proposal is not None and completed_scientific_rejection
-            ),
+            "proposal_family_blocked": (proposal is not None and completed_scientific_rejection),
             "proposal_objective": proposal_objective,
             "proposal_principal_change": proposal_principal_change,
             "proposal_mechanism": proposal_mechanism,

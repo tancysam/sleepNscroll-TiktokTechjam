@@ -112,15 +112,11 @@ def test_live_model_overlay_cannot_replace_stable_candidate_wrapper() -> None:
     with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
         validate_model_generated_overlay(package("reference_pairwise_fm.py", CHANGED_SOURCE))
     with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
-        validate_model_generated_overlay(
-            package("reference_categorical_ranker.py", CHANGED_SOURCE)
-        )
+        validate_model_generated_overlay(package("reference_categorical_ranker.py", CHANGED_SOURCE))
     with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
         validate_model_generated_overlay(package("reference_listnet_ranker.py", CHANGED_SOURCE))
     with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
-        validate_model_generated_overlay(
-            package("reference_observed_pair_fm.py", CHANGED_SOURCE)
-        )
+        validate_model_generated_overlay(package("reference_observed_pair_fm.py", CHANGED_SOURCE))
     with pytest.raises(CandidateMaterializationError, match="protected runtime file"):
         validate_model_generated_overlay(
             package("reference_observed_pair_objectives.py", CHANGED_SOURCE)

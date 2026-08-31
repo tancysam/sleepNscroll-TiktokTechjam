@@ -33,6 +33,7 @@ from kuairand_agent.data.canonical import (
     OUTCOME_FIELDS,
     CanonicalAlignment,
     CanonicalDataset,
+    CanonicalFinalSplit,
     CanonicalInputs,
     CanonicalSplit,
     OutcomeAccessTrace,
@@ -130,7 +131,7 @@ def test_data_plane_and_feature_bundle_never_create_a_final_target_capability() 
 
     assert tuple(fold.name for fold in prepared.folds.folds) == ("A", "B")
     assert prepared.final_inputs is dataset.final.inputs
-    assert dataset.final.targets is None
+    assert isinstance(dataset.final, CanonicalFinalSplit)
     assert dataset.final.outcome_trace.parsed_cell_count == 0
     assert features.fold_a.prefix.row_count == len(prepared.fold_a.prefix_inputs)
     assert features.fold_b.query.row_count == len(prepared.fold_b.query_inputs)
@@ -221,9 +222,7 @@ def test_research_context_evidence_contains_train_eda_and_input_only_late_period
     assert protected_pairwise["protected_from_generated_overlay"] is True
     assert protected_pairwise["metric_or_scorer_access"] is False
     assert "positive-ticket" in str(protected_pairwise["sampler"])
-    assert "sample_reference_logged_pairs" in str(
-        protected_pairwise["pair_sampler_function"]
-    )
+    assert "sample_reference_logged_pairs" in str(protected_pairwise["pair_sampler_function"])
     assert "row-index maps" in str(protected_pairwise["composition_policy"])
     duration_ablation = cards["protected_duration_conditioned_pair_ablation"].values
     assert duration_ablation["duration_feature_position_zero_based"] == 46
@@ -256,17 +255,13 @@ def test_research_context_evidence_contains_train_eda_and_input_only_late_period
     )
     attempt_15 = cards["historical_attempt_15_listnet_residual_plateau"].values
     assert attempt_15["execution_failures"] == 0
-    assert attempt_15["deep_cross_fold_a_primary_delta"] == pytest.approx(
-        0.0016562640666962
-    )
+    assert attempt_15["deep_cross_fold_a_primary_delta"] == pytest.approx(0.0016562640666962)
     metadata_probes = cards["train_only_static_metadata_probe_result"].values
     assert metadata_probes["production_schema_changed"] is True
     assert metadata_probes["enabled_feature_position_zero_based"] == 82
     assert metadata_probes["other_five_fields_enabled"] is False
     assert metadata_probes["public_validation_used"] is False
-    assert metadata_probes["video_type_fold_b_primary_delta"] == pytest.approx(
-        0.0017284750938416
-    )
+    assert metadata_probes["video_type_fold_b_primary_delta"] == pytest.approx(0.0017284750938416)
     attempt_16 = cards["historical_attempt_16_distinct_signal_result"].values
     assert attempt_16["execution_failures"] == 0
     assert attempt_16["three_way_fold_b_selected_lightgcn_weight"] == 0.0
@@ -276,9 +271,7 @@ def test_research_context_evidence_contains_train_eda_and_input_only_late_period
     attempt_17 = cards["historical_attempt_17_listnet_composition_result"].values
     assert attempt_17["execution_failures"] == 0
     assert attempt_17["malformed_retries"] == 0
-    assert attempt_17["causal_manifold_fold_a_primary_delta"] == pytest.approx(
-        0.0016940832138062
-    )
+    assert attempt_17["causal_manifold_fold_a_primary_delta"] == pytest.approx(0.0016940832138062)
     attempt_18 = cards["historical_attempt_18_standalone_result"].values
     assert attempt_18["execution_failures"] == 0
     assert attempt_18["query_set_attention_fold_b_primary_delta"] == 0.0

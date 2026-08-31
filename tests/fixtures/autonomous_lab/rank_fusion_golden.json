@@ -1,0 +1,16 @@
+{
+  "expected_scores_f64": [0.75, 0.5, 0.25, 0.375, 0.625],
+  "fixture": "tests.unit.test_grouping_and_fusion:test_rank_fusion_uses_only_frozen_grid_weights_and_has_exact_prediction_identity",
+  "fusion_digest": "cb3c821086a5363d11511c1156b036117624a122a513e43f92757794f9e89a47",
+  "members": [
+    [3.0, 2.0, 1.0, 9.0, 9.0],
+    [1.0, 2.0, 3.0, 0.0, 1.0]
+  ],
+  "phase": "final",
+  "prediction_digest": "26ed852fc159be2747adf88f3049e7041f09794cbba524c14d6c48d364b9ccca",
+  "schema_version": 1,
+  "tie_policy": "descending-average-rank; singleton=0.5",
+  "user_ids": ["u", "u", "u", "v", "v"],
+  "video_ids": ["dup", "middle", "dup", "x", "x"],
+  "weights": [0.75, 0.25]
+}

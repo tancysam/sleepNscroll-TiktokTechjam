@@ -20,6 +20,12 @@ from types import MappingProxyType
 from typing import Final, cast
 
 from kuairand_agent.contract import BENCHMARK_CONTRACT, SplitName
+from kuairand_agent.evaluation.protected import (
+    ProtectedEvidenceError as _ProtectedEvidenceError,
+)
+from kuairand_agent.evaluation.protected import (
+    ProtectedLabels as _ProtectedLabels,
+)
 
 CANONICAL_SCHEMA_VERSION: Final = 1
 STANDARD_LOG_FILENAMES: Final = (
@@ -418,37 +424,9 @@ class TrainingTargets:
             raise CanonicalDataError(f"unapproved training target {name!r}") from exc
 
 
-@dataclass(frozen=True, slots=True)
-class ProtectedTargets:
-    """Opaque public-validation labels intended only for the trusted scorer.
-
-    The class is deliberately non-iterable and has no generic ``column`` method, preventing
-    accidental reuse by a candidate capability builder.  Trusted scoring code must make the
-    explicit access decision expressed by :meth:`reveal_for_scorer`.
-    """
-
-    _long_view: Sequence[int] = field(repr=False)
-    digest: str = field(init=False)
-    access: TargetAccess = field(init=False, default=TargetAccess.PROTECTED_SCORER)
-
-    def __post_init__(self) -> None:
-        values = _canonical_int_sequence(cast(Sequence[object], self._long_view), PRIMARY_TARGET)
-        if any(value not in (0, 1) for value in values):
-            raise CanonicalDataError("protected long_view must be binary")
-        object.__setattr__(self, "_long_view", values)
-        object.__setattr__(
-            self,
-            "digest",
-            _digest_columns(b"kuairand-protected-outer-targets-v1", ((PRIMARY_TARGET, values),)),
-        )
-
-    def __len__(self) -> int:
-        return len(self._long_view)
-
-    def reveal_for_scorer(self) -> tuple[int, ...]:
-        """Return labels after the caller has entered the trusted scorer path."""
-
-        return cast(tuple[int, ...], self._long_view)
+# Compatibility import for trusted legacy adapters.  The class itself is owned by evaluation so
+# protected labels cannot gradually acquire candidate-facing data behavior in this module.
+ProtectedTargets = _ProtectedLabels
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,39 +469,25 @@ class OutcomeAccessTrace:
 
 
 @dataclass(frozen=True, slots=True)
-class CanonicalSplit:
-    """One immutable organizer split with inputs, targets, and alignment separated."""
+class _CanonicalSplitBase:
+    """Common value-free split identity; subclasses define phase-specific label capability."""
 
     name: SplitName
     inputs: CanonicalInputs
     alignment: CanonicalAlignment
-    targets: TrainingTargets | ProtectedTargets | None
     outcome_trace: OutcomeAccessTrace
     digest: str = field(init=False)
 
-    def __post_init__(self) -> None:
+    def _seal(self, *, expected_name: SplitName, target_digest: str) -> None:
+        if self.name is not expected_name:
+            raise CanonicalDataError(
+                f"{type(self).__name__} requires the {expected_name.value} split"
+            )
         count = len(self.inputs)
-        if self.alignment.split != self.name or self.outcome_trace.split != self.name:
+        if self.alignment.split is not self.name or self.outcome_trace.split is not self.name:
             raise CanonicalDataError("split identity differs across canonical components")
         if len(self.alignment) != count or self.outcome_trace.row_count != count:
             raise CanonicalDataError("canonical split component row counts differ")
-        expected_target_type: type[TrainingTargets] | type[ProtectedTargets] | None
-        if self.name is SplitName.TRAIN:
-            expected_target_type = TrainingTargets
-        elif self.name is SplitName.VALID:
-            expected_target_type = ProtectedTargets
-        else:
-            expected_target_type = None
-        if expected_target_type is None:
-            if self.targets is not None:
-                raise CanonicalDataError("final split must not contain targets")
-            target_digest = "no-final-targets"
-        elif not isinstance(self.targets, expected_target_type):
-            raise CanonicalDataError(f"{self.name.value} split has the wrong target capability")
-        else:
-            if len(self.targets) != count:
-                raise CanonicalDataError("canonical split and target row counts differ")
-            target_digest = self.targets.digest
         if self.inputs.user_id != self.alignment.user_id:
             raise CanonicalDataError("input and alignment user order differ")
         if self.inputs.video_id != self.alignment.video_id:
@@ -560,7 +524,7 @@ class CanonicalSplit:
     def split_digest(self) -> str:
         return self.digest
 
-    def manifest(self) -> dict[str, object]:
+    def _manifest(self) -> dict[str, object]:
         return {
             "schema_version": CANONICAL_SCHEMA_VERSION,
             "name": self.name.value,
@@ -568,22 +532,161 @@ class CanonicalSplit:
             "input_fields": list(self.inputs.field_names),
             "inputs_digest": self.inputs.digest,
             "alignment_digest": self.alignment.digest,
-            "target_access": self.targets.access.value if self.targets is not None else "none",
-            "target_digest": self.targets.digest if self.targets is not None else None,
             "outcome_access": self.outcome_trace.manifest(),
             "digest": self.digest,
         }
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalTrainingSplit(_CanonicalSplitBase):
+    """Official training inputs, alignment, and training-only targets."""
+
+    targets: TrainingTargets
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.targets, TrainingTargets):
+            raise CanonicalDataError("train split has the wrong target capability")
+        if len(self.targets) != len(self.inputs):
+            raise CanonicalDataError("canonical split and target row counts differ")
+        self._seal(expected_name=SplitName.TRAIN, target_digest=self.targets.digest)
+
+    def manifest(self) -> dict[str, object]:
+        result = self._manifest()
+        result.update(target_access=self.targets.access.value, target_digest=self.targets.digest)
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalValidationSplit(_CanonicalSplitBase):
+    """Public-validation inputs plus labels quarantined for protected evaluation."""
+
+    targets: _ProtectedLabels
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.targets, _ProtectedLabels):
+            raise CanonicalDataError("valid split has the wrong target capability")
+        if len(self.targets) != len(self.inputs):
+            raise CanonicalDataError("canonical split and target row counts differ")
+        self._seal(expected_name=SplitName.VALID, target_digest=self.targets.digest)
+
+    def manifest(self) -> dict[str, object]:
+        result = self._manifest()
+        result.update(target_access=self.targets.access.value, target_digest=self.targets.digest)
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalFinalSplit(_CanonicalSplitBase):
+    """Final-period inputs and alignment, structurally incapable of carrying outcomes."""
+
+    def __post_init__(self) -> None:
+        self._seal(expected_name=SplitName.TEST, target_digest="no-final-targets")
+
+    def manifest(self) -> dict[str, object]:
+        # There is no target-shaped key on this phase-specific schema.  The outcome trace records
+        # only skipped field names and counts, never final-period bytes or decoded values.
+        return self._manifest()
+
+
+type CanonicalPhaseSplit = CanonicalTrainingSplit | CanonicalValidationSplit | CanonicalFinalSplit
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalSplit:
+    """Explicit compatibility adapter for legacy phase-erased split construction.
+
+    New code must use one of the three phase-specific split types.  Calling
+    :meth:`to_phase_split` validates this legacy representation and returns the corresponding
+    phase-specific object; final-period adapters cannot transfer a target member to the returned
+    :class:`CanonicalFinalSplit`.
+    """
+
+    name: SplitName
+    inputs: CanonicalInputs
+    alignment: CanonicalAlignment
+    targets: TrainingTargets | _ProtectedLabels | None
+    outcome_trace: OutcomeAccessTrace
+    digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        adapted = self.to_phase_split()
+        object.__setattr__(self, "digest", adapted.digest)
+
+    def to_phase_split(self) -> CanonicalPhaseSplit:
+        if self.name is SplitName.TRAIN:
+            if not isinstance(self.targets, TrainingTargets):
+                raise CanonicalDataError("train split has the wrong target capability")
+            return CanonicalTrainingSplit(
+                name=self.name,
+                inputs=self.inputs,
+                alignment=self.alignment,
+                outcome_trace=self.outcome_trace,
+                targets=self.targets,
+            )
+        if self.name is SplitName.VALID:
+            if not isinstance(self.targets, _ProtectedLabels):
+                raise CanonicalDataError("valid split has the wrong target capability")
+            return CanonicalValidationSplit(
+                name=self.name,
+                inputs=self.inputs,
+                alignment=self.alignment,
+                outcome_trace=self.outcome_trace,
+                targets=self.targets,
+            )
+        if self.name is SplitName.TEST:
+            if self.targets is not None:
+                raise CanonicalDataError("final split must not contain targets")
+            return CanonicalFinalSplit(
+                name=self.name,
+                inputs=self.inputs,
+                alignment=self.alignment,
+                outcome_trace=self.outcome_trace,
+            )
+        raise CanonicalDataError(f"unsupported canonical split {self.name!r}")
+
+    @property
+    def row_count(self) -> int:
+        return len(self.inputs)
+
+    @property
+    def split_digest(self) -> str:
+        return self.digest
+
+    def manifest(self) -> dict[str, object]:
+        return self.to_phase_split().manifest()
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class CanonicalDataset:
     """Complete immutable train/public-validation/final logical dataset."""
 
-    train: CanonicalSplit
-    valid: CanonicalSplit
-    final: CanonicalSplit
+    train: CanonicalTrainingSplit
+    valid: CanonicalValidationSplit
+    final: CanonicalFinalSplit
     author_map_digest: str
     digest: str = field(init=False)
+
+    def __init__(
+        self,
+        train: CanonicalTrainingSplit | CanonicalSplit,
+        valid: CanonicalValidationSplit | CanonicalSplit,
+        final: CanonicalFinalSplit | CanonicalSplit,
+        author_map_digest: str,
+    ) -> None:
+        normalized_train = train.to_phase_split() if isinstance(train, CanonicalSplit) else train
+        normalized_valid = valid.to_phase_split() if isinstance(valid, CanonicalSplit) else valid
+        normalized_final = final.to_phase_split() if isinstance(final, CanonicalSplit) else final
+        if not isinstance(normalized_train, CanonicalTrainingSplit):
+            raise CanonicalDataError("canonical dataset train member is not phase-typed")
+        if not isinstance(normalized_valid, CanonicalValidationSplit):
+            raise CanonicalDataError("canonical dataset valid member is not phase-typed")
+        if not isinstance(normalized_final, CanonicalFinalSplit):
+            raise CanonicalDataError("canonical dataset final member is not phase-typed")
+        object.__setattr__(self, "train", normalized_train)
+        object.__setattr__(self, "valid", normalized_valid)
+        object.__setattr__(self, "final", normalized_final)
+        object.__setattr__(self, "author_map_digest", author_map_digest)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if (self.train.name, self.valid.name, self.final.name) != (
@@ -608,21 +711,21 @@ class CanonicalDataset:
         )
 
     @property
-    def test(self) -> CanonicalSplit:
+    def test(self) -> CanonicalFinalSplit:
         """Organizer-compatible alias for the final evaluation split."""
 
         return self.final
 
-    def split(self, name: SplitName | str) -> CanonicalSplit:
+    def split(self, name: SplitName | str) -> CanonicalPhaseSplit:
         try:
             normalized = name if isinstance(name, SplitName) else SplitName(name)
         except ValueError as exc:
             raise CanonicalDataError(f"unknown canonical split {name!r}") from exc
-        return {
-            SplitName.TRAIN: self.train,
-            SplitName.VALID: self.valid,
-            SplitName.TEST: self.final,
-        }[normalized]
+        if normalized is SplitName.TRAIN:
+            return self.train
+        if normalized is SplitName.VALID:
+            return self.valid
+        return self.final
 
     def manifest(self) -> dict[str, object]:
         return {
@@ -852,7 +955,7 @@ def _append_row(
         raise AssertionError("canonical row identity changed during author join")
 
 
-def _build_split(name: SplitName, builder: _SplitBuilder) -> CanonicalSplit:
+def _build_split(name: SplitName, builder: _SplitBuilder) -> CanonicalPhaseSplit:
     inputs = CanonicalInputs(
         user_id=builder.user_id,
         video_id=builder.video_id,
@@ -878,16 +981,29 @@ def _build_split(name: SplitName, builder: _SplitBuilder) -> CanonicalSplit:
         skipped_fields=skipped,
     )
     if name is SplitName.TRAIN:
-        targets: TrainingTargets | ProtectedTargets | None = TrainingTargets(builder.targets)
-    elif name is SplitName.VALID:
-        targets = ProtectedTargets(cast(Sequence[int], builder.targets[PRIMARY_TARGET]))
-    else:
-        targets = None
-    return CanonicalSplit(
+        return CanonicalTrainingSplit(
+            name=name,
+            inputs=inputs,
+            alignment=alignment,
+            targets=TrainingTargets(builder.targets),
+            outcome_trace=trace,
+        )
+    if name is SplitName.VALID:
+        try:
+            labels = _ProtectedLabels(cast(Sequence[int], builder.targets[PRIMARY_TARGET]))
+        except _ProtectedEvidenceError as exc:
+            raise CanonicalDataError(str(exc)) from exc
+        return CanonicalValidationSplit(
+            name=name,
+            inputs=inputs,
+            alignment=alignment,
+            targets=labels,
+            outcome_trace=trace,
+        )
+    return CanonicalFinalSplit(
         name=name,
         inputs=inputs,
         alignment=alignment,
-        targets=targets,
         outcome_trace=trace,
     )
 
@@ -933,9 +1049,18 @@ def load_canonical_dataset(data_dir: str | Path) -> CanonicalDataset:
                     video_type_map=video_type_map,
                 )
 
-    train = _build_split(SplitName.TRAIN, builders[SplitName.TRAIN])
-    valid = _build_split(SplitName.VALID, builders[SplitName.VALID])
-    final = _build_split(SplitName.TEST, builders[SplitName.TEST])
+    train = cast(
+        CanonicalTrainingSplit,
+        _build_split(SplitName.TRAIN, builders[SplitName.TRAIN]),
+    )
+    valid = cast(
+        CanonicalValidationSplit,
+        _build_split(SplitName.VALID, builders[SplitName.VALID]),
+    )
+    final = cast(
+        CanonicalFinalSplit,
+        _build_split(SplitName.TEST, builders[SplitName.TEST]),
+    )
     return CanonicalDataset(
         train=train,
         valid=valid,
@@ -975,8 +1100,12 @@ __all__ = [
     "CanonicalAlignment",
     "CanonicalDataError",
     "CanonicalDataset",
+    "CanonicalFinalSplit",
     "CanonicalInputs",
+    "CanonicalPhaseSplit",
     "CanonicalSplit",
+    "CanonicalTrainingSplit",
+    "CanonicalValidationSplit",
     "OutcomeAccessTrace",
     "ProtectedTargets",
     "TargetAccess",

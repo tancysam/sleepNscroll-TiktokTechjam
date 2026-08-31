@@ -19,14 +19,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from numbers import Integral
-from typing import Final, Literal, cast
+from typing import Final, Literal, Protocol, cast, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
 
 from kuairand_agent.contract import STARTER_FILE_SHA256
 from kuairand_agent.data.capabilities import DataPhase
-from kuairand_agent.scoring.protected import ScoreResult
 from kuairand_agent.scoring.submission import prediction_digest
 
 type VectorInput = Sequence[object] | npt.NDArray[np.generic]
@@ -43,6 +42,35 @@ _PROTECTED_SCORER_DIGEST: Final = STARTER_FILE_SHA256["evaluate.py"]
 type PointEstimateSource = Literal[
     "independent_diagnostic_reconstruction", "protected_organizer_scorer"
 ]
+
+
+@runtime_checkable
+class _AggregateScore(Protocol):
+    """Legacy aggregate adapter shape without importing quarantined evaluation types."""
+
+    @property
+    def gauc(self) -> float: ...
+
+    @property
+    def ndcg_at_5(self) -> float: ...
+
+    @property
+    def primary(self) -> float: ...
+
+    @property
+    def users(self) -> int: ...
+
+    @property
+    def rows(self) -> int: ...
+
+    @property
+    def scorer_digest(self) -> str: ...
+
+    @property
+    def prediction_digest(self) -> str: ...
+
+    @property
+    def runtime_seconds(self) -> float: ...
 
 
 class BootstrapDiagnosticError(ValueError):
@@ -439,7 +467,7 @@ def _interval(deltas: Float64Vector, confidence_level: float) -> PercentileConfi
 
 
 def _protected_metrics(
-    result: ScoreResult,
+    result: _AggregateScore,
     *,
     location: str,
     expected_rows: int,
@@ -448,7 +476,7 @@ def _protected_metrics(
 ) -> tuple[float, float, float]:
     """Validate one fresh protected aggregate and return its organizer metric triplet."""
 
-    if not isinstance(result, ScoreResult):
+    if not isinstance(result, _AggregateScore):
         raise BootstrapDiagnosticError(f"{location} protected result must be a ScoreResult")
     if result.rows != expected_rows or type(result.rows) is not int:
         raise BootstrapDiagnosticError(f"{location} protected result rows changed")
@@ -494,8 +522,8 @@ def paired_user_cluster_bootstrap(
     resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
     confidence_level: float = DEFAULT_CONFIDENCE_LEVEL,
     seed: int = 0,
-    candidate_protected_result: ScoreResult | None = None,
-    control_protected_result: ScoreResult | None = None,
+    candidate_protected_result: _AggregateScore | None = None,
+    control_protected_result: _AggregateScore | None = None,
 ) -> UserClusterBootstrapDiagnostic:
     """Return paired user-cluster percentile intervals for organizer metric deltas.
 

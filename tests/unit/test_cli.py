@@ -9,9 +9,9 @@ import pytest
 
 import kuairand_agent.cli as cli_module
 from kuairand_agent.baselines.qualification import QualificationError, QualificationMetrics
-from kuairand_agent.campaign import CampaignEngine, CampaignIntegrityError, CampaignRunExistsError
+from kuairand_agent.campaign import CampaignIntegrityError
 from kuairand_agent.cli import build_parser, main
-from kuairand_agent.config import ConfigError, load_config
+from kuairand_agent.config import load_config
 from kuairand_agent.data.acquire import ArchiveIntegrityError
 from kuairand_agent.data.audit import DataAuditError
 
@@ -197,186 +197,44 @@ def test_status_does_not_resolve_away_a_rejected_campaign_symlink(
     assert output.err == "CAMPAIGN_STATUS_FAILED: campaign run path must be a real directory\n"
 
 
-def test_resume_drives_once_then_finalizes_without_pre_reconciling(
+@pytest.mark.parametrize(
+    ("argv", "command"),
+    [
+        (["run", "--config", "configs/default.toml"], "run"),
+        (["resume", "--run-dir", "runs/legacy"], "resume"),
+        (["finalize", "--run-dir", "runs/legacy"], "finalize"),
+    ],
+)
+def test_legacy_mutating_commands_fail_closed_before_touching_either_authority(
+    argv: list[str],
+    command: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
-    run_dir = tmp_path / "campaign"
-    observed: dict[str, object] = {}
-
-    class FakeEngine:
-        def resume(self, _path: Path) -> None:
-            pytest.fail("the provider-free driver owns resume reconciliation")
-
-    outcome = SimpleNamespace(
-        manifest=lambda: {
-            "schema_version": 1,
-            "campaign_id": "campaign-fixture",
-            "status": "FINALIZATION_REQUIRED",
-        }
-    )
-    finalized = SimpleNamespace(
-        manifest=lambda: {
-            "schema_version": 1,
-            "selected_candidate_id": "official-fm-fallback-seed-4",
-            "bundle": {"manifest_sha256": "a" * 64},
-        }
-    )
-
-    def drive(
-        path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> object:
-        observed.update(
-            path=path,
-            project_root=project_root,
-            engine=engine,
-            cancel_event=cancel_event,
-        )
-        return outcome
-
-    def finalize(
-        path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> object:
-        observed.update(
-            finalized_path=path,
-            finalized_root=project_root,
-            finalized_engine=engine,
-            finalized_cancel_event=cancel_event,
-        )
-        return finalized
-
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "CampaignEngine", FakeEngine)
-    monkeypatch.setattr(cli_module, "_drive_provider_free_campaign", drive)
-    monkeypatch.setattr(cli_module, "_finalize_provider_free_campaign", finalize)
-
-    code = main(["resume", "--run-dir", "campaign"])
-    output = capsys.readouterr()
-
-    assert code == 0
-    assert output.err == ""
-    assert output.out == (
-        '{"bundle":{"manifest_sha256":"' + "a" * 64 + '"},'
-        '"schema_version":1,"selected_candidate_id":"official-fm-fallback-seed-4"}\n'
+    monkeypatch.setattr(
+        cli_module,
+        "CampaignEngine",
+        lambda: pytest.fail("legacy CampaignEngine must not be constructed"),
     )
-    assert observed == {
-        "path": run_dir,
-        "project_root": tmp_path.resolve(),
-        "engine": observed["engine"],
-        "cancel_event": observed["cancel_event"],
-        "finalized_path": run_dir,
-        "finalized_root": tmp_path.resolve(),
-        "finalized_engine": observed["engine"],
-        "finalized_cancel_event": observed["cancel_event"],
-    }
-    assert isinstance(observed["engine"], FakeEngine)
-    assert isinstance(observed["cancel_event"], threading.Event)
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda _path: pytest.fail("legacy run must not load campaign configuration"),
+    )
 
-
-def test_resume_corrupt_campaign_is_nonzero_and_stderr_only(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    def fail(
-        _path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> None:
-        del project_root, engine, cancel_event
-        raise CampaignIntegrityError("campaign request digest mismatch")
-
-    monkeypatch.setattr(cli_module, "_drive_provider_free_campaign", fail)
-
-    code = main(["resume", "--run-dir", str(tmp_path / "corrupt")])
+    code = main(argv)
     output = capsys.readouterr()
 
     assert code == cli_module.EXIT_CONTRACT
     assert output.out == ""
-    assert output.err == "CAMPAIGN_RESUME_FAILED: campaign request digest mismatch\n"
-
-
-def test_finalize_loads_retained_outcome_and_emits_one_stable_result(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    run_dir = tmp_path / "campaign"
-    observed: dict[str, object] = {}
-    result = SimpleNamespace(
-        manifest=lambda: {
-            "schema_version": 1,
-            "selected_candidate_id": "official-fm-fallback-seed-4",
-            "fallback_count": 1,
-            "bundle": {"manifest_sha256": "b" * 64},
-        }
-    )
-
-    def finalize(
-        path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> object:
-        observed.update(
-            path=path,
-            project_root=project_root,
-            engine=engine,
-            cancel_event=cancel_event,
-        )
-        return result
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "_finalize_provider_free_campaign", finalize)
-
-    code = main(["finalize", "--run-dir", "campaign"])
-    output = capsys.readouterr()
-
-    assert code == 0
-    assert output.err == ""
-    assert json.loads(output.out) == result.manifest()
-    assert output.out.count("\n") == 1
-    assert observed["path"] == run_dir
-    assert observed["project_root"] == tmp_path.resolve()
-    assert observed["engine"].__class__ is CampaignEngine
-    assert isinstance(observed["cancel_event"], threading.Event)
-
-
-def test_finalize_corrupt_outcome_is_nonzero_and_stderr_only(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    def fail(
-        _path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> None:
-        del project_root, engine, cancel_event
-        raise CampaignIntegrityError("campaign outcome digest mismatch")
-
-    monkeypatch.setattr(cli_module, "_finalize_provider_free_campaign", fail)
-
-    code = main(["finalize", "--run-dir", str(tmp_path / "campaign")])
-    output = capsys.readouterr()
-
-    assert code == cli_module.EXIT_CONTRACT
-    assert output.out == ""
-    assert output.err == "CAMPAIGN_FINALIZE_FAILED: campaign outcome digest mismatch\n"
+    assert output.err.startswith(f"LEGACY_CAMPAIGN_COMMAND_DISABLED: {command}: ")
+    assert "StateRepository authority" in output.err
+    assert "kuairand-agent compete" in output.err
+    assert "inspect" in output.err
+    assert "replay" in output.err
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_replay_delegates_only_to_the_trusted_closed_bundle_facade(
@@ -500,7 +358,7 @@ def test_replay_integrity_failure_is_nonzero_and_stderr_only(
     assert output.err == "CAMPAIGN_REPLAY_FAILED: closed bundle member digest mismatch\n"
 
 
-def test_finalize_and_replay_handlers_are_not_placeholders() -> None:
+def test_legacy_finalize_and_replay_handlers_remain_parse_compatible() -> None:
     finalize = build_parser().parse_args(["finalize", "--run-dir", "campaign"])
     replay = build_parser().parse_args(
         [
@@ -518,230 +376,6 @@ def test_finalize_and_replay_handlers_are_not_placeholders() -> None:
 
     assert finalize.handler is cli_module._finalize
     assert replay.handler is cli_module._replay
-
-
-def test_run_creates_drives_and_finalizes_one_deterministic_new_campaign(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    config = load_config(ROOT / "configs/default.toml")
-    request = object()
-    observed: dict[str, object] = {}
-    dataset = SimpleNamespace(
-        digest="d" * 64,
-        final=SimpleNamespace(targets=None),
-    )
-
-    def fake_load_dataset(path: Path) -> SimpleNamespace:
-        observed["data_dir"] = path
-        return dataset
-
-    def fake_build_request(
-        *,
-        repository_root: str | Path,
-        run_dir: str | Path,
-        qualification_run_dir: str | Path,
-        config: object,
-        dataset_manifest_digest: str,
-    ) -> SimpleNamespace:
-        observed.update(
-            {
-                "repository_root": repository_root,
-                "run_dir": run_dir,
-                "qualification_run_dir": qualification_run_dir,
-                "config": config,
-                "dataset_manifest_digest": dataset_manifest_digest,
-            }
-        )
-        return SimpleNamespace(request=request)
-
-    class FakeEngine:
-        def create(self, candidate: object) -> SimpleNamespace:
-            observed["request"] = candidate
-            return SimpleNamespace(
-                manifest=lambda: {
-                    "schema_version": 1,
-                    "campaign_id": "campaign-fixture",
-                    "status": "RUNNING",
-                }
-            )
-
-    outcome = SimpleNamespace(
-        manifest=lambda: {
-            "schema_version": 1,
-            "campaign_id": "campaign-fixture",
-            "status": "FINALIZATION_REQUIRED",
-        }
-    )
-    finalized = SimpleNamespace(
-        manifest=lambda: {
-            "schema_version": 1,
-            "selected_candidate_id": "generated-lambdarank",
-            "bundle": {"manifest_sha256": "f" * 64},
-        }
-    )
-
-    def drive(
-        path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> object:
-        observed.update(
-            drive_path=path,
-            drive_root=project_root,
-            drive_engine=engine,
-            drive_cancel_event=cancel_event,
-        )
-        return outcome
-
-    def finalize(
-        path: Path,
-        *,
-        project_root: Path,
-        engine: object,
-        cancel_event: threading.Event,
-    ) -> object:
-        observed.update(
-            finalize_path=path,
-            finalize_root=project_root,
-            finalize_engine=engine,
-            finalize_cancel_event=cancel_event,
-        )
-        return finalized
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "load_config", lambda _path: config)
-    monkeypatch.setattr(cli_module, "load_canonical_dataset", fake_load_dataset)
-    monkeypatch.setattr(cli_module, "build_campaign_request", fake_build_request, raising=False)
-    monkeypatch.setattr(cli_module, "CampaignEngine", FakeEngine)
-    monkeypatch.setattr(cli_module, "_drive_provider_free_campaign", drive)
-    monkeypatch.setattr(cli_module, "_finalize_provider_free_campaign", finalize)
-
-    code = main(["run", "--config", "configs/default.toml"])
-    output = capsys.readouterr()
-
-    root = tmp_path.resolve()
-    expected_run_dir = root / "runs" / f"campaign-{config.digest[:12]}"
-    assert code == 0
-    assert output.err == ""
-    assert output.out == (
-        '{"bundle":{"manifest_sha256":"' + "f" * 64 + '"},'
-        '"schema_version":1,"selected_candidate_id":"generated-lambdarank"}\n'
-    )
-    assert observed["data_dir"] == root / config.benchmark.data_dir
-    assert observed["repository_root"] == root
-    assert observed["run_dir"] == expected_run_dir
-    assert observed["qualification_run_dir"] == root / "runs" / "wp3-official-qualification"
-    assert observed["config"] is config
-    assert observed["dataset_manifest_digest"] == "d" * 64
-    assert observed["request"] is request
-    assert observed["drive_path"] == expected_run_dir
-    assert observed["drive_root"] == root
-    assert isinstance(observed["drive_engine"], FakeEngine)
-    assert observed["finalize_path"] == expected_run_dir
-    assert observed["finalize_root"] == root
-    assert observed["finalize_engine"] is observed["drive_engine"]
-    assert isinstance(observed["drive_cancel_event"], threading.Event)
-    assert observed["finalize_cancel_event"] is observed["drive_cancel_event"]
-
-
-def test_run_refuses_to_replace_an_existing_explicit_campaign_path(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    config = load_config(ROOT / "configs/default.toml")
-    request = object()
-    observed: dict[str, object] = {}
-
-    def fake_build_request(**kwargs: object) -> SimpleNamespace:
-        observed.update(kwargs)
-        return SimpleNamespace(request=request)
-
-    class FakeEngine:
-        def create(self, candidate: object) -> None:
-            assert candidate is request
-            raise CampaignRunExistsError("campaign run path already exists")
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "load_config", lambda _path: config)
-    monkeypatch.setattr(
-        cli_module,
-        "load_canonical_dataset",
-        lambda _path: SimpleNamespace(
-            digest="d" * 64,
-            final=SimpleNamespace(targets=None),
-        ),
-    )
-    monkeypatch.setattr(cli_module, "build_campaign_request", fake_build_request)
-    monkeypatch.setattr(cli_module, "CampaignEngine", FakeEngine)
-
-    code = main(
-        [
-            "run",
-            "--config",
-            "config.toml",
-            "--run-dir",
-            "runs/explicit",
-            "--qualification-run-dir",
-            "qualification",
-        ]
-    )
-    output = capsys.readouterr()
-
-    root = tmp_path.resolve()
-    assert code != 0
-    assert output.out == ""
-    assert output.err == "CAMPAIGN_CREATE_FAILED: campaign run path already exists\n"
-    assert observed["run_dir"] == root / "runs" / "explicit"
-    assert observed["qualification_run_dir"] == root / "qualification"
-
-
-def test_run_rejects_invalid_config_before_loading_data(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    def fail_config(_path: Path) -> None:
-        raise ConfigError("unsupported schema_version 99")
-
-    monkeypatch.setattr(cli_module, "load_config", fail_config)
-
-    code = main(["run", "--config", "bad.toml"])
-    output = capsys.readouterr()
-
-    assert code != 0
-    assert output.out == ""
-    assert output.err == "CONFIG_INVALID: unsupported schema_version 99\n"
-
-
-def test_run_fails_closed_if_final_targets_are_exposed(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    tmp_path: Path,
-) -> None:
-    config = load_config(ROOT / "configs/default.toml")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli_module, "load_config", lambda _path: config)
-    monkeypatch.setattr(
-        cli_module,
-        "load_canonical_dataset",
-        lambda _path: SimpleNamespace(
-            digest="d" * 64,
-            final=SimpleNamespace(targets=object()),
-        ),
-    )
-
-    code = main(["run", "--config", "config.toml"])
-    output = capsys.readouterr()
-
-    assert code != 0
-    assert output.out == ""
-    assert output.err == (
-        "CAMPAIGN_CREATE_FAILED: final split unexpectedly exposes a target capability\n"
-    )
 
 
 def test_config_validate_emits_one_stable_json_object(

@@ -287,9 +287,7 @@ class GeneratedLambdaRankEnsembleReplayRecipe:
             "backend": self.backend.value,
             "members": [member.manifest() for member in self.members],
             "member_recipe_digests": list(self.member_recipe_digests),
-            "validation_member_prediction_digests": list(
-                self.validation_member_prediction_digests
-            ),
+            "validation_member_prediction_digests": list(self.validation_member_prediction_digests),
             "fusion_weights": list(self.fusion_weights),
             "validation_fusion_digest": self.validation_fusion_digest,
         }
@@ -500,9 +498,7 @@ def _ensemble_from_manifest(value: dict[str, object]) -> GeneratedLambdaRankEnse
     return GeneratedLambdaRankEnsembleReplayRecipe(
         members=tuple(members),
         member_recipe_digests=_digest_tuple("member_recipe_digests"),
-        validation_member_prediction_digests=_digest_tuple(
-            "validation_member_prediction_digests"
-        ),
+        validation_member_prediction_digests=_digest_tuple("validation_member_prediction_digests"),
         fusion_weights=tuple(cast(float, item) for item in raw_weights),
         validation_fusion_digest=cast(str, raw["validation_fusion_digest"]),
     )

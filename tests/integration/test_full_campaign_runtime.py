@@ -36,6 +36,7 @@ from kuairand_agent.campaign.scientific import (
 from kuairand_agent.campaign.selector import IncumbentEvidence, OrganizerMetrics
 from kuairand_agent.campaign.store import CampaignStore
 from kuairand_agent.contract import STARTER_FILE_SHA256
+from kuairand_agent.data.canonical import CanonicalFinalSplit
 from kuairand_agent.execution.artifacts import ArtifactKind, ArtifactRef, ArtifactStore
 from kuairand_agent.research.context import AggregateRecord
 from kuairand_agent.research.production import (
@@ -83,8 +84,7 @@ def _deployment_gate_fixture(
             replayable=True,
             eligible=True,
             outer_by_seed=tuple(
-                SimpleNamespace(seed=seed, metrics=OrganizerMetrics(0.6, 0.6))
-                for seed in (0, 1, 2)
+                SimpleNamespace(seed=seed, metrics=OrganizerMetrics(0.6, 0.6)) for seed in (0, 1, 2)
             ),
         ),
         incumbent=SimpleNamespace(
@@ -123,8 +123,8 @@ def test_candidate_artifact_deployment_gate_is_strict_at_material_boundary(
     representative_primary: float,
     expected: bool,
 ) -> None:
-    result, candidate_result, representative_record, qualification = (
-        _deployment_gate_fixture(representative_primary=representative_primary)
+    result, candidate_result, representative_record, qualification = _deployment_gate_fixture(
+        representative_primary=representative_primary
     )
 
     assert (
@@ -148,12 +148,9 @@ def test_research_incumbent_with_tiny_mean_gain_keeps_seed_four_deployment_fallb
 
     assert cast(Any, result).incumbent.candidate_id == "generated-candidate"
     assert float(
-        sum(item.metrics.primary_decimal for item in cast(Any, result).incumbent.outer_by_seed)
-        / 3
+        sum(item.metrics.primary_decimal for item in cast(Any, result).incumbent.outer_by_seed) / 3
         - OrganizerMetrics(0.6, 0.6).primary_decimal
-    ) == pytest.approx(
-        0.0000422497590383
-    )
+    ) == pytest.approx(0.0000422497590383)
     assert not runtime._candidate_artifact_clears_deployment_gate(
         result=cast(Any, result),
         candidate_result=cast(Any, candidate_result),
@@ -952,7 +949,7 @@ def test_provider_free_runtime_closes_fallback_and_exactly_retries_without_final
     assert first.selection is None
     assert first.scientific_result_digest is not None
     assert first.reflection_transcript is not None
-    assert canonical.final.targets is None
+    assert isinstance(canonical.final, CanonicalFinalSplit)
     assert canonical.final.outcome_trace.parsed_cell_count == 0
     assert tuple(item.stage for item in first_checkpoints) == tuple(FullCampaignStage)
     science = next(

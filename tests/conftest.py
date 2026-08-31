@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from kuairand_agent.data.audit import DataAuditReport, audit_dataset
-from kuairand_agent.data.canonical import CanonicalDataset, load_canonical_dataset
+from kuairand_agent.data.canonical import (
+    CanonicalDataset,
+    CanonicalFinalSplit,
+    load_canonical_dataset,
+)
 
 DATA_ENV = "KUAIRAND_PURE_DATA_DIR"
 
@@ -49,7 +53,7 @@ def official_dataset(
     official_audit: DataAuditReport,
 ) -> CanonicalDataset:
     dataset = load_canonical_dataset(official_data_dir)
-    assert dataset.final.targets is None
+    assert isinstance(dataset.final, CanonicalFinalSplit)
     assert dataset.final.outcome_trace.parsed_cell_count == 0
     assert dataset.train.row_count == 1_141_112
     assert dataset.valid.row_count == 124_909

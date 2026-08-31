@@ -89,6 +89,7 @@ from kuairand_agent.contract import (
 )
 from kuairand_agent.data.canonical import (
     CanonicalDataset,
+    CanonicalFinalSplit,
     ProtectedTargets,
     load_canonical_dataset,
 )
@@ -1563,7 +1564,7 @@ def _trusted_replay_context(
     dataset = load_canonical_dataset(data_dir)
     if dataset.digest != _digest(expected_data_sha256, "expected_data_sha256"):
         raise ProductionFinalizationError("canonical dataset identity differs from finalization")
-    if dataset.final.targets is not None:
+    if not isinstance(dataset.final, CanonicalFinalSplit):
         raise ProductionFinalizationError("final dataset unexpectedly exposes target capability")
     if not isinstance(dataset.valid.targets, ProtectedTargets):
         raise ProductionFinalizationError("public validation targets are not scorer-protected")

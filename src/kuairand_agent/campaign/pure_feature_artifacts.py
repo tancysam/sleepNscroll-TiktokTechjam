@@ -681,9 +681,7 @@ def _decode_pair(npz_handle: BinaryIO, stored_pair: Mapping[str, object]) -> Pur
     raw_input_exposure = stored_pair.get("input_exposure")
     if stored_pair.get("schema_version") == 8:
         if not isinstance(raw_input_exposure, Mapping):
-            raise PureFeatureArtifactError(
-                "schema-v8 input-exposure manifest must be an object"
-            )
+            raise PureFeatureArtifactError("schema-v8 input-exposure manifest must be an object")
         width = len(STRICT_PAST_EXPOSURE_FEATURE_NAMES)
         if prefix.feature_names[-width:] != STRICT_PAST_EXPOSURE_FEATURE_NAMES:
             raise PureFeatureArtifactError(
@@ -691,21 +689,11 @@ def _decode_pair(npz_handle: BinaryIO, stored_pair: Mapping[str, object]) -> Pur
             )
         try:
             input_exposure = StrictPastExposurePair(
-                prefix=FeatureMatrix(
-                    prefix.values[:, -width:], STRICT_PAST_EXPOSURE_FEATURE_NAMES
-                ),
-                query=FeatureMatrix(
-                    query.values[:, -width:], STRICT_PAST_EXPOSURE_FEATURE_NAMES
-                ),
-                prefix_input_digest=cast(
-                    str, raw_input_exposure.get("prefix_input_digest")
-                ),
-                query_input_digest=cast(
-                    str, raw_input_exposure.get("query_input_digest")
-                ),
-                builder_source_digest=cast(
-                    str, raw_input_exposure.get("builder_source_digest")
-                ),
+                prefix=FeatureMatrix(prefix.values[:, -width:], STRICT_PAST_EXPOSURE_FEATURE_NAMES),
+                query=FeatureMatrix(query.values[:, -width:], STRICT_PAST_EXPOSURE_FEATURE_NAMES),
+                prefix_input_digest=cast(str, raw_input_exposure.get("prefix_input_digest")),
+                query_input_digest=cast(str, raw_input_exposure.get("query_input_digest")),
+                builder_source_digest=cast(str, raw_input_exposure.get("builder_source_digest")),
             )
             if input_exposure.digest != _require_digest(
                 raw_input_exposure.get("build_digest"), "input_exposure.build_digest"

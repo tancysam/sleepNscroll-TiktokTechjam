@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Final, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -31,6 +31,14 @@ from kuairand_agent.data.fields import (
     LogicalDType,
     field_spec,
 )
+
+if TYPE_CHECKING:
+    from kuairand_agent.data.canonical import (
+        CanonicalFinalSplit,
+        CanonicalInputs,
+        CanonicalTrainingSplit,
+        CanonicalValidationSplit,
+    )
 
 
 class CapabilityError(ValueError):
@@ -206,6 +214,20 @@ class TrainTargets:
             "logical_content_digest": self.logical_content_digest,
             "capability_digest": self.digest,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingCapabilities:
+    """Candidate-facing training inputs and targets built from one typed split."""
+
+    inputs: CandidateInputs
+    targets: TrainTargets
+
+    def __post_init__(self) -> None:
+        if self.inputs.phase is not DataPhase.TRAIN or self.targets.phase is not DataPhase.TRAIN:
+            raise CapabilityError("training capabilities require the train phase")
+        if self.inputs.row_count != self.targets.row_count:
+            raise CapabilityError("training input and target row counts differ")
 
 
 def validate_candidate_capability_request(name: str) -> CandidateCapabilityName:
@@ -533,4 +555,65 @@ def build_train_targets(
         logical_content_digest=content_digest,
         digest=digest,
         _columns=frozen_columns,
+    )
+
+
+def _canonical_input_columns(
+    inputs: CanonicalInputs,
+    *,
+    log_member: str,
+) -> Mapping[FieldKey, object]:
+    """Project only candidate-approved canonical fields into the capability factory."""
+
+    return MappingProxyType(
+        {
+            FieldKey(log_member, "user_id"): inputs.user_id,
+            FieldKey(log_member, "video_id"): inputs.video_id,
+            FieldKey(VIDEO_BASIC_MEMBER, "author_id"): inputs.author_id,
+            FieldKey(log_member, "tab"): inputs.tab,
+            FieldKey(log_member, "duration_ms"): inputs.duration_ms,
+        }
+    )
+
+
+def build_training_capabilities(split: CanonicalTrainingSplit) -> TrainingCapabilities:
+    """Build train inputs and targets from a structurally training-only split."""
+
+    from kuairand_agent.data.canonical import CanonicalTrainingSplit as TrainingSplitType
+
+    if not isinstance(split, TrainingSplitType):
+        raise CapabilityError("training capabilities require CanonicalTrainingSplit")
+    input_columns = _canonical_input_columns(split.inputs, log_member=STANDARD_TRAIN_MEMBER)
+    target_columns = MappingProxyType(
+        {FieldKey(STANDARD_TRAIN_MEMBER, "long_view"): split.targets.long_view}
+    )
+    return TrainingCapabilities(
+        inputs=build_candidate_inputs(DataPhase.TRAIN, input_columns),
+        targets=build_train_targets(DataPhase.TRAIN, target_columns),
+    )
+
+
+def build_validation_inputs(split: CanonicalValidationSplit) -> CandidateInputs:
+    """Build validation inputs without touching the split's protected label capability."""
+
+    from kuairand_agent.data.canonical import CanonicalValidationSplit as ValidationSplitType
+
+    if not isinstance(split, ValidationSplitType):
+        raise CapabilityError("validation inputs require CanonicalValidationSplit")
+    return build_candidate_inputs(
+        DataPhase.OUTER_VALID,
+        _canonical_input_columns(split.inputs, log_member=STANDARD_LATE_MEMBER),
+    )
+
+
+def build_final_inputs(split: CanonicalFinalSplit) -> CandidateInputs:
+    """Build final-period inputs from a type that cannot represent outcome labels."""
+
+    from kuairand_agent.data.canonical import CanonicalFinalSplit as FinalSplitType
+
+    if not isinstance(split, FinalSplitType):
+        raise CapabilityError("final inputs require CanonicalFinalSplit")
+    return build_candidate_inputs(
+        DataPhase.FINAL,
+        _canonical_input_columns(split.inputs, log_member=STANDARD_LATE_MEMBER),
     )

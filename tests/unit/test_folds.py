@@ -14,6 +14,7 @@ from kuairand_agent.data.canonical import (
     CanonicalAlignment,
     CanonicalInputs,
     CanonicalSplit,
+    CanonicalTrainingSplit,
     OutcomeAccessTrace,
     ProtectedTargets,
     TrainingTargets,
@@ -31,7 +32,7 @@ def _training_split(
     *,
     labels: tuple[int, ...] | None = None,
     omitted_dates: frozenset[int] = frozenset(),
-) -> CanonicalSplit:
+) -> CanonicalTrainingSplit:
     dates: list[int] = []
     for date in range(20220408, 20220422):
         if date not in omitted_dates:
@@ -62,7 +63,7 @@ def _training_split(
         else:
             target_columns[name] = tuple(float(value) for value in actual_labels)
     targets = TrainingTargets(target_columns)
-    return CanonicalSplit(
+    return CanonicalTrainingSplit(
         name=SplitName.TRAIN,
         inputs=inputs,
         alignment=alignment,
@@ -165,7 +166,7 @@ def test_non_train_split_and_manifest_boundary_drift_are_rejected() -> None:
         ),
     )
     with pytest.raises(TemporalFoldError, match="train split"):
-        build_temporal_folds(wrong_name)
+        build_temporal_folds(cast(CanonicalTrainingSplit, wrong_name))
 
     manifest = build_temporal_folds(train).manifest()
     changed = copy.deepcopy(manifest)

@@ -15,6 +15,7 @@ from kuairand_agent.data.canonical import (
     VIDEO_BASIC_FILENAME,
     VIDEO_BASIC_HEADER,
     CanonicalDataError,
+    CanonicalFinalSplit,
     CanonicalInputs,
     ProtectedTargets,
     TrainingTargets,
@@ -162,7 +163,7 @@ def test_canonical_order_duplicate_pairs_alignment_and_phase_target_boundary(
     assert dataset.valid.targets.reveal_for_scorer() == (1,)
     assert dataset.valid.inputs.author_id == ("UNK",)
     assert dataset.valid.inputs.video_type == ("UNKNOWN",)
-    assert dataset.final.targets is None
+    assert isinstance(dataset.final, CanonicalFinalSplit)
     assert dataset.test is dataset.final
 
     assert set(dataset.train.targets.column_names) == {PRIMARY_TARGET, *APPROVED_AUXILIARY_TARGETS}

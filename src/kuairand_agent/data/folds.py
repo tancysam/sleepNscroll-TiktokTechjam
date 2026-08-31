@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Final, Self, cast
 
 from kuairand_agent.contract import SplitName
-from kuairand_agent.data.canonical import CanonicalSplit, TrainingTargets
+from kuairand_agent.data.canonical import CanonicalTrainingSplit, TrainingTargets
 
 TEMPORAL_FOLD_SCHEMA_VERSION: Final = 1
 
@@ -342,7 +342,7 @@ class FoldSupport:
     maximum_valid_slate_depth: int
 
 
-def _validate_train_date_domain(split: CanonicalSplit) -> None:
+def _validate_train_date_domain(split: CanonicalTrainingSplit) -> None:
     if any(not 20220408 <= date <= 20220421 for date in split.inputs.date):
         raise TemporalFoldError("temporal-fold source contains a date outside official training")
 
@@ -361,7 +361,7 @@ def _positions_for(
 
 
 def validate_fold_support(
-    split: CanonicalSplit,
+    split: CanonicalTrainingSplit,
     fold: TemporalFold,
     policy: FoldSupportPolicy = DEFAULT_FOLD_SUPPORT_POLICY,
 ) -> FoldSupport:
@@ -417,7 +417,7 @@ def validate_fold_support(
 
 
 def build_temporal_folds(
-    train_split: CanonicalSplit,
+    train_split: CanonicalTrainingSplit,
     *,
     validate_support: bool = True,
     support_policy: FoldSupportPolicy = DEFAULT_FOLD_SUPPORT_POLICY,
