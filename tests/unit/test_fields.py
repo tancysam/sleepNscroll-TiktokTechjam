@@ -9,10 +9,12 @@ from kuairand_agent.data.fields import (
     EXPECTED_ROLE_COUNTS,
     FIELD_POLICY_DIGEST,
     FIELD_REGISTRY,
+    HISTORY_GRANTED_AUXILIARY_OUTCOMES,
     RANDOMIZED_MEMBER,
     STANDARD_LATE_MEMBER,
     STANDARD_LOG_HEADER,
     STANDARD_TRAIN_MEMBER,
+    TARGET_GRANTED_AUXILIARY_OUTCOMES,
     USER_SNAPSHOT_HEADER,
     USER_SNAPSHOT_MEMBER,
     VIDEO_BASIC_HEADER,
@@ -112,10 +114,18 @@ def test_standard_log_roles_and_secondary_history_metadata_are_exact() -> None:
             "comment_stay_time",
             "is_profile_enter",
         }
-        # is_click and is_like are granted for strictly-past aggregation by the trusted
-        # controller. Every auxiliary field stays history_eligible and none is ever a candidate
-        # input, because that additionally requires the INFERENCE_INPUT role.
-        granted = {"is_click", "is_like"}
+        # Two independent grants, and a field enabled by either is enabled. is_click and is_like
+        # may be aggregated over strictly-past rows into history features; is_click and
+        # play_time_ms may additionally be served as auxiliary TRAINING TARGETS, which is a
+        # different question -- the aggregation grant excludes non-binary fields because
+        # exposure/positive counting is meaningless for them, and that says nothing about their
+        # value as supervision. play_time_ms is granted there precisely because long_view is
+        # derived from it.
+        #
+        # Every auxiliary field stays history_eligible and none is ever a candidate input,
+        # because that additionally requires the INFERENCE_INPUT role.
+        granted = set(HISTORY_GRANTED_AUXILIARY_OUTCOMES) | set(TARGET_GRANTED_AUXILIARY_OUTCOMES)
+        assert granted == {"is_click", "is_like", "play_time_ms"}
         for name in auxiliary_names:
             spec = field_spec(FieldKey(member, name))
             assert spec.role is FieldRole.TRAINING_AUXILIARY_TARGET
@@ -194,3 +204,38 @@ def test_registry_and_headers_are_read_only() -> None:
         )
     with pytest.raises(TypeError):
         CSV_HEADERS["data/extra.csv"] = ("field",)  # type: ignore[index]
+
+
+def test_a_target_grant_never_becomes_a_model_input_or_reaches_the_scored_period() -> None:
+    """The two properties that make auxiliary supervision safe, asserted rather than promised.
+
+    `play_time_ms` is the continuous form of the label: `long_view` is derived from it and the
+    video duration. That makes it the richest available supervision for exactly what is scored,
+    and it would be catastrophic as a feature. Both guards are structural.
+    """
+
+    from kuairand_agent.data.capabilities import CapabilityError, DataPhase, _require_train_target
+
+    key = FieldKey(STANDARD_TRAIN_MEMBER, "play_time_ms")
+    spec = field_spec(key)
+
+    # 1. Enabled as supervision, and still never copyable into a candidate input capability,
+    #    because that path additionally requires the INFERENCE_INPUT role.
+    assert spec.enabled
+    assert spec.role is FieldRole.TRAINING_AUXILIARY_TARGET
+    assert not spec.candidate_input_enabled
+
+    # 2. Targets exist only where fitting happens. No auxiliary outcome is served for any phase
+    #    the model is scored on.
+    for phase in (DataPhase.TRAIN, DataPhase.INNER_TRAIN):
+        assert _require_train_target(key, phase) is not None
+    for phase in (DataPhase.INNER_VALID, DataPhase.OUTER_VALID, DataPhase.FINAL):
+        with pytest.raises(CapabilityError, match="only for train or inner_train"):
+            _require_train_target(key, phase)
+
+
+def test_the_history_grant_did_not_widen_when_the_target_grant_was_added() -> None:
+    """Feature aggregation reads its own grant; supervision must not leak into it."""
+
+    assert HISTORY_GRANTED_AUXILIARY_OUTCOMES == ("is_click", "is_like")
+    assert "play_time_ms" not in HISTORY_GRANTED_AUXILIARY_OUTCOMES

@@ -256,9 +256,26 @@ _NUMBER_LOG_FIELDS: Final = frozenset(
 # would need mean semantics rather than the exposure/positive counting shape.
 _HISTORY_GRANTED_AUXILIARY_FIELDS: Final = frozenset({"is_click", "is_like"})
 
+# Auxiliary outcomes the trusted controller may hand a candidate as an additional TRAINING TARGET.
+# This is a different grant from the history one above and the restriction there does not apply:
+# that comment rules out non-binary fields because exposure/positive counting has no meaning for
+# them, which is an objection to aggregation shape, not to supervision.
+#
+# `play_time_ms` is here because `long_view` is derived from it and the video duration, so it is
+# the same quantity in continuous form -- a strictly richer signal for exactly what is scored, and
+# the basis of watch-time regression as practised in industry. `is_click` is the other dense
+# engagement outcome on the same impression.
+#
+# Safe by construction rather than by promise. A TRAINING_AUXILIARY_TARGET can never become a
+# model input: `candidate_input_enabled` additionally requires the INFERENCE_INPUT role, which
+# these do not have. And `_require_train_target` serves targets only for the TRAIN and INNER_TRAIN
+# phases, so no auxiliary outcome exists for the scored period at all.
+_TARGET_GRANTED_AUXILIARY_FIELDS: Final = frozenset({"is_click", "play_time_ms"})
+
 # Deterministic order, exported so the feature builder and the data plane cannot drift from the
 # reviewed field policy: the grant is declared once, here, and read everywhere else.
 HISTORY_GRANTED_AUXILIARY_OUTCOMES: Final = tuple(sorted(_HISTORY_GRANTED_AUXILIARY_FIELDS))
+TARGET_GRANTED_AUXILIARY_OUTCOMES: Final = tuple(sorted(_TARGET_GRANTED_AUXILIARY_FIELDS))
 
 _AUXILIARY_FIELDS: Final = frozenset(
     {
@@ -306,7 +323,10 @@ def _standard_spec(column: str) -> FieldSpec:
             rationale="native ranking label; same-row use is target-only",
         )
     if column in _AUXILIARY_FIELDS:
-        granted = column in _HISTORY_GRANTED_AUXILIARY_FIELDS
+        granted = (
+            column in _HISTORY_GRANTED_AUXILIARY_FIELDS
+            or column in _TARGET_GRANTED_AUXILIARY_FIELDS
+        )
         return FieldSpec(
             FieldRole.TRAINING_AUXILIARY_TARGET,
             dtype,
