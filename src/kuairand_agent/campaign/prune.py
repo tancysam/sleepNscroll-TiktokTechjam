@@ -109,11 +109,46 @@ def plan_prune(run_dir: Path | str) -> PrunePlan:
     )
 
 
+def archive_generated_source(run_dir: Path | str, runs_root: Path | str | None = None) -> int:
+    """Mirror a run's generated candidate source into a durable archive; return files copied.
+
+    ``prune`` never removes ``generated-source``, but that only protects it from this tool. A
+    whole-directory delete -- reclaiming disk by hand, say -- takes the code with it, and the
+    ledger keeps configurations rather than implementations. That happened: 129 candidate trees
+    existed across the run directories and two survived, so the recipes behind every earlier
+    measurement had to be reconstructed from config alone.
+
+    The cost of preventing it is nil. Generated source is 244 KB against a 4.4 GB run, roughly
+    five thousandths of one percent; the bulk is regenerable feature cache. Mirroring is
+    idempotent and never overwrites, so an archived tree stays as it was first written.
+    """
+
+    root = Path(run_dir)
+    source = root / "production" / "generated-source"
+    if source.is_symlink() or not source.is_dir():
+        return 0
+    archive = (Path(runs_root) if runs_root is not None else root.parent) / "archive"
+    destination = archive / "generated-source" / root.name
+    copied = 0
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        target = destination / path.relative_to(source)
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        copied += 1
+    return copied
+
+
 def prune_run(run_dir: Path | str) -> PrunePlan:
     """Remove regenerable bulk from one run directory and return what was removed."""
 
     plan = plan_prune(run_dir)
     root = plan.run_dir
+    # Archive before deleting anything, so the irreplaceable half of a run outlives the run.
+    archive_generated_source(root)
     # Verified immediately before deletion rather than only at plan time: the record must still be
     # present at the moment anything is removed.
     required = list(_REQUIRED)

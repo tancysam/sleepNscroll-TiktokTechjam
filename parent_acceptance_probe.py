@@ -29,8 +29,6 @@ from kuairand_agent.contract import SplitName
 from kuairand_agent.data.canonical import load_canonical_dataset
 from kuairand_agent.scoring.protected import Alignment, ProtectedScorer, SplitIdentity
 
-sys.path.insert(0, str(Path(__file__).parent / "candidate_seed"))
-
 #: Fold B as the campaign defines it in ``campaign.scientific.FOLD_DATES``.
 _PREFIX_DATES = (20220408, 20220418)
 _QUERY_DATES = (20220419, 20220421)
@@ -83,10 +81,9 @@ def _fit_and_score(
     split: SplitIdentity,
     labels: np.ndarray,
     config: dict[str, object],
+    model_impl: object,
 ) -> float:
-    """Fit the trusted parent on the prefix and score its query predictions."""
-
-    import model_impl  # the candidate seed's own scorer, unmodified
+    """Fit the supplied candidate implementation on the prefix and score its query predictions."""
 
     checkpoint = model_impl.train_model(train_features, train_targets, train_groups, config, 0)
     scores = model_impl.predict_scores(query_features, checkpoint)
@@ -100,7 +97,28 @@ def _fit_and_score(
     )
 
 
-def main(data_dir: str, starter_dir: str) -> int:
+def _load_candidate(directory: Path) -> tuple[object, dict[str, object]]:
+    """Import a candidate tree's ``model_impl`` and its own ``config.json``.
+
+    Any candidate directory works, not only ``candidate_seed``: the point of this probe is to run
+    the recipe that a recorded measurement actually used, and the best FM-lineage implementations
+    survive as complete source under a run's ``generated-source/``.
+    """
+
+    import importlib.util
+    import json
+
+    spec = importlib.util.spec_from_file_location(
+        f"probe_model_impl_{abs(hash(str(directory)))}", directory / "model_impl.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"{directory}/model_impl.py is not importable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, json.loads((directory / "config.json").read_text(encoding="utf-8"))
+
+
+def main(data_dir: str, starter_dir: str, candidate_dir: str = "candidate_seed") -> int:
     dataset = load_canonical_dataset(Path(data_dir))
     train = dataset.split(SplitName.TRAIN)
     assert train.targets is not None
@@ -149,9 +167,9 @@ def main(data_dir: str, starter_dir: str) -> int:
     )
     scorer = ProtectedScorer(starter_dir=Path(starter_dir), trusted_alignment=alignment)
 
-    import json as _json
-
-    config = _json.loads(Path("candidate_seed/config.json").read_text(encoding="utf-8"))
+    model_impl, config = _load_candidate(Path(candidate_dir))
+    print(f"candidate {candidate_dir}")
+    print(f"family    {config.get('candidate_family')}\n")
     train_targets = np.asarray(all_labels[prefix_rows], dtype=np.float64)
     train_groups = np.asarray(
         [hash(value) % (2**31) for value in prefix_inputs.user_id], dtype=np.float64
@@ -167,6 +185,7 @@ def main(data_dir: str, starter_dir: str) -> int:
         split,
         query_labels,
         config,
+        model_impl,
     )
     # docs/RESULTS.md 3.3a. The control is the official FM's own Fold B primary.
     run_16 = 0.5745312
@@ -202,5 +221,6 @@ if __name__ == "__main__":
         main(
             sys.argv[1] if len(sys.argv) > 1 else ".data/KuaiRand-Pure/data",
             sys.argv[2] if len(sys.argv) > 2 else "kuairand-starter-kit",
+            sys.argv[3] if len(sys.argv) > 3 else "candidate_seed",
         )
     )

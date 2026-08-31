@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -135,3 +136,35 @@ def test_iter_run_dirs_finds_only_real_campaign_runs(tmp_path: Path) -> None:
     (tmp_path / "ledger.sqlite3").write_bytes(b"x")
 
     assert [path.name for path in iter_run_dirs(tmp_path)] == ["alpha", "beta"]
+
+
+def test_generated_source_is_archived_before_anything_is_pruned(tmp_path: Path) -> None:
+    """prune protects generated-source, but only from prune.
+
+    A whole-directory delete takes the code with it, and the ledger keeps configurations rather
+    than implementations. That happened here: 129 candidate trees existed across the run
+    directories and two survived, so the recipe behind every earlier measurement had to be
+    recovered from config alone. Generated source is 244 KB against a 4.4 GB run, so the
+    archive costs nothing and is written before any deletion.
+    """
+
+    from kuairand_agent.campaign.prune import archive_generated_source
+
+    run = tmp_path / "runs" / "campaign-a"
+    source = run / "production" / "generated-source" / "candidate-01-abcdef"
+    source.mkdir(parents=True)
+    (source / "model_impl.py").write_text("# the recipe\n", encoding="utf-8")
+    (source / "config.json").write_text('{"rank": 8}', encoding="utf-8")
+
+    assert archive_generated_source(run) == 2
+    archived = tmp_path / "runs" / "archive" / "generated-source" / "campaign-a"
+    assert (archived / "candidate-01-abcdef" / "model_impl.py").read_text() == "# the recipe\n"
+
+    # Idempotent, and never overwrites: an archived tree stays as it was first written.
+    (source / "model_impl.py").write_text("# edited after archiving\n", encoding="utf-8")
+    assert archive_generated_source(run) == 0
+    assert (archived / "candidate-01-abcdef" / "model_impl.py").read_text() == "# the recipe\n"
+
+    # The archive survives the run directory itself being removed by hand.
+    shutil.rmtree(run)
+    assert (archived / "candidate-01-abcdef" / "model_impl.py").is_file()
