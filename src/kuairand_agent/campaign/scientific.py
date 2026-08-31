@@ -1265,16 +1265,20 @@ def run_scientific_campaign(
             # rather than proof of them, so the reason is named for what was observed.
             # Naming the cause matters as much here: "your blend lost" and "your model was too
             # weak to be worth confirming" are different lessons, and only one of them is true.
-            if (
+            #
+            # Order matters, and getting it wrong was observed in sol6: a candidate that changed
+            # NOTHING is also, necessarily, as far below the control as its parent was, so a
+            # standalone check placed first captures it and reports "your model is too weak"
+            # when the true and far more actionable lesson is "your idea never ran". The weaker
+            # explanation must never pre-empt the stronger one.
+            if evidence.metrics is not None and _metrics_identical(evidence.metrics, parent_fold_b):
+                reason = "fold_b_no_measurable_effect"
+            elif (
                 evidence.metrics is not None
                 and standalone_shortfall is not None
                 and standalone_shortfall > Decimal(str(config.standalone_tolerance))
             ):
                 reason = "fold_b_standalone_below_control"
-            elif evidence.metrics is not None and _metrics_identical(
-                evidence.metrics, parent_fold_b
-            ):
-                reason = "fold_b_no_measurable_effect"
             else:
                 reason = "fold_b_screen_failed"
             results.append(

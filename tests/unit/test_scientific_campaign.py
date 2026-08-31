@@ -873,3 +873,28 @@ def test_a_runner_that_discloses_no_standalone_keeps_the_historical_behaviour() 
     )
 
     assert ScientificTier.FOLD_A_CONFIRMATION in [request.tier for request in requests]
+
+
+def test_changing_nothing_reports_that_rather_than_a_weak_model() -> None:
+    """Observed in sol6: the standalone check pre-empted the more actionable lesson.
+
+    A candidate whose metrics are identical to its parent's is also, necessarily, exactly as far
+    below the control as its parent was. With the standalone check placed first it reported
+    "your model is too weak to confirm" when the true lesson was "your idea never ran" -- the
+    same wrong-lesson class the reason strings exist to prevent.
+    """
+
+    def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
+        # Bit-identical to the incumbent's Fold B metrics, and far below the control.
+        return _screened(request, 0.6, standalone=0.560000, control=0.575424)
+
+    result = run_scientific_campaign(
+        config=replace(_config(), standalone_tolerance=0.001896),
+        fallback=_fallback(),
+        candidates=(_candidate(),),
+        runner=runner,
+        outer_ledger=_Ledger(),
+    )
+
+    assert result.candidates[0].outcome is CandidateOutcome.SCREEN_REJECTED
+    assert result.candidates[0].reason == "fold_b_no_measurable_effect"

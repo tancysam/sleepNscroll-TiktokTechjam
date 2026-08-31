@@ -1,26 +1,19 @@
-"""Does adding temporal columns to the parent move the Fold B score? The actual ablation.
+"""Does the promoted parent reproduce run 16's measurement? Blocking acceptance test.
 
-``temporal_signal_probe.py`` answered a correlation question and its verdict overreached in both
-directions before settling. Correlation against the incumbent column is not the incremental test
-either: the bundle already owns ``video_past_rate``'s signal, and what matters about a new feature
-is what it adds ORTHOGONALLY to what the model already fits. A within-user r of 0.035 that is
-independent of the current signal is worth roughly +0.001 GAUC, about +0.0005 primary -- the same
-magnitude as the rank-ensembling gain, which was judged real.
+``candidate_seed/model_impl.py`` was a bare logistic scorer and is now an identity-code
+factorization machine, because every campaign was spending its one shot re-deriving the scoring
+structure before its own hypothesis could be measured. Promoting a parent changes what every
+future ``parent_fold_b_primary`` MEANS, so it must be verified against the measurement it claims
+to reproduce rather than assumed to work.
 
-So this fits the actual parent, twice, on the actual Fold B split, and scores both with the
-protected organizer scorer. No proxies.
-
-    baseline   the 76-column bundle exactly as candidates receive it
-    treatment  the same 76 plus three impression-side temporal columns
-
-The three are properties of the impression rather than of its outcome, so they are inside the
-causal cutoff: position within the user's session, log time since their previous impression, and
-the sine of the time of day. Fold B is the screen every candidate faces: prefix 2022-04-08..18,
-query 04-19..21.
+docs/RESULTS.md 3.3a records run 16 at Fold B standalone 0.5745 against a 0.5754 control -- about
+one sigma down, and the best standalone this project has produced. If the rewired parent does not
+land within roughly one measured sigma of that, every later verdict would read "versus an
+unverified reimplementation", which is the retracted-headline problem rebuilt at the foundation.
 
 Read only, training rows only. Repository root, outside the hash_source_tree slice.
 
-Run:  python3 temporal_ablation_probe.py
+Run:  python3 parent_acceptance_probe.py
 """
 
 from __future__ import annotations
@@ -175,46 +168,33 @@ def main(data_dir: str, starter_dir: str) -> int:
         query_labels,
         config,
     )
-    treatment_train = np.hstack(
-        (baseline_train, _temporal_columns(prefix_inputs, _order_by_user_then_time(prefix_inputs)))
+    # docs/RESULTS.md 3.3a. The control is the official FM's own Fold B primary.
+    run_16 = 0.5745312
+    control = 0.5754240
+    sigma = 0.000316
+    print(f"    promoted parent, Fold B standalone  {baseline:.7f}")
+    print(f"    run 16, the target                  {run_16:.7f}")
+    print(f"    official FM control                 {control:.7f}")
+    print(
+        f"    parent minus run 16                 {baseline - run_16:+.7f}"
+        f"   ({(baseline - run_16) / sigma:+.2f} sigma)"
     )
-    treatment_query = np.hstack(
-        (baseline_query, _temporal_columns(query_inputs, _order_by_user_then_time(query_inputs)))
+    print(
+        f"    parent minus control                {baseline - control:+.7f}"
+        f"   ({(baseline - control) / sigma:+.2f} sigma)"
     )
-    treatment = _fit_and_score(
-        treatment_train,
-        train_targets,
-        train_groups,
-        treatment_query,
-        scorer,
-        alignment,
-        split,
-        query_labels,
-        config,
-    )
-
-    delta = treatment - baseline
-    print(f"    parent, 76 columns                  {baseline:.7f}")
-    print(f"    parent + 3 temporal columns         {treatment:.7f}")
-    print(f"    delta                               {delta:+.7f}")
     print()
-    # 0.000316 is the measured seed sigma (docs/RESULTS.md 3.4); epsilon is 0.002.
-    print(f"    in measured sigma                   {delta / 0.000316:+.2f}")
-    if delta <= -0.000316:
-        print("\n    VERDICT: NEGATIVE. The columns cost more than they add on this base. A")
-        print("    linear scorer cannot use a non-monotone term like session position, so this")
-        print("    retires the axis for the current parent and would need re-running against a")
-        print("    non-linear one before the axis could be called dead in general.")
-    elif delta < 0.000316:
-        print("\n    VERDICT: below one sigma. Temporal position is not a lever worth an")
-        print("    iteration, and the plateau finding keeps the pillar this was meant to test.")
-    elif delta < 0.002:
-        print("\n    VERDICT: real but below epsilon, on the order of the rank-ensembling gain.")
-        print("    Worth carrying on a competitive base, where increments of this size decide")
-        print("    whether a standalone win happens; not worth a scientific iteration alone.")
-    else:
-        print("\n    VERDICT: clears epsilon on its own. This is the mechanism to build.")
-    return 0
+    if abs(baseline - run_16) <= sigma:
+        print("    ACCEPTED. The promoted parent reproduces the measurement it claims.")
+        return 0
+    if baseline > run_16:
+        print("    ACCEPTED, and stronger than the target. Verify the gain is real before")
+        print("    relying on it, but nothing here blocks a campaign.")
+        return 0
+    print("    REJECTED. The promoted parent does not reproduce run 16 within one sigma.")
+    print("    Do not run a campaign on it: every parent_fold_b_primary would then mean")
+    print("    'versus an unverified reimplementation'.")
+    return 1
 
 
 if __name__ == "__main__":

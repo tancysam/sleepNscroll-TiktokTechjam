@@ -3646,6 +3646,7 @@ def _evaluation_scope_digest(
     dataset_digest: str,
     scorer_digest: str,
     feature_bundle_digest: str,
+    candidate_seed_digest: str,
 ) -> str:
     """Identity of everything that determines what a recorded metric means.
 
@@ -3654,19 +3655,53 @@ def _evaluation_scope_digest(
     feature bundle; editing a prompt, a selector or a circuit breaker cannot make it false, so
     that evidence should outlive our own development. Changing the features or the scorer does
     change what the number means, and both are inputs here, so the scope correctly resets then.
+
+    The candidate seed belongs here for the same reason and was missing. Every recorded verdict
+    is relative to an incumbent descended from the trusted parent: "lost a full inner-fold
+    evaluation" means lost to THAT parent's lineage. Promote a stronger parent and the old
+    verdicts would silently keep closing families against a baseline that no longer exists,
+    which is a measurement made under different conditions being read as though it still holds.
+    Including the seed digest expires that evidence exactly when the parent changes, and never
+    when unrelated controller code does.
     """
 
     return hashlib.sha256(
         canonical_json_bytes(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "benchmark_digest": benchmark_digest,
                 "dataset_digest": dataset_digest,
                 "scorer_digest": scorer_digest,
                 "feature_bundle_digest": feature_bundle_digest,
+                "candidate_seed_digest": candidate_seed_digest,
             }
         )
     ).hexdigest()
+
+
+def _candidate_seed_digest(project_root: Path) -> str:
+    """Content digest of the trusted parent tree a campaign's candidates start from.
+
+    Deliberately independent of ``load_parent_snapshot``: that enforces the candidate protocol
+    and raises for a tree that does not satisfy it, and a provider-free campaign has no parent
+    to satisfy it with. The evaluation scope must be computable for every campaign, so this
+    hashes bytes and answers a fixed sentinel when there is no seed tree at all.
+    """
+
+    seed = project_root / "candidate_seed"
+    if not seed.is_dir() or seed.is_symlink():
+        return hashlib.sha256(b"kuairand-candidate-seed-absent-v1").hexdigest()
+    entries: list[tuple[str, str]] = []
+    for path in sorted(seed.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        entries.append(
+            (
+                path.relative_to(seed).as_posix(),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        )
+    return hashlib.sha256(canonical_json_bytes({"schema_version": 1, "files": entries})).hexdigest()
 
 
 def _lineage_ledger_location(
@@ -4200,6 +4235,10 @@ def run_provider_free_campaign(
             # matrix digest hashes the feature names, shape and float bytes, so it changes when
             # the features genuinely change and not when a prompt does.
             feature_bundle_digest=features.outer_and_final.prefix.digest,
+            # Scopes recorded verdicts to the parent they were measured against; see the
+            # docstring. The snapshot is a pure read of the seed tree and is loaded again later
+            # for the research portfolio; only its digest is needed here.
+            candidate_seed_digest=_candidate_seed_digest(root),
         )
         _stage(
             progress,

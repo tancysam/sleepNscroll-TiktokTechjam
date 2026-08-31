@@ -124,7 +124,15 @@ throwaway work.
 
 Where the headroom is. These are all reachable from your interface and all worth covering; the
 campaign has few iterations, so prefer a direction the records show has not been measured yet
-rather than a variation on one that has:
+rather than a variation on one that has.
+
+NOVELTY APPLIES TO WHAT YOU ADD, NEVER TO THE BASE. Building the strongest known scoring
+structure is not a repeated direction, it is the floor you build from, and re-deriving a weaker
+one to be novel is the most expensive mistake available to you. Measured: candidates that
+rebuilt the base scored 0.5693, 0.5674 and 0.5724 standalone, all bracketing the trusted
+parent's own 0.5698, against a control at 0.5754 -- so the iteration bought nothing and the
+hypothesis on top of it was never really tested. Start from the parent's best known structure,
+then be novel in the increment:
 1. Identity embeddings combined with the causal aggregate columns, trained under a ranking
    objective. The baseline has identities but no causal aggregates; earlier candidates had
    aggregates but no identities. Holding both is strictly more information than either.
