@@ -13,7 +13,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 11
+PROMPT_VERSION: Final = 12
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -94,6 +94,13 @@ burns one of three slots to test a number. Every new method you propose should a
 internal search already in it: a small grid over the parameters you are least sure of, an honest
 inner split to select on, and a guard that keeps the parent configuration when nothing beats it.
 Report which setting won in training_diagnostics.
+
+Propose mechanisms the implementation can actually build. The parent already ships tested helpers
+for the pieces that used to crash branches: categorical code extraction, per-fold embedding table
+sizing, the FM second-order interaction term, and within-user pair sampling. A proposal that rests
+on those plus a grid over a training function is cheap and reliable. A proposal that requires
+hand-rolled interaction algebra, a bespoke sampler or a custom checkpoint validator is where eight
+of eight branches died, so ask for those only when the hypothesis genuinely needs them.
 
 Two consequences worth stating explicitly. First, a direction that lost at ONE configuration has
 not been shown to be a dead direction, so read a prior campaign's candidate_config_json before
@@ -349,8 +356,25 @@ objective above ignores it entirely.
 Size, measured in this campaign. Every candidate at or under about 260 lines executed. Of the
 eight written at over 580 lines, none executed: they died in hand-rolled interaction maths, in
 pair-sampling index arithmetic, or in their own bespoke validators. Write the smallest
-implementation that tests your hypothesis. Elaborate optimizers, multi-stage training and custom
-checkpoint validators are where branches are lost, not where score is won.
+implementation that tests your hypothesis.
+
+Read that as a warning about BESPOKE MACHINERY, not about doing several fits. The branches that
+died were writing their own interaction algebra, their own pair samplers and their own checkpoint
+validators. Those are all provided and tested below: call them.
+
+A loop that fits the SAME tested training function two or three times at different settings and
+keeps the best on an inner split is not what lost those branches. It adds a few lines around code
+that already works, and it is where the campaign's scarcest resource is saved: a new hypothesis
+costs one of only about three scientific iterations, while additional fits inside one candidate
+cost none. If the proposal you were handed specifies an internal grid, an inner split or a seed
+ensemble, IMPLEMENT IT -- it is cheap in risk and expensive to skip.
+
+What you must not do is silently ship a different, simpler model than the one proposed. The
+material-change gate gives you no credit for that: it checks that your code changed, never that it
+implements the mechanism you were given, so a downgrade passes every check and wastes the
+iteration anyway. If the proposal genuinely cannot be built inside the runtime contract, implement
+the closest thing that can be and say so in training_diagnostics; do not substitute a familiar
+architecture for the proposed one without a word.
 
 The parent already provides four tested helpers. Call them; do not reimplement them.
 
@@ -436,7 +460,13 @@ _OPERATION: Final = {
 parent, with complete content for each returned file; never return patches or filesystem
 references. Preserve the request_id. Change model_impl.py, config.json, or transitively reachable
 helper modules. Never return or replace any runtime_contract.stable_files.protected_paths entry.
-Materially implement the declared mechanism while respecting the
+You are implementing request.proposal, which is supplied in full. Build THAT
+mechanism: its objective, its sampling and weighting, and the inner_fold_plan and smoke_plan it
+declares, including any grid, inner split or seed ensemble those plans specify. Nothing downstream
+checks that your code matches the proposal -- the material-change gate only checks that the code
+changed -- so a simpler substitute passes every automated check and still wastes the iteration.
+Implement the proposal or, if the runtime contract genuinely forbids part of it, implement the
+closest reachable version and record the deviation in training_diagnostics. Respect the
 request's complete candidate-source policy. In material_symbols, list only bare
 top-level ASCII Python identifiers; they must be reachable top-level Python identifiers changed
 by this response relative to the trusted parent. Never list filenames, paths, qualified names, or

@@ -178,7 +178,7 @@ def test_schema_retry_appends_only_a_correction_notice() -> None:
 def test_prompt_version_matches_the_response_schema_name() -> None:
     """``provider.py`` builds ``kuairand_<operation>_v{PROMPT_VERSION}``; tests pin ``_v7``."""
 
-    assert PROMPT_VERSION == 11
+    assert PROMPT_VERSION == 12
 
 
 @pytest.mark.parametrize("bad", [None, "propose", 0, object()])
@@ -355,3 +355,39 @@ def test_implement_briefing_points_at_the_provided_helpers_and_their_shapes() ->
     assert "(N,)" in rendered
     # The measured size finding.
     assert "260 lines" in rendered
+
+
+# A live campaign proposed an FM hybrid with an internal grid and a seed ensemble, then shipped a
+# plain LightGBM ranker with a flat config instead. The two instructions were in direct conflict
+# and split across operations that never saw each other: PROPOSE was told every method should
+# arrive with its own internal search, while IMPLEMENT was told multi-stage training is where
+# branches are lost. The agent followed both, in opposite directions.
+
+
+def test_implement_is_told_to_build_the_proposal_it_was_handed() -> None:
+    """Nothing downstream checks that the code matches the proposal, so the prompt must."""
+
+    rendered = " ".join(instructions_for(ResearchOperation.IMPLEMENT).split())
+    assert "You are implementing request.proposal" in rendered
+    assert "inner_fold_plan" in rendered
+    assert "a simpler substitute passes every automated check" in rendered
+    assert "record the deviation in training_diagnostics" in rendered
+
+
+def test_the_size_warning_does_not_forbid_an_internal_grid() -> None:
+    """ "Smallest implementation" must not read as "do not do several fits"."""
+
+    rendered = " ".join(instructions_for(ResearchOperation.IMPLEMENT).split())
+    assert "BESPOKE MACHINERY, not about doing several fits" in rendered
+    assert "IMPLEMENT IT" in rendered
+    # The retracted phrasing named multi-stage training itself as the thing that loses branches.
+    assert "multi-stage training and custom" not in rendered
+
+
+@pytest.mark.parametrize("operation", _SCIENCE_OPERATIONS)
+def test_proposals_are_steered_toward_the_tested_helpers(operation: ResearchOperation) -> None:
+    """A proposal that needs bespoke maths is one the implementation is warned away from."""
+
+    rendered = " ".join(instructions_for(operation).split())
+    assert "Propose mechanisms the implementation can actually build" in rendered
+    assert "hand-rolled interaction algebra" in rendered
