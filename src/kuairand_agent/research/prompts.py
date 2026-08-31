@@ -12,7 +12,7 @@ from kuairand_agent.research.source_policy import (
     CandidateSourcePolicy,
 )
 
-PROMPT_VERSION: Final = 11
+PROMPT_VERSION: Final = 12
 
 _COMMON: Final = """You are the bounded research model inside the KuaiRand-Pure ML campaign.
 Use only the supplied request. You have no filesystem, shell, network, evaluator, credential, or
@@ -141,6 +141,29 @@ twelve. Start from that structure. Two further measurements from the same run: p
 loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
 collapsed it to 0.5630, so do not replace the loss.
 
+THE REMAINING GAP IS OPTIMISATION, NOT MODELLING, AND IT IS THE FIRST THING TO FIX. The control
+trains with MINI-BATCH ADAM: batch size 8192, up to 40 epochs, the row order reshuffled every epoch
+from a seeded generator, Adam moments with bias correction, and early stopping with patience 4. On
+1,141,112 training rows that is about 140 batches per epoch, so roughly 5,570 parameter updates.
+The worked example in these instructions demonstrates deterministic FULL-BATCH gradient descent
+with a fixed step: about 20 updates in total, no momentum, no adaptive step. Every candidate this
+project has generated copied that loop. So the 0.5745 result above, and every earlier one, came
+from a model that took roughly 20 optimisation steps against a control that took roughly 5,570.
+That is a factor of about 278, and it is the most likely reason a one sigma deficit survived every
+change to features, capacity and loss. The organizers separately measured that neither features nor
+capacity is the bottleneck, which is consistent.
+
+You may fix this and it stays byte-exact reproducible, because the control does exactly the same
+thing: draw one permutation per epoch from `numpy.random.default_rng(seed)`, iterate fixed-size
+slices of it, and keep Adam's two moment arrays alongside your parameters. Match the control's
+optimisation budget before you try to beat it on anything else. Hold the interaction structure
+above fixed while you do it, and change the optimiser only. A metric-matched weight or a
+regularisation schedule cannot express itself in 20 gradient steps, so this comes first.
+
+Once you have MEASURED optimisation parity and it is working, ONE later iteration may try a single
+enhancement above Adam, such as Lookahead fast and slow weight averaging, or sharpness-aware
+minimisation. Never before parity is on the board, and never more than one at a time.
+
 SEED ENSEMBLING inside one candidate has been measured and is a dead end. Training five copies of
 the same scorer on the same data and averaging their raw scores in `predict_scores` scored 0.5740
 standalone against 0.5745 for the identical single-copy scorer: flat, and slightly worse. The
@@ -241,7 +264,9 @@ The parent `model_impl.py` contains, among other definitions:
 
 ```python
 def train_model(features, targets, user_groups, config, seed):
-    # Fixed-step standardized logistic model, deterministic full-batch updates.
+    # WARNING: this parent loop is UNDER-TRAINED and is shown for its interface, not as a
+    # pattern to copy. It takes about 20 full-batch fixed-step updates; the official control
+    # takes about 5,570 mini-batch Adam updates. Replace this loop.
     normalized = (features - mean) / scale
     weights = np.zeros(features.shape[1], dtype=np.float64)
     for _ in range(epochs):

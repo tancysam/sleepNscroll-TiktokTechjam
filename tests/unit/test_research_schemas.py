@@ -150,6 +150,39 @@ def test_generated_package_json_round_trip_rejects_schema_drift() -> None:
         GeneratedPackage.from_mapping(payload)
 
 
+def test_generated_package_deduplicates_repeated_material_symbols() -> None:
+    """A repeated declaration is normalized, not fatal.
+
+    maki-overnight-20 lost its only iteration to this: the model returned a complete, correct
+    implementation whose material_symbols listed 23 entries with 10 repeats, the response was
+    rejected outright, and max_malformed_retries = 1 ended the branch. Naming a symbol twice
+    asserts nothing beyond naming it once, and materiality is decided separately by comparing
+    top-level AST nodes.
+    """
+
+    payload = {
+        "schema_version": 1,
+        "request_id": "implement-1",
+        "response_id": "response-1",
+        "files": [{"path": "candidate.py", "content": "def train_model():\n    pass\n"}],
+        "material_change_summary": "Change the training implementation.",
+        "material_symbols": ["train_model", "score", "train_model", "score", "train_model"],
+    }
+
+    package = GeneratedPackage.from_mapping(payload)
+    assert package.material_symbols == ("train_model", "score")
+    # The dataclass invariant itself stays strict; only untrusted wire input is normalized.
+    with pytest.raises(SchemaValidationError, match="duplicates"):
+        GeneratedPackage(
+            schema_version=package.schema_version,
+            request_id=package.request_id,
+            response_id=package.response_id,
+            files=package.files,
+            material_change_summary=package.material_change_summary,
+            material_symbols=("train_model", "train_model"),
+        )
+
+
 @pytest.mark.parametrize(
     "material_symbol",
     ["README.md", "candidate.py", "candidate.py.train_model", "train-model"],

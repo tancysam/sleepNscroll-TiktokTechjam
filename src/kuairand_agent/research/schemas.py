@@ -157,6 +157,34 @@ def _string_tuple(
     return result
 
 
+def _deduplicated(value: object) -> object:
+    """Collapse repeats in an untrusted declaration list, preserving first-seen order.
+
+    ``material_symbols`` declares WHICH definitions changed; naming one twice says nothing
+    different from naming it once.  A live campaign was nonetheless lost to it: the model returned
+    a complete, correct implementation whose symbol list repeated ``train_model`` and nine others,
+    the strict duplicate check rejected the whole response, and with ``max_malformed_retries = 1``
+    the branch died having produced working code.  Repeats are normalized here, on untrusted wire
+    input only; the dataclass invariants stay strict, and materiality itself is still decided by
+    ``require_material_executable_change`` comparing top-level AST nodes.
+
+    Anything that is not a list passes through untouched so the caller's own validation still
+    produces the right error.
+    """
+
+    if not isinstance(value, list):
+        return value
+    seen: set[str] = set()
+    ordered: list[object] = []
+    for item in value:
+        if type(item) is str:
+            if item in seen:
+                continue
+            seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
 def _mapping(value: object, location: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
         raise SchemaValidationError(f"{location} must be a JSON object")
@@ -641,7 +669,7 @@ class GeneratedPackage:
                 "generated_package.material_change_summary",
             ),
             material_symbols=_string_tuple(
-                raw["material_symbols"],
+                _deduplicated(raw["material_symbols"]),
                 "generated_package.material_symbols",
                 maximum_items=32,
             ),
@@ -822,7 +850,9 @@ class RejectedPackageSnapshot:
                 raw["material_change_summary"], "rejected_package.material_change_summary"
             ),
             material_symbols=_string_tuple(
-                raw["material_symbols"], "rejected_package.material_symbols", maximum_items=32
+                _deduplicated(raw["material_symbols"]),
+                "rejected_package.material_symbols",
+                maximum_items=32,
             ),
             package_digest=_text(raw["package_digest"], "rejected_package.package_digest"),
         )
