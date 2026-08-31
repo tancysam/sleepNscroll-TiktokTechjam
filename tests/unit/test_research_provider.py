@@ -247,15 +247,17 @@ def test_gateway_payload_uses_gateway_reasoning_contract(
     model.propose(_proposal_request())
 
     payload = json.loads(transport.requests[0].body)
-    assert "reasoning_effort" not in payload
     if base_url.startswith("https://api.tokenrouter.com"):
-        # This host ignores both reasoning_effort and the gateway reasoning object. Measured:
-        # the OpenAI-style controls left 92% of completion tokens as reasoning and pushed
-        # implement calls past the configured timeout, so the effort is sent as an explicit
-        # budget instead, which the host honours exactly.
+        # This host used to require the ``thinking`` switch and now rejects it outright with
+        # ``400 Unknown parameter: 'thinking'``, which failed the first provider call of every
+        # campaign. It honours the standard control instead: reasoning_effort "high" returned
+        # 242 reasoning tokens on a prompt that needs them. A trivial prompt still reports zero,
+        # which is the model declining to think, not the parameter being ignored.
+        assert payload["reasoning_effort"] == "low"
+        assert "thinking" not in payload
         assert "reasoning" not in payload
-        assert payload["thinking"] == {"type": "enabled"}
     else:
+        assert "reasoning_effort" not in payload
         assert payload["reasoning"] == {"effort": "low", "exclude": True}
         assert "thinking" not in payload
     if base_url.startswith("https://openrouter.ai/"):

@@ -55,18 +55,19 @@ _PRICE_RE: Final = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?\Z")
 _REASONING_EFFORTS: Final = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _GATEWAY_REASONING_HOSTS: Final = frozenset({"openrouter.ai"})
 # Hosts that ignore both ``reasoning_effort`` and the gateway ``reasoning`` object, and
-# instead expose a ``thinking`` switch.  Measured against api.tokenrouter.com on real
-# request payloads: neither OpenAI-style control has any effect, and ``budget_tokens`` is
-# advisory only -- a 4096 budget still returned 11k-26k reasoning tokens.  Reasoning is
-# billed as completion tokens, so on this host it consumed most of ``max_output_tokens``
-# and the generated files arrived truncated: unterminated string literals, an empty
-# config.json, and one response that repeated the same path twelve times.  Disabling it
-# returned the same request in 12s instead of 334s with the full output budget intact.
+# instead expose a ``thinking`` switch.
 #
-# The switch is therefore treated as binary here, and it is left ON for every effort this
-# campaign configures.  Only an explicit request for no reasoning turns it off, because the
-# alternative is worse: see ``_THINKING_DISABLED_EFFORTS`` below.
-_THINKING_SWITCH_HOSTS: Final = frozenset({"api.tokenrouter.com"})
+# ``api.tokenrouter.com`` was measured into this set and has since been measured out of it.
+# That host now REJECTS the switch outright -- ``400 Unknown parameter: 'thinking'`` -- which
+# failed every propose call on the first request of a campaign, and it now honours the standard
+# control instead: ``reasoning_effort: "high"`` returned 242 reasoning tokens on a prompt that
+# needs them and a correct answer.  A trivial prompt still reports zero, which is the model
+# declining to think rather than the parameter being ignored, so do not re-derive "no effect"
+# from an easy question.
+#
+# The set is kept because the dialect problem it solves is real and another gateway may need it.
+# It is empty because no host we currently use does.
+_THINKING_SWITCH_HOSTS: Final = frozenset[str]()
 # Measured: with thinking disabled this model stops writing code and returns 18-character
 # stubs -- every file identical, and "import numpy as np" written into config.json.  Only an
 # explicit request for no reasoning disables it; the cost is paid in output budget instead.
