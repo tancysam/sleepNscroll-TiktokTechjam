@@ -329,11 +329,19 @@ against the recorded digest; every one matches exactly. Run 14's two commits sha
 **Runs 16 and 17 are the only bundles that replay against the repository as submitted.** Every
 earlier bundle requires checking out its own older commit first.
 
-`runs/maki-overnight-15/final` is the **only agent-generated submission** the project produced
-(SHA-256 `c98d7cd6…`, organizer checker rc=0) and it cannot be replayed at any commit.
-`replay_final_bundle` calls `_verify_closed_bundle` before the current-source check, so at a fixed
-commit it fails source identity, and at its own commit `8124607` the float32 defect it was stranded
-by is still present and the bundle check fails. Both doors are shut, exactly as for run 13.
+`runs/maki-overnight-15/final` was for a long time the **only agent-generated submission** the
+project had produced (SHA-256 `c98d7cd6…`, organizer checker rc=0), and it cannot be replayed at
+any commit. `replay_final_bundle` calls `_verify_closed_bundle` before the current-source check, so
+at a fixed commit it fails source identity, and at its own commit `8124607` the float32 defect it
+was stranded by is still present and the bundle check fails. Both doors are shut, exactly as for
+run 13.
+
+That is no longer the only one. The sol6 and sol7 campaigns each finalized an agent-generated
+bundle at the current commit — `runs/sol7-20260831T124700Z/final` and
+`runs/sol7-20260831T131245Z/final`, both 170,588 rows with organizer checker rc=0 — and both
+replay against the repository as submitted rather than needing an older checkout. Their scores are
+in the table above; neither clears epsilon, and the second is one of two campaigns run under
+`CONTINUE_ON_SUCCESS=1`, so it must be read as one of N rather than as a single measurement.
 
 `runs/maki-overnight-13` has no bundle. Its campaign ran at `f66e364`
 (`cca9cc26a6e57fdb36fc6dfb…`) and promoted a generated candidate for the first time, which exposed
