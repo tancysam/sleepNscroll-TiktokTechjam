@@ -46,10 +46,13 @@ response_format = "json_schema"
 max_tokens_parameter = "max_completion_tokens"
 send_reasoning_effort = true
 
+# deepseek/deepseek-v4-pro-0813 as served by OpenRouter, read from its models endpoint.
+# Cost reporting is derived from these numbers rather than inferred at runtime, so a stale
+# block silently misreports spend.
 [research.openai.main.pricing]
-input_usd_per_million = "4.00"
-cached_input_usd_per_million = "0.40"
-output_usd_per_million = "20.00"
+input_usd_per_million = "0.66"
+cached_input_usd_per_million = "0.022"
+output_usd_per_million = "1.98"
 
 [research.openai.fallback]
 api_key_env = "INFERENCE_FALLBACK_API_KEY"
