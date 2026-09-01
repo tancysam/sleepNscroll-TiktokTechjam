@@ -1,7 +1,8 @@
 # Autonomous KuaiRand-Pure ML Research Agent
 
-This repository provides a local implementation of the autonomous research campaign in
-[`plan.md`](plan.md). The operative benchmark is within-user `long_view` ranking over
+This repository implements an autonomous ML research campaign end to end; the architecture and
+the reasoning behind it are described in [How the agent works](#how-the-agent-works) below and in
+[`docs/RESULTS.md`](docs/RESULTS.md). The operative benchmark is within-user `long_view` ranking over
 logged KuaiRand-Pure impressions. The untouched organizer evaluator reports GAUC and nDCG@5;
 their arithmetic mean is the primary metric.
 
@@ -421,9 +422,10 @@ Headline, stated conservatively:
 | **Five-seed rank ensemble of the official FM (validation, shipped)** | 0.6688063 | 0.5364006 | **0.6026034** |
 
 **No generated candidate has beaten the baseline by a material margin, and we do not claim an
-improvement.** Nine live autonomous campaigns ran with **zero manual interventions**; seventeen
-campaigns in total across the project. Seven selected the protected official-FM fallback; two
-promoted a generated candidate, neither clearing ε = 0.002.
+improvement.** Every live autonomous campaign ran with **zero manual interventions**;
+twenty-five campaigns in total across the project, eighteen of which produced a final bundle.
+Seven selected the protected official-FM fallback; two promoted a generated candidate, neither
+clearing ε = 0.002.
 
 The best generated result, `maki-overnight-15` `candidate-01`, scored 0.6017246 against an
 incumbent of 0.6014403 — **+0.0002844, or 0.36 of one seed standard deviation.** The same method
@@ -436,8 +438,8 @@ Three caveats we went looking for and are reporting against ourselves:
 - **The agent's number is a blend, not its model.** Every candidate prediction is rank-fused with
   the official FM over a fixed five-point weight grid, and the recorded metric is the blend's.
   0.6017246 is a 25/75 blend, so roughly three quarters of it is the organizer's ordering. Scored
-  alone, no candidate we have run has beaten the baseline — best is 0.5745312 against 0.5754240,
-  or −1.12σ. Reproduce with `python3 fusion_audit.py <run-id>`; the analysis is in
+  alone, no candidate we have run has beaten the baseline — best is 0.5746261 against 0.5754240,
+  or −1.00σ. Reproduce with `python3 fusion_audit.py <run-id>`; the analysis is in
   [`docs/RESULTS.md`](docs/RESULTS.md) §3.3a.
 - **The five-seed ensemble is not an agent result.** 0.6026034 beats the 0.6016 baseline by
   +0.0010 with no selection effect. But it ensembles the organizer's own baseline with itself, it
@@ -471,7 +473,7 @@ Members are combined on within-user rank percentiles, not raw scores. That choic
 cannot perform, because prediction receives no `user_groups`. See Limitations.
 
 GPU-hours consumed: **0.00** — every configuration is CPU-only. Total provider spend across every
-run to date: **$29.27** for **2,996,874 tokens** over **141 attempts** (130 returned a usage
+run to date: **$60.61** for **6,284,739 tokens** over **262 attempts** (247 returned a usage
 block). Regenerate with `python3 token_accounting.py`.
 
 ## Limitations, and what we would do with more time
