@@ -174,11 +174,12 @@ install cannot silently change the execution profile.
 
 ## Honest status
 
-**Seventeen campaigns, ten of them reaching a terminal `COMPLETED` state under the organizers' own
-frozen rule (ε = 0.002, patience 3), with zero manual interventions in every single one.** The last five
-executed every generated candidate they produced — 22/22, 21/21, 22/22, 15/15 and 15/15 subprocess
-executions with empty stderr. Bundles are organizer-valid: 170,588 rows, checker return code 0,
-replay verified.
+**Twenty-five campaigns, eighteen of them producing a final bundle under the organizers' own
+frozen rule (ε = 0.002, patience 3), with zero manual interventions in every single one.** Five
+consecutive campaigns executed every generated candidate they produced — 22/22, 21/21, 22/22, 15/15
+and 15/15 subprocess executions with empty stderr, and the final campaign admitted and trained all
+six candidates it wrote with zero repairs and zero pre-execution rejections. Bundles are
+organizer-valid: 170,588 rows, checker return code 0, replay verified.
 
 **We do not claim an improvement over the baseline, and the reason is the most useful result we
 have.** A candidate was promoted at +0.0002715, or 0.34 of one seed standard deviation. We reran
@@ -193,7 +194,7 @@ Reported honestly, best first:
 | **Five-seed rank ensemble of the organizer FM** (submitted) | **0.6026034** | **+0.0010** | controller-side, **not agent-generated** |
 | Shipped fallback `official-fm-fallback-seed-4` | 0.6020371 | +0.0004 | best-of-five **selected on this split** |
 | Best agent candidate, fused | 0.6017246 | +0.0001 | within noise, 75% organizer FM by weight |
-| Best agent candidate, **scored alone** | 0.5745312 vs control 0.5754240 | **−1.12σ** | our model, honestly measured |
+| Best agent candidate, **scored alone** | 0.5746261 vs control 0.5754240 | **−1.00σ** | our model, honestly measured |
 
 Every caveat in that table is one we went looking for. The submitted ensemble is real and
 reproducible — `python3 build_ensemble_submission.py` regenerates it from already-qualified
@@ -205,6 +206,13 @@ it is now within about one standard deviation of a reference that gets to early-
 it is scored on, which our candidates structurally cannot.
 
 We would rather hand a judge four rows with their provenance than one row without it.
+
+**Resource accounting.** **6,284,739 LLM tokens** across 247 provider calls that returned a
+usage block, at an estimated **$60.61**, covering every campaign in the series. **0.00
+GPU-hours**, by construction rather than by approximation. **Zero manual interventions** in
+every campaign.
+The per-run breakdown, including the two accounting caveats that make the table reconcile, is
+in [`docs/RESULTS.md`](RESULTS.md) section 4.
 
 Hidden-test performance is organizer-computed and is neither known nor claimed. Full detail,
 including a section on what is *not* demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).
@@ -263,5 +271,6 @@ trained on, joined with, or pre-trained against any dataset outside KuaiRand-Pur
 
 - [`README.md`](../README.md) — overview, setup, reproduction, limitations, contributions
 - [`docs/RESULTS.md`](RESULTS.md) — results, run logs, resource accounting, integrity analysis
-- [`plan.md`](../plan.md) — full architecture and design rationale
+- [`docs/agent-memory-experiment.md`](agent-memory-experiment.md) — the cross-run memory experiment and its negative result
+- [`docs/run-logs/`](run-logs/README.md) — rendered per-iteration run log
 - [`docs/research/`](research/) — primary-source verification and implementation-readiness research
