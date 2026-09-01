@@ -777,7 +777,31 @@ each run's `production/provider-attempt-journal/`. Reasoning tokens are billed a
 | `maki-overnight-15` | 9 | 132,596 | 49,480 | 182,076 | $1.44 |
 | `maki-overnight-16` | 9 | 129,277 | 54,140 | 183,417 | $1.52 |
 | `maki-overnight-17` | 9 | 135,948 | 56,565 | 192,513 | $1.58 |
-| **Total** | **141** | **1,823,981** | **1,172,893** | **2,996,874** | **$29.27** |
+| *subtotal, runs 01–17* | *141* | *1,823,981* | *1,172,893* | *2,996,874* | *$29.27* |
+| `maki-overnight-18` | 20 | 334,499 | 228,021 | 562,520 | $5.90 |
+| `maki-overnight-19` | 2 | 33,308 | 20,545 | 53,853 | $0.54 |
+| `maki-overnight-20` | 3 | 54,750 | 40,674 | 95,424 | $1.03 |
+| `maki-overnight-21` | 18 | 322,962 | 164,718 | 487,680 | $4.59 |
+| `maki-overnight-22` | 18 | 332,969 | 169,099 | 502,068 | $4.71 |
+| `maki-overnight-23` | 18 | 344,178 | 164,005 | 508,183 | $4.66 |
+| `maki-overnight-24` | 18 | 341,756 | 151,363 | 493,119 | $4.39 |
+| **Total, runs 01–24** | **227** | **3,588,403** | **2,111,318** | **5,699,721** | **$55.09** |
+
+The second block roughly doubled total consumption and produced **no material improvement**. It is
+reported in full because the Feasibility criterion asks for total consumption to reach the result,
+and because three of those seven campaigns produced no scored candidate at all: run 19 was aborted
+by an operator command that wrote `__pycache__` into the pinned starter kit, run 20 lost its only
+iteration to a provider 402 followed by a malformed fallback response, and run 21 crashed all six
+iterations while blind to the exception message (§3.5a). Their 637,000 tokens bought two instrument
+defects and nothing else, which is an honest description of the trade.
+
+Two accounting caveats on this block. The **Calls** column here counts attempts that returned a
+usage block, matching `token_accounting.py`; the runs 01–17 subtotal counts every attempt, which is
+why 141 appears against the tool's 130 for the same period. And the cost column applies the frozen
+`4.00 / 0.40 / 20.00` pricing block throughout, which was verified against `upstream_inference_cost`
+for `openai/gpt-5.6-sol` routed through OpenRouter BYOK; runs 22 onward billed `gpt-5` directly to
+OpenAI, so their dollar figures are an **estimate at that same rate card** rather than a verified
+upstream cost. Token counts are exact in every row.
 
 Of the 1,172,893 output tokens, **854,988 are reasoning tokens** — 73% of all output. That is the
 price of leaving reasoning enabled, which is not optional here: with thinking disabled the model
