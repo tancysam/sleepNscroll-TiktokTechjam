@@ -56,9 +56,10 @@ def _campaign(path: Path) -> tuple[CampaignStore, DeadlineObservation]:
         source_digest="6" * 64,
         hard_deadline_utc=deadline.utc_deadline.isoformat(),
         initial_convergence={
-            "schema_version": 1,
+            "schema_version": 2,
             "best_primary": 0.6016,
             "non_material_streak": 0,
+            "unmeasured_streak": 0,
             "completed_iterations": 0,
             "required_completion_pending": False,
         },

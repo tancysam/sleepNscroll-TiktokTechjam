@@ -14,9 +14,11 @@ and experiment outputs out of commits.
 
 2. For deterministic local work, use `configs/default.toml` or `configs/smoke.toml`; they do not
    require an API credential.
-3. Only contributors who are intentionally running the live research provider should copy
-   `.env.example` to `.env.local` and set their own `OPENAI_API_KEY`. Do not send this file or key
-   to other contributors.
+3. Only contributors who are intentionally running live research should copy `.env.example` to
+   `.env.local` and fill both dedicated provider profiles: main and fallback API key, base URL,
+   and model. Both endpoints must support `POST {base_url}/chat/completions`. `OPENAI_API_KEY`
+   remains only for legacy schema-v2 configurations. Do not send `.env.local` or any key to other
+   contributors.
 4. Obtain the official KuaiRand data separately through the approved organizer source, then keep
    it under `.data/`. Do not commit or redistribute the data through this repository.
 

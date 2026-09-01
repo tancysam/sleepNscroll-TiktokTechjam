@@ -37,9 +37,13 @@ SCIENTIFIC_SCHEMA_VERSION: Final = 1
 HARD_LAUNCH_LIMIT: Final = 50
 HARD_OUTER_PROMOTION_LIMIT: Final = 6
 HARD_WALL_CLOCK_SECONDS: Final = 21_600
-MIN_FINALIZATION_RESERVE_SECONDS: Final = 3_600
+MIN_FINALIZATION_RESERVE_SECONDS: Final = 600
+DEFAULT_FINALIZATION_RESERVE_SECONDS: Final = 3_600
 MATCHED_SEEDS: Final = (0, 1, 2)
 SAFE_REPORTING_PRECISION: Final = 4
+# The executor caps its own failure diagnostic at 4096 characters; this bounds what a candidate
+# controlled exception message can add to a campaign record even if that ever changes.
+_MAX_CALLBACK_REASON_CHARS: Final = 4_000
 FOLD_DATES: Final = {
     "A": (20220408, 20220415, 20220416, 20220418),
     "B": (20220408, 20220418, 20220419, 20220421),
@@ -139,6 +143,10 @@ class CandidateOutcome(StrEnum):
 class CampaignStopReason(StrEnum):
     CANDIDATES_EXHAUSTED = "candidates_exhausted"
     CONVERGED = "converged"
+    # Consecutive iterations produced no eligible outer primary at all.  Distinct from CONVERGED,
+    # which is a claim that measured results plateaued; reporting this as convergence would assert
+    # a plateau nobody measured.
+    CANDIDATES_NOT_PROMOTABLE = "candidates_not_promotable"
     ITERATION_CAP = "iteration_cap"
     LAUNCH_CAP = "launch_cap"
     FINALIZATION_RESERVE = "finalization_reserve"
@@ -164,7 +172,7 @@ class ScientificCampaignConfig:
     screen_margin: float = 0.0
     elapsed_seconds_at_start: float = 0.0
     wall_clock_seconds: int = HARD_WALL_CLOCK_SECONDS
-    finalization_reserve_seconds: int = MIN_FINALIZATION_RESERVE_SECONDS
+    finalization_reserve_seconds: int = DEFAULT_FINALIZATION_RESERVE_SECONDS
     reporting_precision: int = field(init=False, default=SAFE_REPORTING_PRECISION)
     max_launches: int = field(init=False, default=HARD_LAUNCH_LIMIT)
     outer_promotion_limit: int = field(init=False, default=HARD_OUTER_PROMOTION_LIMIT)
@@ -202,7 +210,7 @@ class ScientificCampaignConfig:
             < self.wall_clock_seconds
         ):
             raise ScientificCampaignError(
-                "finalization_reserve_seconds must be at least 3600 and below the wall clock"
+                "finalization_reserve_seconds must be at least 600 and below the wall clock"
             )
         elapsed = _finite_nonnegative(self.elapsed_seconds_at_start, "elapsed_seconds_at_start")
         if elapsed > self.wall_clock_seconds:
@@ -918,7 +926,15 @@ def _invoke_runner(
     except ScientificCampaignCancelled:
         raise
     except Exception as exc:
-        return None, type(exc).__name__
+        # Keep the message, not only the class name.  The executor already builds a bounded
+        # diagnostic naming the failing operation and the underlying exception, and this reason
+        # reaches the research model as campaign_records[].candidate_reason.  Returning only
+        # type(exc).__name__ meant a model asked to repair a crash was told only the class name;
+        # a whole campaign then burned all six of its iterations guessing at a defect it had
+        # never been shown.
+        detail = str(exc).strip()
+        reason = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+        return None, reason[:_MAX_CALLBACK_REASON_CHARS]
     return evidence, None
 
 
@@ -1121,7 +1137,11 @@ def run_scientific_campaign(
 
     for candidate in candidates:
         if convergence.should_stop:
-            stop_reason = CampaignStopReason.CONVERGED
+            stop_reason = (
+                CampaignStopReason.CONVERGED
+                if convergence.converged
+                else CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+            )
             break
         if convergence.completed_iterations >= config.max_scientific_iterations:
             stop_reason = CampaignStopReason.ITERATION_CAP
@@ -1521,7 +1541,11 @@ def run_scientific_campaign(
         convergence = convergence.update_after_iteration(float(eligible_outer_primary_decimal))
 
     if stop_reason is CampaignStopReason.CANDIDATES_EXHAUSTED and convergence.should_stop:
-        stop_reason = CampaignStopReason.CONVERGED
+        stop_reason = (
+            CampaignStopReason.CONVERGED
+            if convergence.converged
+            else CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+        )
 
     return ScientificCampaignResult(
         config_digest=config.digest,

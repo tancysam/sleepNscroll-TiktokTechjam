@@ -48,9 +48,10 @@ class _Clock:
 
 def _convergence() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "best_primary": 0.6016,
         "non_material_streak": 0,
+        "unmeasured_streak": 0,
         "completed_iterations": 0,
         "required_completion_pending": False,
     }

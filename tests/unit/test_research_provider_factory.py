@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
-from kuairand_agent.config import ResearchConfig
+from kuairand_agent.config import ResearchConfig, load_config
 from kuairand_agent.research.factory import (
     AvailableResearchProvider,
     ProviderUnavailableCode,
     ProviderUnavailableDiagnostic,
+    openai_chat_completions_configs,
+    openai_responses_configs,
     select_research_provider,
 )
 from kuairand_agent.research.interface import ResearchModel
 from kuairand_agent.research.provider import (
+    OpenAIFailoverModel,
     OpenAIResponsesConfig,
     OpenAIResponsesModel,
     ResponsesTransport,
@@ -155,6 +159,64 @@ def test_openai_selection_constructs_the_real_adapter_only_after_validation() ->
     assert selection.live_provider_used is True
     assert isinstance(selection.model, OpenAIResponsesModel)
     assert "sk-proj-available-only-in-memory" not in repr(selection)
+
+
+def test_schema_v4_resolves_two_dedicated_environment_profiles() -> None:
+    research = load_config(Path(__file__).parents[2] / "configs" / "full-pure.toml").research
+    values = {
+        "INFERENCE_MAIN_BASE_URL": "https://main.example/v1",
+        "INFERENCE_MAIN_MODEL": "z-ai/glm-5.3-free",
+        "INFERENCE_FALLBACK_BASE_URL": "https://fallback.example/v1",
+        "INFERENCE_FALLBACK_MODEL": "deepseek/deepseek-v4-pro-0813",
+    }
+
+    configs = openai_chat_completions_configs(research, setting_lookup=values.get)
+
+    assert configs is not None
+    assert [(item.model, item.base_url, item.api_key_env) for item in configs] == [
+        ("z-ai/glm-5.3-free", "https://main.example/v1", "INFERENCE_MAIN_API_KEY"),
+        (
+            "deepseek/deepseek-v4-pro-0813",
+            "https://fallback.example/v1",
+            "INFERENCE_FALLBACK_API_KEY",
+        ),
+    ]
+    assert [item.response_format for item in configs] == ["json_schema", "json_schema"]
+    assert [item.max_tokens_parameter for item in configs] == [
+        "max_completion_tokens",
+        "max_completion_tokens",
+    ]
+    assert all(item.send_reasoning_effort for item in configs)
+    assert openai_responses_configs(research, setting_lookup=values.get) == configs
+
+
+def test_two_provider_selection_requires_both_credentials_and_builds_chain() -> None:
+    main = replace(_openai_config(), api_key_env="KUAIRAND_MAIN_TEST_KEY")
+    fallback = replace(
+        _openai_config(),
+        model="fallback-model",
+        base_url="https://fallback.example/v1",
+        api_key_env="KUAIRAND_FALLBACK_TEST_KEY",
+    )
+    missing = select_research_provider(
+        ResearchConfig(provider="openai", max_repairs_per_experiment=1),
+        openai_configs=(main, fallback),
+        credential_lookup=lambda name: (
+            "sk-proj-main-only" if name == "KUAIRAND_MAIN_TEST_KEY" else None
+        ),
+    )
+    assert isinstance(missing, ProviderUnavailableDiagnostic)
+    assert missing.code is ProviderUnavailableCode.CREDENTIAL_MISSING
+    assert missing.credential_env == "KUAIRAND_FALLBACK_TEST_KEY"
+
+    available = select_research_provider(
+        ResearchConfig(provider="openai", max_repairs_per_experiment=1),
+        openai_configs=(main, fallback),
+        credential_lookup=lambda _name: "sk-proj-dedicated-fixture",
+    )
+    assert isinstance(available, AvailableResearchProvider)
+    assert isinstance(available.model, OpenAIFailoverModel)
+    assert available.model.active_slot == "main"
 
 
 @dataclass

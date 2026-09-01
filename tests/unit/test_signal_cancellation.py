@@ -26,6 +26,18 @@ def test_signal_context_sets_supplied_event_and_restores_exact_prior_handlers() 
     assert {item: signal.getsignal(item) for item in prior} == prior
 
 
+def test_second_signal_escalates_blocked_cooperative_cancellation() -> None:
+    cancellation = threading.Event()
+
+    with cancellation_on_signals(cancellation):
+        active = signal.getsignal(signal.SIGTERM)
+        assert callable(active)
+        active(signal.SIGTERM, None)
+        assert cancellation.is_set()
+        with pytest.raises(KeyboardInterrupt, match="second cancellation signal"):
+            active(signal.SIGTERM, None)
+
+
 def test_signal_context_rejects_installation_outside_the_main_thread() -> None:
     observed: list[BaseException] = []
 

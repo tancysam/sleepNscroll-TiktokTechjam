@@ -34,6 +34,17 @@ class ReplayBackendKind(StrEnum):
 
     GENERATED_LAMBDARANK = "generated_lambdarank_v1"
     OFFICIAL_FM = "official_fm_v1"
+    OFFICIAL_FM_SEED_ENSEMBLE = "official_fm_seed_ensemble_v1"
+
+
+# Members are averaged after within-user rank normalisation, never on raw scores.  Measured on
+# public validation with the five qualified seeds: rank averaging scores 0.6026034 while raw score
+# averaging scores 0.6021143, against 0.6020371 for the best single seed.  Raw averaging therefore
+# recovers about one seventh of the gain, because the metric is a within-user ordering and the
+# members do not share a score scale.  See ensemble_mode_probe.py.
+OFFICIAL_FM_ENSEMBLE_COMBINATION: Final = "within_user_descending_midrank_percentile_mean_v1"
+MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS: Final = 2
+MAX_OFFICIAL_FM_ENSEMBLE_MEMBERS: Final = 16
 
 
 def _canonical_json(value: object) -> bytes:
@@ -241,7 +252,101 @@ class OfficialFMReplayRecipe:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
 
 
-type ReplayRecipe = GeneratedLambdaRankReplayRecipe | OfficialFMReplayRecipe
+@dataclass(frozen=True, slots=True)
+class OfficialFMSeedEnsembleReplayRecipe:
+    """Frozen equal-weight rank ensemble over several qualified official FM seeds.
+
+    Every member is an already-qualified organizer FM run, so this adds no new training and no new
+    data.  The members share one encoding: the organizer vocabulary is deterministic and only the
+    weight initialisation differs by seed, which is verified rather than assumed by requiring one
+    ``encoding_sha256`` across all members.
+    """
+
+    source_artifact_sha256: str
+    feature_artifact_sha256: str
+    checkpoint_artifact_sha256: str
+    data_sha256: str
+    validation_inputs_digest: str
+    final_inputs_digest: str
+    fm_members: tuple[OfficialFMMemberRecipe, ...]
+    combination: str = field(init=False, default=OFFICIAL_FM_ENSEMBLE_COMBINATION)
+    schema_version: int = field(init=False, default=REPLAY_RECIPE_SCHEMA_VERSION)
+    backend: ReplayBackendKind = field(
+        init=False, default=ReplayBackendKind.OFFICIAL_FM_SEED_ENSEMBLE
+    )
+
+    def __post_init__(self) -> None:
+        for name in (
+            "source_artifact_sha256",
+            "feature_artifact_sha256",
+            "checkpoint_artifact_sha256",
+            "data_sha256",
+            "validation_inputs_digest",
+            "final_inputs_digest",
+        ):
+            object.__setattr__(self, name, _digest(getattr(self, name), name))
+        members = self.fm_members
+        if type(members) is not tuple or not all(
+            isinstance(member, OfficialFMMemberRecipe) for member in members
+        ):
+            raise ReplayRecipeError("fm_members must be a tuple of OfficialFMMemberRecipe")
+        if not (
+            MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS
+            <= len(members)
+            <= MAX_OFFICIAL_FM_ENSEMBLE_MEMBERS
+        ):
+            raise ReplayRecipeError(
+                f"fm_members must contain between {MIN_OFFICIAL_FM_ENSEMBLE_MEMBERS} and "
+                f"{MAX_OFFICIAL_FM_ENSEMBLE_MEMBERS} members"
+            )
+        seeds = tuple(member.seed for member in members)
+        if len(set(seeds)) != len(seeds):
+            raise ReplayRecipeError("fm_members must not repeat a seed")
+        if seeds != tuple(sorted(seeds)):
+            raise ReplayRecipeError("fm_members must be ordered by ascending seed")
+        # One shared encoding keeps the member checkpoints mutually comparable and makes the
+        # bundle carry a single vocabulary rather than one copy per seed.
+        if len({member.encoding_sha256 for member in members}) != 1:
+            raise ReplayRecipeError("fm_members must share one encoding artifact")
+        if len({member.encoding_digest for member in members}) != 1:
+            raise ReplayRecipeError("fm_members must share one encoding identity")
+        if len({member.starter_manifest_sha256 for member in members}) != 1:
+            raise ReplayRecipeError("fm_members must share one organizer starter identity")
+        if len({member.checkpoint_sha256 for member in members}) != len(members):
+            raise ReplayRecipeError("fm_members must reference distinct checkpoints")
+
+    @property
+    def seeds(self) -> tuple[int, ...]:
+        return tuple(member.seed for member in self.fm_members)
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "backend": self.backend.value,
+            "combination": self.combination,
+            "source_artifact_sha256": self.source_artifact_sha256,
+            "feature_artifact_sha256": self.feature_artifact_sha256,
+            "checkpoint_artifact_sha256": self.checkpoint_artifact_sha256,
+            "data_sha256": self.data_sha256,
+            "validation_inputs_digest": self.validation_inputs_digest,
+            "final_inputs_digest": self.final_inputs_digest,
+            "fm_members": [member.manifest() for member in self.fm_members],
+        }
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json(self.manifest())
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+
+type ReplayRecipe = (
+    GeneratedLambdaRankReplayRecipe
+    | OfficialFMReplayRecipe
+    | OfficialFMSeedEnsembleReplayRecipe
+)
 
 
 def _pairs_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -375,6 +480,39 @@ def _official_from_manifest(value: dict[str, object]) -> OfficialFMReplayRecipe:
     )
 
 
+def _ensemble_from_manifest(value: dict[str, object]) -> OfficialFMSeedEnsembleReplayRecipe:
+    raw = _exact(
+        value,
+        {
+            "schema_version",
+            "backend",
+            "combination",
+            "source_artifact_sha256",
+            "feature_artifact_sha256",
+            "checkpoint_artifact_sha256",
+            "data_sha256",
+            "validation_inputs_digest",
+            "final_inputs_digest",
+            "fm_members",
+        },
+        "official FM seed ensemble recipe",
+    )
+    if raw["combination"] != OFFICIAL_FM_ENSEMBLE_COMBINATION:
+        raise ReplayRecipeError("official FM ensemble combination policy is not allowlisted")
+    members = raw["fm_members"]
+    if not isinstance(members, list):
+        raise ReplayRecipeError("fm_members must be a JSON array")
+    return OfficialFMSeedEnsembleReplayRecipe(
+        source_artifact_sha256=cast(str, raw["source_artifact_sha256"]),
+        feature_artifact_sha256=cast(str, raw["feature_artifact_sha256"]),
+        checkpoint_artifact_sha256=cast(str, raw["checkpoint_artifact_sha256"]),
+        data_sha256=cast(str, raw["data_sha256"]),
+        validation_inputs_digest=cast(str, raw["validation_inputs_digest"]),
+        final_inputs_digest=cast(str, raw["final_inputs_digest"]),
+        fm_members=tuple(_fm_from_manifest(member) for member in members),
+    )
+
+
 def parse_replay_recipe(payload: bytes) -> ReplayRecipe:
     """Parse one exact canonical JSON recipe through the executable backend allowlist."""
 
@@ -404,6 +542,8 @@ def parse_replay_recipe(payload: bytes) -> ReplayRecipe:
         return _generated_from_manifest(raw)
     if kind is ReplayBackendKind.OFFICIAL_FM:
         return _official_from_manifest(raw)
+    if kind is ReplayBackendKind.OFFICIAL_FM_SEED_ENSEMBLE:
+        return _ensemble_from_manifest(raw)
     raise ReplayRecipeError("replay backend is not allowlisted")  # pragma: no cover
 
 

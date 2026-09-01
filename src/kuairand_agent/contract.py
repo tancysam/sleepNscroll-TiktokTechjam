@@ -347,7 +347,15 @@ def verify_starter_kit(root: str | Path) -> StarterVerification:
     starter_root = Path(root)
     if not starter_root.is_dir():
         raise OrganizerIntegrityError(f"starter directory does not exist: {starter_root}")
-    actual_entries = {entry.name for entry in starter_root.iterdir()}
+    # The organizer README instructs running `python3 submit.py --check` from inside this
+    # directory before every submission, and CPython then writes __pycache__ next to the pinned
+    # files.  Treating that as tampering halted a live campaign for a directory entry that changes
+    # no pinned byte.  hash_source_tree already excludes it (campaign/provenance.py), so exclude it
+    # here too rather than leaving the organizer's own documented workflow lethal.  Every pinned
+    # file is still digest-verified below, so an actual edit is still caught.
+    actual_entries = {
+        entry.name for entry in starter_root.iterdir() if entry.name != "__pycache__"
+    }
     expected_entries = set(STARTER_FILE_SHA256)
     missing = expected_entries - actual_entries
     unexpected = actual_entries - expected_entries

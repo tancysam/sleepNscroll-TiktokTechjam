@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 
 import pytest
 
+from kuairand_agent.campaign.convergence import MAX_UNMEASURED_STREAK
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
     CandidateOutcome,
@@ -215,7 +216,9 @@ def test_fold_b_screen_failure_stops_before_fold_a_or_outer_and_preserves_fm() -
     assert result.fallback.candidate_id == "official-fm"
     assert result.launches_used == 7
     assert result.convergence.completed_iterations == 1
-    assert result.convergence.non_material_streak == 1
+    # Rejected: no eligible outer primary, so it is unmeasured rather than non-material.
+    assert result.convergence.non_material_streak == 0
+    assert result.convergence.unmeasured_streak == 1
     assert not ledger.reservations
     assert not ledger.completions
 
@@ -302,13 +305,52 @@ def test_callback_failure_is_charged_but_cannot_displace_replayable_fallback() -
 
     assert result.candidates[0].outcome is CandidateOutcome.CALLBACK_FAILED
     assert result.candidates[0].runs == ()
+    # The reason must carry the exception MESSAGE, not only its class name. It becomes
+    # campaign_records[].candidate_reason, the only account of the crash the research model ever
+    # sees, and a campaign once spent all six of its iterations guessing at a defect it had been
+    # told nothing about beyond the bare string "CandidateExecutionError".
+    assert result.candidates[0].reason == (
+        "callback_failed:RuntimeError: ordinary isolated candidate failure"
+    )
     assert result.incumbent == result.fallback == _fallback()
     assert result.launches_used == 7
     assert result.convergence.completed_iterations == 1
-    assert result.convergence.non_material_streak == 1
+    # Rejected: no eligible outer primary, so it is unmeasured rather than non-material.
+    assert result.convergence.non_material_streak == 0
+    assert result.convergence.unmeasured_streak == 1
 
 
-def test_three_nonmaterial_screens_converge_before_fourth_candidate() -> None:
+def test_callback_failure_reason_is_bounded_and_survives_an_empty_message() -> None:
+    def noisy(_: ScientificRunRequest) -> ScientificRunEvidence:
+        raise RuntimeError("x" * 10_000)
+
+    loud = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate("broken"),),
+        runner=noisy,
+        outer_ledger=_Ledger(),
+    )
+    reason = loud.candidates[0].reason
+    assert reason.startswith("callback_failed:RuntimeError: xxx")
+    assert len(reason) <= len("callback_failed:") + 4_000
+
+    def silent(_: ScientificRunRequest) -> ScientificRunEvidence:
+        raise RuntimeError
+
+    quiet = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=(_candidate("broken"),),
+        runner=silent,
+        outer_ledger=_Ledger(),
+    )
+    assert quiet.candidates[0].reason == "callback_failed:RuntimeError"
+
+
+def test_three_rejected_screens_do_not_stop_a_fourth_candidate() -> None:
+    # Screen-rejected candidates produce no eligible outer primary.  They used to end the campaign
+    # at three under the label "converged"; the fourth candidate must now still get its turn.
     seen: list[str] = []
 
     def runner(request: ScientificRunRequest) -> ScientificRunEvidence:
@@ -324,14 +366,15 @@ def test_three_nonmaterial_screens_converge_before_fourth_candidate() -> None:
         outer_ledger=_Ledger(),
     )
 
-    assert seen == ["candidate-0", "candidate-1", "candidate-2"]
-    assert len(result.candidates) == 3
-    assert result.stop_reason is CampaignStopReason.CONVERGED
-    assert result.convergence.should_stop
+    assert seen == ["candidate-0", "candidate-1", "candidate-2", "candidate-3"]
+    assert len(result.candidates) == 4
+    assert result.stop_reason is CampaignStopReason.CANDIDATES_EXHAUSTED
+    assert not result.convergence.converged
+    assert result.convergence.unmeasured_streak == 4
     assert result.incumbent.candidate_id == "official-fm"
 
 
-def test_exactly_three_nonmaterial_candidates_report_convergence_not_exhaustion() -> None:
+def test_exactly_three_rejected_candidates_report_exhaustion_not_convergence() -> None:
     result = run_scientific_campaign(
         config=_config(),
         fallback=_fallback(),
@@ -340,8 +383,26 @@ def test_exactly_three_nonmaterial_candidates_report_convergence_not_exhaustion(
         outer_ledger=_Ledger(),
     )
 
+    # Nothing was measured, so nothing plateaued: this must not be reported as convergence.
+    assert not result.convergence.converged
+    assert not result.convergence.should_stop
+    assert result.stop_reason is CampaignStopReason.CANDIDATES_EXHAUSTED
+
+
+def test_sustained_rejection_stops_without_claiming_convergence() -> None:
+    result = run_scientific_campaign(
+        config=_config(),
+        fallback=_fallback(),
+        candidates=tuple(_candidate(f"candidate-{index}") for index in range(8)),
+        runner=lambda request: _evidence(request, 0.599),
+        outer_ledger=_Ledger(),
+    )
+
+    assert result.convergence.unmeasured_streak == MAX_UNMEASURED_STREAK
     assert result.convergence.should_stop
-    assert result.stop_reason is CampaignStopReason.CONVERGED
+    assert not result.convergence.converged
+    assert result.stop_reason is CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+    assert result.incumbent.candidate_id == "official-fm"
 
 
 def test_finalization_reserve_rejects_new_scientific_launch_without_charging() -> None:

@@ -38,6 +38,7 @@ from kuairand_agent.candidate_api.protocol import (
     validate_prediction_outputs,
     validate_train_outputs,
 )
+from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
 from kuairand_agent.execution.artifacts import (
     ArtifactKind,
     ArtifactRef,
@@ -138,9 +139,9 @@ class GeneratedCandidateIdentity:
     source_snapshot: DirectoryArtifactRef
     source_digest: str
     config_digest: str
-    entry_point: str = "candidate.py"
-    config_path: str = "config.json"
-    checkpoint_path: str = "checkpoint/model.txt"
+    entry_point: str = CANDIDATE_RUNTIME_CONTRACT.entry_point
+    config_path: str = CANDIDATE_RUNTIME_CONTRACT.config_path
+    checkpoint_path: str = CANDIDATE_RUNTIME_CONTRACT.checkpoint_path
 
     def __post_init__(self) -> None:
         if (
@@ -156,8 +157,12 @@ class GeneratedCandidateIdentity:
         config = entries.get(self.config_path)
         if config is None or config.sha256 != self.config_digest:
             raise ValueError("generated source snapshot config.json identity mismatch")
-        if self.checkpoint_path != "checkpoint/model.txt":
-            raise ValueError("generated checkpoint path must remain checkpoint/model.txt")
+        if self.entry_point != CANDIDATE_RUNTIME_CONTRACT.entry_point:
+            raise ValueError("generated entry point differs from the runtime contract")
+        if self.config_path != CANDIDATE_RUNTIME_CONTRACT.config_path:
+            raise ValueError("generated config path differs from the runtime contract")
+        if self.checkpoint_path != CANDIDATE_RUNTIME_CONTRACT.checkpoint_path:
+            raise ValueError("generated checkpoint path differs from the runtime contract")
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,25 +591,33 @@ class GeneratedCandidateExecutor:
             raise ValueError("request must be GeneratedTrainRequest")
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise ValueError("cancel_event must be threading.Event or None")
-        payload = {
-            "protocol_schema_version": 1,
-            "source_digest": request.identity.source_digest,
-            "config_digest": request.identity.config_digest,
-            "data_digest": request.data_digest,
-            "split_token": request.split_token,
-            "seed": request.seed,
-            "features_handle": "features",
-            "targets_handle": "targets",
-            "user_groups_handle": "user_groups",
-        }
+        payload = CANDIDATE_RUNTIME_CONTRACT.training_payload(
+            source_digest=request.identity.source_digest,
+            config_digest=request.identity.config_digest,
+            data_digest=request.data_digest,
+            split_token=request.split_token,
+            seed=request.seed,
+        )
         workspace = self._workspace(
             execution_id=request.execution_id,
             identity=request.identity,
             split_role=request.split_role,
             inputs=(
-                ApprovedInput("features", CandidateInputRole.TRAIN_INPUTS, request.features),
-                ApprovedInput("targets", CandidateInputRole.TRAIN_TARGETS, request.targets),
-                ApprovedInput("user_groups", CandidateInputRole.TRAIN_INPUTS, request.user_groups),
+                ApprovedInput(
+                    CANDIDATE_RUNTIME_CONTRACT.features_handle,
+                    CandidateInputRole.TRAIN_INPUTS,
+                    request.features,
+                ),
+                ApprovedInput(
+                    CANDIDATE_RUNTIME_CONTRACT.targets_handle,
+                    CandidateInputRole.TRAIN_TARGETS,
+                    request.targets,
+                ),
+                ApprovedInput(
+                    CANDIDATE_RUNTIME_CONTRACT.user_groups_handle,
+                    CandidateInputRole.TRAIN_INPUTS,
+                    request.user_groups,
+                ),
             ),
             payload=payload,
         )
@@ -654,7 +667,9 @@ class GeneratedCandidateExecutor:
                 result=result,
                 journal=journal,
                 workspace=workspace,
-                diagnostic=f"generated training output validation failed: {type(exc).__name__}",
+                diagnostic=(
+                    f"generated training output validation failed: {type(exc).__name__}: {exc}"
+                ),
             ) from exc
         entries = self._base_artifacts(result)
         checkpoint = self.artifact_store.put_file(
@@ -699,23 +714,21 @@ class GeneratedCandidateExecutor:
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise ValueError("cancel_event must be threading.Event or None")
         checkpoint_path = self.artifact_store.verify(request.checkpoint)
-        payload = {
-            "protocol_schema_version": 1,
-            "source_digest": request.identity.source_digest,
-            "config_digest": request.identity.config_digest,
-            "data_digest": request.data_digest,
-            "split_token": request.split_token,
-            "features_handle": "features",
-            "expected_count": request.expected_count,
-            "checkpoint_digest": request.checkpoint.sha256,
-        }
+        payload = CANDIDATE_RUNTIME_CONTRACT.prediction_payload(
+            source_digest=request.identity.source_digest,
+            config_digest=request.identity.config_digest,
+            data_digest=request.data_digest,
+            split_token=request.split_token,
+            expected_count=request.expected_count,
+            checkpoint_digest=request.checkpoint.sha256,
+        )
         workspace = self._workspace(
             execution_id=request.execution_id,
             identity=request.identity,
             split_role=request.split_role,
             inputs=(
                 ApprovedInput(
-                    "features",
+                    CANDIDATE_RUNTIME_CONTRACT.features_handle,
                     _PREDICTION_INPUT_ROLE[request.split_role],
                     request.features,
                 ),
@@ -770,7 +783,9 @@ class GeneratedCandidateExecutor:
                 result=result,
                 journal=journal,
                 workspace=workspace,
-                diagnostic=f"generated prediction output validation failed: {type(exc).__name__}",
+                diagnostic=(
+                    f"generated prediction output validation failed: {type(exc).__name__}: {exc}"
+                ),
             ) from exc
         entries = self._base_artifacts(result)
         prediction = self.artifact_store.put_file(

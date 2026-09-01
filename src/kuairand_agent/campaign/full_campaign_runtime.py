@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import resource
 import stat
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
-from typing import Literal, Protocol, cast
+from typing import Final, Literal, Protocol, TypedDict, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -81,6 +82,7 @@ from kuairand_agent.campaign.provenance import (
     capture_environment_identity,
     hash_source_tree,
 )
+from kuairand_agent.campaign.pure_features import ID_CODE_FEATURE_NAMES
 from kuairand_agent.campaign.qualification_evidence import (
     OfficialFMQualificationEvidence,
     OfficialFMSeedEvidence,
@@ -89,6 +91,8 @@ from kuairand_agent.campaign.qualification_evidence import (
 )
 from kuairand_agent.campaign.scientific import (
     CampaignStopReason,
+    CandidateCampaignResult,
+    CandidateOutcome,
     ExecutableChangeEvidence,
     OuterPromotionRequest,
     ScientificCampaignCancelled,
@@ -115,6 +119,7 @@ from kuairand_agent.campaign.store import (
     CampaignStore,
     OuterQueryLedger,
 )
+from kuairand_agent.candidates.fusion import FUSION_WEIGHT_GRID
 from kuairand_agent.config import ResearchConfig
 from kuairand_agent.contract import benchmark_digest, verify_starter_kit
 from kuairand_agent.data.canonical import (
@@ -155,21 +160,37 @@ from kuairand_agent.research.factory import (
     ProviderUnavailableDiagnostic,
     select_research_provider,
 )
-from kuairand_agent.research.interface import ResearchModel
+from kuairand_agent.research.interface import ResearchModel, ResearchModelError
 from kuairand_agent.research.loop import CampaignStoreResearchLedger
 from kuairand_agent.research.materialize import snapshot_materialized_candidate
 from kuairand_agent.research.production import (
     SCRIPTED_CANDIDATE_ID,
     SCRIPTED_PARENT_ID,
+    LiveResearchBranchRejected,
     LiveResearchLineage,
+    ProductionResearchError,
     ScriptedLambdaRankLineage,
     load_parent_snapshot,
     prepare_or_rehydrate_live_lineage,
     prepare_or_rehydrate_scripted_lambdarank_lineage,
+    proposal_family_of,
 )
-from kuairand_agent.research.provider import OpenAIResponsesModel
+from kuairand_agent.research.provider import (
+    OpenAIChatCompletionsConfig,
+    OpenAIChatCompletionsModel,
+    OpenAIFailoverModel,
+    OpenAIProviderChainError,
+    OpenAIProviderError,
+    ProviderErrorCode,
+    ProviderModelLimitResolver,
+    ProviderTranscript,
+    ResponsesTransport,
+    RetryRuntime,
+)
 from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
+    ParentSnapshot,
+    Proposal,
     Reflection,
     ReflectionRequest,
     ResearchOperation,
@@ -186,6 +207,9 @@ from kuairand_agent.scoring.protected import (
 _SCHEMA_VERSION = 1
 _PRODUCTION_DIR = "production"
 _PORTFOLIO_REASON = "bounded_high_value_lambdarank_branch_prioritized"
+_REJECTION_JOURNAL_DIR = "controller-rejection-journal"
+_REJECTION_JOURNAL_LIMIT_BYTES = 65_536
+_PROVIDER_ATTEMPT_JOURNAL_DIR = "provider-attempt-journal"
 _SAFE_FOLD_FAILURE_OUTCOMES = frozenset(
     {
         ExecutionOutcome.TIMED_OUT,
@@ -726,7 +750,23 @@ def _research_context_evidence(
                     "feature_count": features.final.feature_count,
                     "feature_names_csv": ",".join(features.final.feature_names),
                     "feature_bundle_digest": features.digest,
+                    "categorical_code_columns_csv": ",".join(ID_CODE_FEATURE_NAMES),
+                    # Each fold fits its own vocabulary on its own training rows, so these sizes
+                    # describe the outer build only.  A candidate must size any embedding table
+                    # from the training matrix it is handed, never from these numbers.
+                    "outer_code_cardinalities_csv": ",".join(
+                        str(value) for value in features.outer_and_final.code_cardinalities
+                    ),
+                    "code_cardinalities_vary_by_fold": True,
+                    # This was previously a bare boolean, which disclosed the mechanism without
+                    # explaining it.  Candidate predictions are rank-blended with the official FM
+                    # control, so the primary a candidate sees is the blend's, never its own.
                     "fold_b_selected_fusion_only": True,
+                    "fusion_weight_grid_model_then_control_csv": ";".join(
+                        f"{model}/{control}" for model, control in FUSION_WEIGHT_GRID
+                    ),
+                    "fusion_scored_metric_is_the_blend_not_the_model": True,
+                    "fusion_weight_frozen_on_fold_b_and_reused_below": True,
                     "uses_public_labels_for_features": False,
                     "uses_prediction_period_outcomes": False,
                 },
@@ -1275,26 +1315,44 @@ def _reflect(
     research_config: ResearchConfig,
     artifacts: ArtifactStore,
     research_model: ResearchModel | None = None,
+    fusion_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord] | None = None,
 ) -> tuple[str, str, ArtifactRef, Reflection]:
     candidate_result = result.candidates[0] if result.candidates else None
     run = None
     if candidate_result is not None and candidate_result.runs:
         outer = [item for item in candidate_result.runs if item.metrics is not None]
         run = outer[-1] if outer else None
+    # A branch that produced no run has no metrics.  Substituting the fallback's numbers here
+    # told the model its crashed candidate had tied the baseline, and overnight-11's reflection
+    # duly concluded a candidate that never executed was "indistinguishable from the official FM
+    # reference".  Report zeros with the failure flag instead, so the summary cannot be read as a
+    # measurement.
+    execution_failed = run is None or run.metrics is None
     metrics = (
         _metrics(result.fallback.outer_by_seed[0].metrics)
         if run is None or run.metrics is None
         else run.metrics
     )
     promoted = result.incumbent.candidate_id == candidate_id
+    # The metrics above are the rank-fusion BLEND's, not this model's.  Commit 8124607 disclosed
+    # that on the propose path and stopped there, so reflection kept reading a blend as its own
+    # result: every reflection in runs 16 and 17 recorded that it could not tell a discarded model
+    # from a tie, and reconstructed the answer by exact-matching the control's score.  Same
+    # disclosure, same helper, now on the path that decides what gets tried next.
+    fusion = _fusion_disclosure({} if fusion_records is None else fusion_records)
     summary = ExperimentResultSummary(
         tier="outer" if promoted else "inner",
         status="promoted" if promoted else "rejected",
-        gauc=metrics.gauc,
-        ndcg_at_5=metrics.ndcg_at_5,
-        primary=metrics.primary,
+        gauc=0.0 if execution_failed else metrics.gauc,
+        ndcg_at_5=0.0 if execution_failed else metrics.ndcg_at_5,
+        primary=0.0 if execution_failed else metrics.primary,
+        execution_failed=execution_failed,
         runtime_seconds=0.0 if run is None else run.resources.wall_seconds,
         peak_memory_mb=(0.0 if run is None else run.resources.peak_rss_bytes / float(1024**2)),
+        candidate_standalone_primary=fusion["candidate_standalone_primary"],
+        fold_b_control_primary=fusion["fold_b_control_primary"],
+        fusion_weights_selected=fusion["fusion_weights_selected"],
+        fusion_note=fusion["fusion_note"],
     )
     request = ReflectionRequest.create(
         request_id=f"iteration-{scientific_iteration:02d}-reflect",
@@ -1335,7 +1393,10 @@ def _reflect(
         reflection_model = research_model
         reflection_provider = lineage.provider
         reflection_live = lineage.live_provider_used
-    reflection = reflection_model.reflect(request)
+    try:
+        reflection = reflection_model.reflect(request)
+    except ResearchModelError as exc:
+        reflection = _unavailable_reflection(exc, scientific_iteration=scientific_iteration)
     transcript = artifacts.put_bytes(
         canonical_json_bytes(
             {
@@ -1396,6 +1457,103 @@ class _AutonomousFollowupResult:
     reflection_response_digest: str
     reflection_transcript: ArtifactRef
     iterations_completed: int
+    rejected_records: tuple[AggregateRecord, ...]
+
+
+_MEASURED_TIER_RUN_COUNT: Final = 3
+
+
+def _measured_primary(
+    candidate_result: CandidateCampaignResult | None,
+    incumbent: IncumbentEvidence,
+) -> tuple[float | None, float | None, str | None]:
+    """Return the candidate's measured primary, its delta, and the tier that produced it.
+
+    The proposer sees only the records built here, so without this a direction that ran and
+    scored is indistinguishable from one that was never tried.  Runs arrive in tier order:
+    the Fold B screen, then the Fold A confirmation, then the matched outer seeds.
+    """
+
+    if candidate_result is None or not candidate_result.runs:
+        return None, None, None
+    scored = [run for run in candidate_result.runs if run.metrics is not None]
+    if not scored:
+        return None, None, None
+    if len(scored) >= _MEASURED_TIER_RUN_COUNT:
+        outer = scored[_MEASURED_TIER_RUN_COUNT - 1 :]
+        primary = sum(float(run.metrics.primary) for run in outer if run.metrics) / len(outer)
+        reference = sum(float(item.metrics.primary) for item in incumbent.outer_by_seed) / len(
+            incumbent.outer_by_seed
+        )
+        return primary, primary - reference, "outer_matched_seed"
+    metrics = scored[-1].metrics
+    assert metrics is not None  # narrowed by the scored filter above
+    folds = dict(incumbent.inner_by_fold)
+    fold_b = folds.get("B")
+    primary = float(metrics.primary)
+    delta = None if fold_b is None else primary - float(fold_b.primary)
+    return primary, delta, "inner_fold"
+
+
+class FusionDisclosure(TypedDict):
+    """What rank fusion did to one iteration, in the exact shape both consumers splat."""
+
+    candidate_standalone_primary: float | None
+    fold_b_control_primary: float | None
+    fusion_weights_selected: str | None
+    fusion_note: str | None
+
+
+def _fusion_disclosure(
+    records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord],
+) -> FusionDisclosure:
+    """Describe what rank fusion did to this iteration's predictions.
+
+    Every candidate prediction is rank-fused with the official FM control on a fixed five-point
+    weight grid chosen on the Fold B screen and frozen for every tier below it.  The primary that
+    reaches selection and reflection is the *blend's*, so a model far weaker than the control still
+    reports a score near it, and a model the selector rejects outright reports the control's score
+    exactly.  Without these fields the proposer reads "scored the same as the baseline" when the
+    truth is "was discarded", and has no reason to change anything.
+    """
+
+    record = records.get((ScientificTier.FOLD_B_SCREEN, 0))
+    selection = None if record is None else record.fusion_selection
+    if selection is None:
+        return {
+            "candidate_standalone_primary": None,
+            "fold_b_control_primary": None,
+            "fusion_weights_selected": None,
+            "fusion_note": None,
+        }
+    standalone = selection.standalone_primary
+    control = selection.control_primary
+    weights = selection.selected_weights
+    if selection.model_was_discarded:
+        note = (
+            "Rank fusion selected weight 0.0 for this model on the Fold B screen, so the reported "
+            "primary is the official FM control's score with none of this model's ordering in it. "
+            "The model itself scored candidate_standalone_primary. This is a rejection, NOT a tie."
+        )
+    elif standalone is not None and control is not None and standalone < control:
+        note = (
+            "The reported primary is a blend of this model with the official FM control at "
+            "weights fusion_weights_selected. Scored alone the model was WEAKER than the control "
+            "(candidate_standalone_primary below fold_b_control_primary), so most of the reported "
+            "score is the control's, not this model's."
+        )
+    else:
+        note = (
+            "The reported primary is a blend of this model with the official FM control at "
+            "weights fusion_weights_selected. Scored alone this model was at least as strong as "
+            "the control."
+        )
+    return {
+        "candidate_standalone_primary": None if standalone is None else round(standalone, 7),
+        "fold_b_control_primary": None if control is None else round(control, 7),
+        "fusion_weights_selected": f"{weights[0]} model, {weights[1]} official FM control",
+        "fusion_note": note,
+    }
 
 
 def _iteration_record(
@@ -1403,8 +1561,16 @@ def _iteration_record(
     reflection: Reflection,
     *,
     scientific_iteration: int,
+    proposal: Proposal | None = None,
+    fusion_records: Mapping[tuple[ScientificTier, int], GeneratedScientificRunRecord] | None = None,
 ) -> AggregateRecord:
     candidate_result = result.candidates[-1] if result.candidates else None
+    primary, delta, tier = _measured_primary(candidate_result, result.incumbent)
+    fusion = _fusion_disclosure({} if fusion_records is None else fusion_records)
+    execution_failed = (
+        candidate_result is not None
+        and candidate_result.outcome is CandidateOutcome.CALLBACK_FAILED
+    )
     return AggregateRecord(
         name=f"scientific_iteration_{scientific_iteration:02d}",
         values={
@@ -1416,22 +1582,633 @@ def _iteration_record(
                 None if candidate_result is None else candidate_result.outcome.value
             ),
             "candidate_reason": None if candidate_result is None else candidate_result.reason,
+            # A crashed candidate produced no score at all.  The reflection summary cannot say so,
+            # because its schema requires three finite metrics and substitutes the fallback's, so
+            # without this flag the next proposer reads a failed branch as one that tied the
+            # baseline and has no reason to avoid repeating the defect.
+            "execution_failed": execution_failed,
+            "execution_failure_note": (
+                None
+                if not execution_failed
+                else (
+                    "This iteration produced NO measured score. Its training or prediction code "
+                    "raised an exception before any evaluation. Treat it as a code defect to "
+                    "avoid, not as evidence about the scientific direction."
+                )
+            ),
+            # The direction this iteration actually tested.  A proposer that cannot see this
+            # cannot avoid restating it, and the convergence rule allows very few attempts.
+            "proposal_family": (None if proposal is None else proposal_family_of(proposal)),
+            "proposal_objective": None if proposal is None else proposal.objective,
+            "proposal_principal_change": None if proposal is None else proposal.principal_change,
+            "candidate_primary": None if primary is None else round(primary, 6),
+            "candidate_primary_tier": tier,
+            "delta_vs_incumbent": None if delta is None else round(delta, 6),
+            # candidate_primary above is the FUSED score. These four say what the model itself did.
+            "candidate_standalone_primary": fusion["candidate_standalone_primary"],
+            "fold_b_control_primary": fusion["fold_b_control_primary"],
+            "fusion_weights_selected": fusion["fusion_weights_selected"],
+            "fusion_note": fusion["fusion_note"],
             "incumbent_candidate_id": result.incumbent.candidate_id,
             "launches_used": result.launches_used,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
             "stop_reason": result.stop_reason.value,
             "reflection_recommendation": reflection.recommendation,
             "reflection_summary": reflection.summary,
+            # Lessons are the richest thing reflection produces and were previously dropped here.
+            "reflection_lessons": " | ".join(reflection.lessons),
         },
     )
 
 
-def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
-    if not isinstance(model, OpenAIResponsesModel):
-        return None
-    usage = model.total_usage
+def _rejected_lineage_record(
+    rejection: LiveResearchBranchRejected,
+    *,
+    scientific_iteration: int,
+    root_failure_total_count: int = 1,
+    root_failure_consecutive_count: int = 1,
+    proposal_family_attempt_count: int = 1,
+    proposal_family_blocked: bool = False,
+) -> AggregateRecord:
+    root = rejection.root_failure
+    terminal = rejection.terminal_failure
+    return AggregateRecord(
+        name=f"rejected_lineage_{scientific_iteration:02d}",
+        values={
+            "scientific_iteration": scientific_iteration,
+            "candidate_id": rejection.failed_candidate_id,
+            "branch_outcome": "rejected_before_execution",
+            "repairs_attempted": rejection.repairs_attempted,
+            "diagnostic": rejection.diagnostic[:4096],
+            "root_failure_stage": root.stage,
+            "root_failure_category": root.category,
+            "root_failure_code": root.code,
+            "root_failure_subject": root.subject,
+            "root_failure_fingerprint": root.fingerprint,
+            "root_failure_diagnostic": root.diagnostic,
+            "root_failure_total_count": root_failure_total_count,
+            "root_failure_consecutive_count": root_failure_consecutive_count,
+            "terminal_failure_stage": terminal.stage,
+            "terminal_failure_category": terminal.category,
+            "terminal_failure_code": terminal.code,
+            "terminal_failure_subject": terminal.subject,
+            "terminal_failure_fingerprint": terminal.fingerprint,
+            "terminal_failure_diagnostic": terminal.diagnostic,
+            "proposal_family": rejection.proposal_family,
+            "proposal_signature": rejection.proposal_signature or None,
+            "proposal_family_attempt_count": proposal_family_attempt_count,
+            "proposal_family_blocked": proposal_family_blocked,
+        },
+    )
+
+
+def _research_stage_counts(
+    *,
+    model: ResearchModel | None,
+    branches_attempted: int,
+    rejected_records: Sequence[AggregateRecord],
+    candidates_admitted: int,
+    training_started: int = 0,
+    inner_evaluations_completed: int = 0,
+    outer_evaluations_completed: int = 0,
+) -> dict[str, int]:
+    transcripts = (
+        model.transcripts
+        if isinstance(model, (OpenAIChatCompletionsModel, OpenAIFailoverModel))
+        else ()
+    )
+
+    def accepted(operation: ResearchOperation) -> int:
+        return sum(
+            item.operation is operation and item.outcome == "accepted" for item in transcripts
+        )
+
     return {
-        "model": model.config.model,
+        "branches_attempted": branches_attempted,
+        "proposal_responses_accepted": accepted(ResearchOperation.PROPOSE),
+        "implementation_responses_accepted": accepted(ResearchOperation.IMPLEMENT),
+        "repair_responses_accepted": accepted(ResearchOperation.REPAIR),
+        "branches_rejected_pre_execution": len(rejected_records),
+        "candidates_admitted": candidates_admitted,
+        "training_started": training_started,
+        "inner_evaluations_completed": inner_evaluations_completed,
+        "outer_evaluations_completed": outer_evaluations_completed,
+    }
+
+
+def _failure_count_rows(
+    records: Sequence[AggregateRecord],
+    *,
+    role: Literal["root", "terminal"],
+) -> tuple[list[dict[str, object]], bool]:
+    observed: dict[str, dict[str, object]] = {}
+    prefix = f"{role}_failure_"
+    for record in records:
+        fingerprint = record.values.get(f"{prefix}fingerprint")
+        if type(fingerprint) is not str:
+            continue
+        row = observed.setdefault(
+            fingerprint,
+            {
+                "fingerprint": fingerprint,
+                "stage": record.values.get(f"{prefix}stage"),
+                "category": record.values.get(f"{prefix}category"),
+                "code": record.values.get(f"{prefix}code"),
+                "subject": record.values.get(f"{prefix}subject"),
+                "count": 0,
+            },
+        )
+        row["count"] = cast(int, row["count"]) + 1
+    ordered = sorted(
+        observed.values(),
+        key=lambda item: (-cast(int, item["count"]), cast(str, item["fingerprint"])),
+    )
+    return ordered[:8], len(ordered) > 8
+
+
+def _research_rejection_summary(
+    records: Sequence[AggregateRecord],
+) -> dict[str, object]:
+    root_counts, root_truncated = _failure_count_rows(records, role="root")
+    terminal_counts, terminal_truncated = _failure_count_rows(records, role="terminal")
+    examples: list[dict[str, object]] = []
+    for record in reversed(records):
+        for role in ("terminal", "root"):
+            prefix = f"{role}_failure_"
+            fingerprint = record.values.get(f"{prefix}fingerprint")
+            diagnostic = record.values.get(f"{prefix}diagnostic")
+            if type(fingerprint) is not str or type(diagnostic) is not str:
+                continue
+            examples.append(
+                {
+                    "scientific_iteration": record.values.get("scientific_iteration"),
+                    "candidate_id": record.values.get("candidate_id"),
+                    "proposal_family": record.values.get("proposal_family"),
+                    "proposal_signature": record.values.get("proposal_signature"),
+                    "role": role,
+                    "fingerprint": fingerprint,
+                    "diagnostic": diagnostic,
+                }
+            )
+            if len(examples) == 6:
+                break
+        if len(examples) == 6:
+            break
+    return {
+        "branches_rejected_pre_execution": len(records),
+        "root_counts": root_counts,
+        "terminal_counts": terminal_counts,
+        "examples": examples,
+        "counts_truncated": root_truncated or terminal_truncated,
+        "examples_truncated": len(records) * 2 > len(examples),
+    }
+
+
+def _research_rejection_evidence(
+    records: Sequence[AggregateRecord],
+    *,
+    artifacts: ArtifactStore,
+) -> dict[str, object]:
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "records": [record.to_wire() for record in records],
+    }
+    ledger = artifacts.put_bytes(canonical_json_bytes(payload), kind=ArtifactKind.LOG)
+    return {
+        "research_rejection_summary": _research_rejection_summary(records),
+        "research_rejection_ledger": ledger.manifest(),
+    }
+
+
+def _rejection_journal_directory(generated_root: Path) -> Path:
+    try:
+        generated_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root_metadata = generated_root.lstat()
+    except OSError as exc:
+        raise FullCampaignError("generated-source root is unavailable") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise FullCampaignError("generated-source root must be a real directory")
+    journal = generated_root / _REJECTION_JOURNAL_DIR
+    try:
+        journal.mkdir(exist_ok=True, mode=0o700)
+        journal_metadata = journal.lstat()
+    except OSError as exc:
+        raise FullCampaignError("research rejection journal is unavailable") from exc
+    if stat.S_ISLNK(journal_metadata.st_mode) or not stat.S_ISDIR(journal_metadata.st_mode):
+        raise FullCampaignError("research rejection journal must be a real directory")
+    return journal
+
+
+def _rejection_journal_payload(
+    *,
+    campaign_id: str,
+    scientific_iteration: int,
+    record: AggregateRecord,
+    previous_journal_digest: str | None,
+) -> dict[str, object]:
+    record_wire = record.to_wire()
+    record_digest = _digest(b"kuairand-rejected-lineage-record-v1", record_wire)
+    unsigned = {
+        "schema_version": _SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "scientific_iteration": scientific_iteration,
+        "previous_journal_digest": previous_journal_digest,
+        "record_digest": record_digest,
+        "record": record_wire,
+    }
+    return unsigned | {"journal_digest": _digest(b"kuairand-rejection-journal-entry-v1", unsigned)}
+
+
+def _decode_rejection_journal_entry(
+    payload: bytes,
+    *,
+    campaign_id: str,
+    scientific_iteration: int,
+    previous_journal_digest: str | None,
+) -> tuple[AggregateRecord, str]:
+    if len(payload) > _REJECTION_JOURNAL_LIMIT_BYTES:
+        raise FullCampaignError("research rejection journal entry exceeds its byte limit")
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise FullCampaignError("research rejection journal entry is malformed") from exc
+    if not isinstance(decoded, dict) or payload != canonical_json_bytes(decoded):
+        raise FullCampaignError("research rejection journal entry is not exact canonical JSON")
+    expected_keys = {
+        "schema_version",
+        "campaign_id",
+        "scientific_iteration",
+        "previous_journal_digest",
+        "record_digest",
+        "record",
+        "journal_digest",
+    }
+    if set(decoded) != expected_keys:
+        raise FullCampaignError("research rejection journal entry has unexpected fields")
+    if (
+        decoded["schema_version"] != _SCHEMA_VERSION
+        or decoded["campaign_id"] != campaign_id
+        or decoded["scientific_iteration"] != scientific_iteration
+        or decoded["previous_journal_digest"] != previous_journal_digest
+    ):
+        raise FullCampaignError("research rejection journal identity is inconsistent")
+    record_wire = decoded["record"]
+    if (
+        not isinstance(record_wire, dict)
+        or set(record_wire) != {"name", "values"}
+        or type(record_wire["name"]) is not str
+        or not isinstance(record_wire["values"], dict)
+    ):
+        raise FullCampaignError("research rejection journal record is malformed")
+    record = AggregateRecord(record_wire["name"], record_wire["values"])
+    if (
+        record.name != f"rejected_lineage_{scientific_iteration:02d}"
+        or record.values.get("scientific_iteration") != scientific_iteration
+    ):
+        raise FullCampaignError("research rejection journal iteration is inconsistent")
+    expected_record_digest = _digest(b"kuairand-rejected-lineage-record-v1", record.to_wire())
+    unsigned = {key: decoded[key] for key in expected_keys - {"journal_digest"}}
+    expected_journal_digest = _digest(b"kuairand-rejection-journal-entry-v1", unsigned)
+    if (
+        decoded["record_digest"] != expected_record_digest
+        or decoded["journal_digest"] != expected_journal_digest
+    ):
+        raise FullCampaignError("research rejection journal digest is inconsistent")
+    return record, cast(str, decoded["journal_digest"])
+
+
+def _load_rejection_journal(
+    generated_root: Path,
+    *,
+    campaign_id: str,
+    maximum_iterations: int,
+) -> tuple[list[AggregateRecord], str | None]:
+    journal = _rejection_journal_directory(generated_root)
+    try:
+        entries = tuple(sorted(journal.iterdir()))
+    except OSError as exc:
+        raise FullCampaignError("research rejection journal cannot be listed") from exc
+    if len(entries) > maximum_iterations:
+        raise FullCampaignError("research rejection journal exceeds the campaign iteration cap")
+    records: list[AggregateRecord] = []
+    previous_digest: str | None = None
+    for iteration, path in enumerate(entries, start=1):
+        expected_name = f"rejection-{iteration:02d}.json"
+        try:
+            metadata = path.lstat()
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise FullCampaignError("research rejection journal entry is unavailable") from exc
+        if (
+            path.name != expected_name
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise FullCampaignError("research rejection journal is not a contiguous file ledger")
+        record, previous_digest = _decode_rejection_journal_entry(
+            payload,
+            campaign_id=campaign_id,
+            scientific_iteration=iteration,
+            previous_journal_digest=previous_digest,
+        )
+        records.append(record)
+    return records, previous_digest
+
+
+def _persist_rejection_journal_entry(
+    generated_root: Path,
+    *,
+    campaign_id: str,
+    scientific_iteration: int,
+    record: AggregateRecord,
+    previous_journal_digest: str | None,
+) -> str:
+    journal = _rejection_journal_directory(generated_root)
+    payload = canonical_json_bytes(
+        _rejection_journal_payload(
+            campaign_id=campaign_id,
+            scientific_iteration=scientific_iteration,
+            record=record,
+            previous_journal_digest=previous_journal_digest,
+        )
+    )
+    if len(payload) > _REJECTION_JOURNAL_LIMIT_BYTES:
+        raise FullCampaignError("research rejection journal entry exceeds its byte limit")
+    path = journal / f"rejection-{scientific_iteration:02d}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        try:
+            retained = path.read_bytes()
+        except OSError as exc:
+            raise FullCampaignError("retained research rejection entry is unavailable") from exc
+        if retained != payload:
+            raise FullCampaignError(
+                "retained research rejection entry differs from replay"
+            ) from None
+    except OSError as exc:
+        raise FullCampaignError("research rejection entry cannot be persisted") from exc
+    else:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o400)
+        try:
+            directory_descriptor = os.open(journal, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as exc:
+            raise FullCampaignError("research rejection journal cannot be synchronized") from exc
+    _, journal_digest = _decode_rejection_journal_entry(
+        payload,
+        campaign_id=campaign_id,
+        scientific_iteration=scientific_iteration,
+        previous_journal_digest=previous_journal_digest,
+    )
+    return journal_digest
+
+
+def _provider_transcript_sink(production: Path) -> Callable[[ProviderTranscript], None]:
+    journal = production / _PROVIDER_ATTEMPT_JOURNAL_DIR
+    journal.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if journal.is_symlink() or not journal.is_dir():
+        raise FullCampaignError("provider-attempt journal must be a real directory")
+
+    def persist(transcript: ProviderTranscript) -> None:
+        payload = transcript.json_bytes
+        if hashlib.sha256(payload).hexdigest() != transcript.digest:
+            raise FullCampaignError("provider transcript digest does not identify its bytes")
+        path = journal / f"{transcript.digest}.json"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            try:
+                retained = path.read_bytes()
+            except OSError as exc:
+                raise FullCampaignError("retained provider transcript is unavailable") from exc
+            if retained != payload:
+                raise FullCampaignError(
+                    "retained provider transcript differs from replay"
+                ) from None
+            return
+        except OSError as exc:
+            raise FullCampaignError("provider transcript cannot be persisted") from exc
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o400)
+        try:
+            directory_descriptor = os.open(journal, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as exc:
+            raise FullCampaignError("provider-attempt journal cannot be synchronized") from exc
+
+    return persist
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveLineagePreparation:
+    status: Literal[
+        "accepted",
+        "admission_closed",
+        "portfolio_exhausted",
+        "repeated_pre_admission_failure",
+        "provider_unavailable",
+    ]
+    lineage: LiveResearchLineage | None
+    safe_context: SafeResearchContext | None
+    scientific_iteration: int | None
+    rejected_records: tuple[AggregateRecord, ...]
+    branches_attempted: int
+    provider_error: OpenAIProviderError | None = None
+
+
+def _prepare_live_lineage_portfolio(
+    *,
+    campaign_id: str,
+    parent: ParentSnapshot,
+    generated_root: Path,
+    artifact_store: ArtifactStore,
+    model: ResearchModel,
+    provider: str,
+    maximum_iterations: int,
+    safe_context_factory: Callable[[tuple[AggregateRecord, ...]], SafeResearchContext],
+    continue_check: Callable[[], bool],
+) -> _LiveLineagePreparation:
+    """Prepare one valid lineage or return an exact, evidence-preserving closure reason."""
+
+    rejected, previous_journal_digest = _load_rejection_journal(
+        generated_root,
+        campaign_id=campaign_id,
+        maximum_iterations=maximum_iterations,
+    )
+    root_failure_totals: dict[str, int] = {}
+    proposal_family_attempts: dict[str, int] = {}
+    previous_root_fingerprint: str | None = None
+    consecutive_root_failures = 0
+    for retained_iteration, retained in enumerate(rejected, start=1):
+        root_fingerprint = retained.values.get("root_failure_fingerprint")
+        family = retained.values.get("proposal_family")
+        if type(root_fingerprint) is not str or type(family) is not str:
+            raise FullCampaignError("retained research rejection lacks typed identity")
+        root_total = root_failure_totals.get(root_fingerprint, 0) + 1
+        root_failure_totals[root_fingerprint] = root_total
+        if root_fingerprint == previous_root_fingerprint:
+            consecutive_root_failures += 1
+        else:
+            previous_root_fingerprint = root_fingerprint
+            consecutive_root_failures = 1
+        family_total = proposal_family_attempts.get(family, 0) + 1
+        proposal_family_attempts[family] = family_total
+        if (
+            retained.values.get("root_failure_total_count") != root_total
+            or retained.values.get("root_failure_consecutive_count") != consecutive_root_failures
+            or retained.values.get("proposal_family_attempt_count") != family_total
+            or retained.values.get("proposal_family_blocked") != (family_total >= 2)
+        ):
+            raise FullCampaignError("retained research rejection counters are inconsistent")
+        if root_total >= 3:
+            return _LiveLineagePreparation(
+                status="repeated_pre_admission_failure",
+                lineage=None,
+                safe_context=None,
+                scientific_iteration=None,
+                rejected_records=tuple(rejected),
+                branches_attempted=retained_iteration,
+            )
+    for iteration in range(len(rejected) + 1, maximum_iterations + 1):
+        if not continue_check():
+            return _LiveLineagePreparation(
+                status="admission_closed",
+                lineage=None,
+                safe_context=None,
+                scientific_iteration=None,
+                rejected_records=tuple(rejected),
+                branches_attempted=iteration - 1,
+            )
+        safe_context = safe_context_factory(tuple(rejected))
+        try:
+            lineage = prepare_or_rehydrate_live_lineage(
+                campaign_id=campaign_id,
+                scientific_iteration=iteration,
+                parent=parent,
+                generated_root=generated_root,
+                artifact_store=artifact_store,
+                safe_context=safe_context,
+                model=model,
+                provider=provider,
+            )
+        except OpenAIProviderError as error:
+            return _LiveLineagePreparation(
+                status="provider_unavailable",
+                lineage=None,
+                safe_context=None,
+                scientific_iteration=None,
+                rejected_records=tuple(rejected),
+                branches_attempted=iteration,
+                provider_error=error,
+            )
+        except LiveResearchBranchRejected as rejection:
+            root_fingerprint = rejection.root_failure.fingerprint
+            root_failure_total = root_failure_totals.get(root_fingerprint, 0) + 1
+            root_failure_totals[root_fingerprint] = root_failure_total
+            if root_fingerprint == previous_root_fingerprint:
+                consecutive_root_failures += 1
+            else:
+                previous_root_fingerprint = root_fingerprint
+                consecutive_root_failures = 1
+            family = rejection.proposal_family
+            family_attempt_count = proposal_family_attempts.get(family, 0) + 1
+            proposal_family_attempts[family] = family_attempt_count
+            record = _rejected_lineage_record(
+                rejection,
+                scientific_iteration=iteration,
+                root_failure_total_count=root_failure_total,
+                root_failure_consecutive_count=consecutive_root_failures,
+                proposal_family_attempt_count=family_attempt_count,
+                proposal_family_blocked=family_attempt_count >= 2,
+            )
+            previous_journal_digest = _persist_rejection_journal_entry(
+                generated_root,
+                campaign_id=campaign_id,
+                scientific_iteration=iteration,
+                record=record,
+                previous_journal_digest=previous_journal_digest,
+            )
+            rejected.append(record)
+            if root_failure_total >= 3:
+                return _LiveLineagePreparation(
+                    status="repeated_pre_admission_failure",
+                    lineage=None,
+                    safe_context=None,
+                    scientific_iteration=None,
+                    rejected_records=tuple(rejected),
+                    branches_attempted=iteration,
+                )
+            continue
+        return _LiveLineagePreparation(
+            status="accepted",
+            lineage=lineage,
+            safe_context=safe_context,
+            scientific_iteration=iteration,
+            rejected_records=tuple(rejected),
+            branches_attempted=iteration,
+        )
+    return _LiveLineagePreparation(
+        status="portfolio_exhausted",
+        lineage=None,
+        safe_context=None,
+        scientific_iteration=None,
+        rejected_records=tuple(rejected),
+        branches_attempted=maximum_iterations,
+    )
+
+
+def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
+    def context_limits(endpoint: OpenAIChatCompletionsModel) -> Mapping[str, object] | None:
+        limits = endpoint.context_limits
+        if limits is None:
+            return None
+        return {
+            "context_length": limits.context_length,
+            "max_completion_tokens": limits.max_completion_tokens,
+            "source": limits.source,
+        }
+
+    provider_models: tuple[tuple[str, OpenAIChatCompletionsModel], ...]
+    if isinstance(model, OpenAIChatCompletionsModel):
+        provider_models = (("main", model),)
+        active_slot = "main"
+        transcripts = model.transcripts
+        failovers: tuple[object, ...] = ()
+        usage = model.total_usage
+        active_model = model
+    elif isinstance(model, OpenAIFailoverModel):
+        provider_models = model.provider_models
+        active_slot = model.active_slot
+        transcripts = model.transcripts
+        failovers = tuple(item.to_wire() for item in model.failover_events)
+        usage = model.total_usage
+        active_model = model.active_model
+    else:
+        return None
+    return {
+        "model": active_model.config.model,
+        "base_url": active_model.config.base_url,
+        "context_limits": context_limits(active_model),
         "input_tokens": usage.input_tokens,
         "cached_input_tokens": usage.cached_input_tokens,
         "output_tokens": usage.output_tokens,
@@ -1439,9 +2216,104 @@ def _provider_usage(model: ResearchModel | None) -> Mapping[str, object] | None:
         "total_tokens": usage.total_tokens,
         "estimated_cost_usd": usage.estimated_cost_usd,
         "unaccounted_attempts": usage.unaccounted_attempts,
-        "transcript_count": len(model.transcripts),
-        "provider_wall_seconds": round(sum(item.latency_seconds for item in model.transcripts), 6),
+        "retry_wait_seconds": round(usage.retry_wait_seconds, 6),
+        "transcript_count": len(transcripts),
+        "provider_wall_seconds": round(sum(item.latency_seconds for item in transcripts), 6),
+        "active_slot": active_slot,
+        "failover_count": len(failovers),
+        "failover_events": list(failovers),
+        "provider_chain": [
+            {
+                "slot": slot,
+                "model": endpoint.config.model,
+                "base_url": endpoint.config.base_url,
+                "credential_env": endpoint.config.api_key_env,
+                "context_limits": context_limits(endpoint),
+                "input_tokens": endpoint.total_usage.input_tokens,
+                "cached_input_tokens": endpoint.total_usage.cached_input_tokens,
+                "output_tokens": endpoint.total_usage.output_tokens,
+                "reasoning_tokens": endpoint.total_usage.reasoning_tokens,
+                "total_tokens": endpoint.total_usage.total_tokens,
+                "estimated_cost_usd": endpoint.total_usage.estimated_cost_usd,
+                "unaccounted_attempts": endpoint.total_usage.unaccounted_attempts,
+                "retry_wait_seconds": round(endpoint.total_usage.retry_wait_seconds, 6),
+                "transcript_count": len(endpoint.transcripts),
+            }
+            for slot, endpoint in provider_models
+        ],
     }
+
+
+def _provider_transcripts(
+    model: OpenAIChatCompletionsModel | OpenAIFailoverModel,
+) -> tuple[object, ...]:
+    return tuple(json.loads(item.json_bytes) for item in model.transcripts)
+
+
+def _provider_credential_envs(
+    model: OpenAIChatCompletionsModel | OpenAIFailoverModel,
+) -> tuple[str, ...]:
+    if isinstance(model, OpenAIChatCompletionsModel):
+        return (model.config.api_key_env,)
+    return tuple(endpoint.config.api_key_env for _, endpoint in model.provider_models)
+
+
+def _unavailable_reflection(
+    exc: BaseException,
+    *,
+    scientific_iteration: int,
+) -> Reflection:
+    """Stand in for a reflection the provider did not return.
+
+    Reflection is commentary on a result the controller already owns, so a provider failure here
+    must degrade rather than propagate out of the research loop.  The diagnostic is collapsed to
+    one line because ``report._text`` rejects newlines that ``schemas._text`` permits, and this
+    text is model- and transport-authored.
+    """
+
+    detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+    return Reflection(
+        response_id=f"reflection-unavailable-{scientific_iteration:02d}",
+        summary=("The research provider did not return a reflection for this iteration: " + detail),
+        recommendation="close_branch",
+        lessons=("Provider reflection was unavailable; the measured result stands.",),
+    )
+
+
+def _research_closure_record(
+    exc: BaseException,
+    *,
+    scientific_iteration: int,
+    operation: str,
+) -> AggregateRecord:
+    """Record a research-plane failure that closes research without ending the campaign."""
+
+    detail = " ".join(str(exc).split())[:2048] or exc.__class__.__name__
+    code = getattr(exc, "code", None)
+    return AggregateRecord(
+        name=f"research_closure_{scientific_iteration:02d}",
+        values={
+            "scientific_iteration": scientific_iteration,
+            "branch_outcome": "research_closed_by_provider_failure",
+            "operation": operation,
+            "failure_type": type(exc).__name__,
+            "failure_code": str(getattr(code, "value", code)) if code is not None else "",
+            "diagnostic": detail,
+        },
+    )
+
+
+def _research_closure_reason(exc: BaseException) -> CampaignStopReason:
+    """Map a research-plane failure onto the terminal condition it actually represents.
+
+    The provider raises a DEADLINE error by design once the finalization reserve opens; that is a
+    scheduled stop, not a fault.
+    """
+
+    code = getattr(exc, "code", None)
+    if getattr(code, "value", None) == "deadline":
+        return CampaignStopReason.FINALIZATION_RESERVE
+    return CampaignStopReason.CANDIDATES_EXHAUSTED
 
 
 def _run_autonomous_followups(
@@ -1463,6 +2335,7 @@ def _run_autonomous_followups(
     first_selection: FinalizationSelectionPlan | None,
     first_reflection: Reflection,
     first_reflection_evidence: tuple[str, str, ArtifactRef],
+    prior_records: tuple[AggregateRecord, ...],
 ) -> _AutonomousFollowupResult:
     """Continue propose→implement→evaluate→reflect until an exact terminal condition."""
 
@@ -1481,15 +2354,36 @@ def _run_autonomous_followups(
     )
     candidates = list(result.candidates)
     feedback = list(result.public_feedback)
-    records = [_iteration_record(result, reflection, scientific_iteration=1)]
-    iteration = 1
+    records = [
+        *prior_records,
+        _iteration_record(
+            result,
+            reflection,
+            scientific_iteration=runtime_template.scientific_iteration,
+            proposal=lineage.proposal,
+            # The first iteration ran on runtime_template itself, so its fusion records are here.
+            # Later iterations each get a fresh records dict from the replace() below.
+            fusion_records=runtime_template.records,
+        ),
+    ]
+    rejected_records = list(prior_records)
+    iteration = runtime_template.scientific_iteration
     terminal = result.stop_reason
 
     while True:
         if result.convergence.should_stop:
-            terminal = CampaignStopReason.CONVERGED
+            # Only a measured plateau may be reported as convergence; a run of iterations that
+            # produced no eligible outer primary gets its own reason.
+            terminal = (
+                CampaignStopReason.CONVERGED
+                if result.convergence.converged
+                else CampaignStopReason.CANDIDATES_NOT_PROMOTABLE
+            )
             break
         if result.convergence.completed_iterations >= scientific_config.max_scientific_iterations:
+            terminal = CampaignStopReason.ITERATION_CAP
+            break
+        if iteration >= scientific_config.max_scientific_iterations:
             terminal = CampaignStopReason.ITERATION_CAP
             break
         if result.launches_used >= scientific_config.max_launches:
@@ -1506,6 +2400,18 @@ def _run_autonomous_followups(
         if status.outer_queries_remaining <= 0:
             terminal = CampaignStopReason.OUTER_PROMOTION_LIMIT
             break
+        # ``result.elapsed_seconds`` accumulates only candidate subprocess wall time, so
+        # provider latency, materialization and reflection are invisible to it.  Measured on
+        # this project's own runs the unaccounted provider time reached 4011s in a single
+        # partial campaign, larger than the whole finalization reserve.  Phase 1 consults the
+        # real clock; this loop must too, or research runs straight through the reserve.
+        observed_deadline = runtime_template.engine.inspect_deadline(runtime_template.run_dir)
+        if observed_deadline.hard_expired:
+            terminal = CampaignStopReason.HARD_DEADLINE
+            break
+        if observed_deadline.finalization_reserve_active:
+            terminal = CampaignStopReason.FINALIZATION_RESERVE
+            break
 
         iteration += 1
         safe_context = _safe_context(
@@ -1517,16 +2423,44 @@ def _run_autonomous_followups(
             campaign_records=tuple(records),
             evidence=context_evidence,
         )
-        lineage = prepare_or_rehydrate_live_lineage(
-            campaign_id=request.campaign_id,
-            scientific_iteration=iteration,
-            parent=parent,
-            generated_root=runtime_template.run_dir / _PRODUCTION_DIR / "generated-source",
-            artifact_store=runtime_template.artifacts,
-            safe_context=safe_context,
-            model=research_model,
-            provider="openai",
-        )
+        try:
+            lineage = prepare_or_rehydrate_live_lineage(
+                campaign_id=request.campaign_id,
+                scientific_iteration=iteration,
+                parent=parent,
+                generated_root=runtime_template.run_dir / _PRODUCTION_DIR / "generated-source",
+                artifact_store=runtime_template.artifacts,
+                safe_context=safe_context,
+                model=research_model,
+                provider="openai",
+            )
+        except LiveResearchBranchRejected as rejection:
+            rejected_record = _rejected_lineage_record(
+                rejection,
+                scientific_iteration=iteration,
+            )
+            records.append(rejected_record)
+            rejected_records.append(rejected_record)
+            terminal = CampaignStopReason.CANDIDATES_EXHAUSTED
+            continue
+        except (ResearchModelError, ProductionResearchError) as exc:
+            # A provider or lineage failure closes research; it must never end the campaign
+            # before finalization.  Breaking here returns normally, so the caller finalizes
+            # the retained incumbent exactly as it would on any other terminal condition.
+            #
+            # ``records`` is local and dies with this frame, so the closure also goes into
+            # ``rejected_records``, which is what reaches the durable rejection ledger.  Without
+            # that the report would show research simply stopping with no stated cause.  The
+            # branch genuinely was rejected before execution, so the count stays honest.
+            closure_record = _research_closure_record(
+                exc,
+                scientific_iteration=iteration,
+                operation="lineage",
+            )
+            records.append(closure_record)
+            rejected_records.append(closure_record)
+            terminal = _research_closure_reason(exc)
+            break
         candidate_id = lineage.candidate_id
         research_ledger, experiment_id = _ensure_lineage_ledger(
             campaign_store=runtime_template.campaign_store,
@@ -1610,8 +2544,17 @@ def _run_autonomous_followups(
             research_config=request.config.research,
             artifacts=runtime_template.artifacts,
             research_model=research_model,
+            fusion_records=iteration_runtime.records,
         )
-        records.append(_iteration_record(result, reflection, scientific_iteration=iteration))
+        records.append(
+            _iteration_record(
+                result,
+                reflection,
+                scientific_iteration=iteration,
+                proposal=lineage.proposal,
+                fusion_records=iteration_runtime.records,
+            )
+        )
         if result.incumbent.candidate_id == candidate_id:
             parent = snapshot_materialized_candidate(
                 lineage.materialized,
@@ -1637,6 +2580,7 @@ def _run_autonomous_followups(
         reflection_response_digest=reflection_response,
         reflection_transcript=reflection_transcript,
         iterations_completed=iteration,
+        rejected_records=tuple(rejected_records),
     )
 
 
@@ -1734,6 +2678,13 @@ def _provider_unavailable_outcome(
     scorer_digest: str,
     fallback_receipt_digest: str,
 ) -> FullCampaignOutcome:
+    rejection_evidence = _research_rejection_evidence((), artifacts=artifacts)
+    stage_counts = _research_stage_counts(
+        model=None,
+        branches_attempted=0,
+        rejected_records=(),
+        candidates_admitted=0,
+    )
     receipt = artifacts.put_bytes(
         canonical_json_bytes(
             {
@@ -1750,6 +2701,9 @@ def _provider_unavailable_outcome(
         "diagnostic_artifact": receipt.manifest(),
         "fallback_receipt_digest": fallback_receipt_digest,
         "fallback_preserved": True,
+        "provider_usage": None,
+        "research_stage_counts": stage_counts,
+        **rejection_evidence,
     }
     _stage(
         progress,
@@ -1773,6 +2727,139 @@ def _provider_unavailable_outcome(
             "reflection_response_digest": None,
             "portfolio_count": 0,
             "portfolio_cap_reason": "configured_provider_unavailable",
+        },
+    )
+    return _commit_outcome(
+        run_dir=run_dir,
+        request=request,
+        engine=engine,
+        campaign_store=campaign_store,
+        artifacts=artifacts,
+        progress=progress,
+        qualification=qualification,
+        scorer_digest=scorer_digest,
+        fallback_receipt_digest=fallback_receipt_digest,
+        scientific_result_digest=None,
+        reflection_request_digest=None,
+        reflection_response_digest=None,
+        reflection_transcript=None,
+        selection=None,
+    )
+
+
+def _runtime_provider_unavailable_outcome(
+    *,
+    error: OpenAIProviderError,
+    model: OpenAIChatCompletionsModel | OpenAIFailoverModel,
+    run_dir: Path,
+    request: CampaignCreateRequest,
+    engine: CampaignEngine,
+    campaign_store: CampaignStore,
+    artifacts: ArtifactStore,
+    progress: FullCampaignProgressLedger,
+    qualification: OfficialFMQualificationEvidence,
+    scorer_digest: str,
+    fallback_receipt_digest: str,
+    rejected_records: Sequence[AggregateRecord] = (),
+    branches_attempted: int = 1,
+) -> FullCampaignOutcome:
+    """Close initial research safely after the live provider exhausts bounded retries."""
+
+    retryable = error.code in {
+        ProviderErrorCode.TRANSPORT,
+        ProviderErrorCode.HTTP,
+        ProviderErrorCode.INCOMPLETE,
+    }
+    credential_envs = _provider_credential_envs(model)
+    failures = (
+        [item.to_wire() for item in error.failures]
+        if isinstance(error, OpenAIProviderChainError)
+        else []
+    )
+    diagnostic = {
+        "category": "provider_unavailable",
+        "provider": "openai",
+        "code": error.code.value,
+        "message": "The live research provider failed after its bounded retry policy.",
+        "retryable": retryable,
+        "credential_env": credential_envs[0],
+        "credential_envs": list(credential_envs),
+        "operation": None if error.operation is None else error.operation.value,
+        "attempts": error.attempts,
+        "status_code": error.status_code,
+        "provider_failures": failures,
+    }
+    transcript_payloads = list(_provider_transcripts(model))
+    rejection_evidence = _research_rejection_evidence(
+        rejected_records,
+        artifacts=artifacts,
+    )
+    stage_counts = _research_stage_counts(
+        model=model,
+        branches_attempted=branches_attempted,
+        rejected_records=rejected_records,
+        candidates_admitted=0,
+    )
+    receipt = artifacts.put_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "diagnostic": diagnostic,
+                "provider_attempt_transcripts": transcript_payloads,
+                "provider_failover_events": (
+                    [item.to_wire() for item in model.failover_events]
+                    if isinstance(model, OpenAIFailoverModel)
+                    else []
+                ),
+                "rejected_lineage_records": [record.to_wire() for record in rejected_records],
+                "research_stage_counts": stage_counts,
+                "fallback_preserved": True,
+                "manual_interventions": 0,
+            }
+        ),
+        kind=ArtifactKind.LOG,
+    )
+    evidence = {
+        "provider_diagnostic": diagnostic,
+        "diagnostic_artifact": receipt.manifest(),
+        "provider_usage": _provider_usage(model),
+        "research_stage_counts": stage_counts,
+        **rejection_evidence,
+        "fallback_receipt_digest": fallback_receipt_digest,
+        "fallback_preserved": True,
+    }
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.LINEAGE_READY,
+        evidence=evidence
+        | {
+            "generated_lineage_status": "provider_retry_exhausted",
+            "manual_source_edits": 0,
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.SCIENCE_COMPLETE,
+        evidence=evidence
+        | {
+            "scientific_result_digest": None,
+            "portfolio_count": branches_attempted,
+            "portfolio_cap_reason": "runtime_provider_unavailable",
+        },
+    )
+    _stage(
+        progress,
+        request_digest=request.digest,
+        stage=FullCampaignStage.REFLECTED,
+        evidence=evidence
+        | {
+            "reflection_request_digest": None,
+            "reflection_response_digest": None,
+            "portfolio_count": branches_attempted,
+            "portfolio_cap_reason": "runtime_provider_unavailable",
+            "manual_interventions": 0,
         },
     )
     return _commit_outcome(
@@ -1917,6 +3004,9 @@ def _research_admission_closed_outcome(
     fold_a_status: str = "not_started",
     fold_b_status: str | None = None,
     diagnostic_details: Mapping[str, object] | None = None,
+    research_model: ResearchModel | None = None,
+    rejected_records: Sequence[AggregateRecord] = (),
+    branches_attempted: int = 0,
 ) -> FullCampaignOutcome:
     fallback_receipt = (
         _qualification_fallback_receipt(qualification, reason=reason)
@@ -1937,12 +3027,25 @@ def _research_admission_closed_outcome(
         ),
         kind=ArtifactKind.LOG,
     )
+    stage_counts = _research_stage_counts(
+        model=research_model,
+        branches_attempted=branches_attempted,
+        rejected_records=rejected_records,
+        candidates_admitted=0,
+    )
+    rejection_evidence = _research_rejection_evidence(
+        rejected_records,
+        artifacts=artifacts,
+    )
     common = {
         "admission_closed": True,
         "reason": reason,
         "diagnostic_artifact": diagnostic.manifest(),
         "fallback_receipt_digest": fallback_receipt,
         "fallback_preserved": True,
+        "provider_usage": _provider_usage(research_model),
+        "research_stage_counts": stage_counts,
+        **rejection_evidence,
     }
     _stage(
         progress,
@@ -1985,7 +3088,7 @@ def _research_admission_closed_outcome(
         evidence=common
         | {
             "scientific_result_digest": None,
-            "portfolio_count": 0,
+            "portfolio_count": branches_attempted,
             "portfolio_cap_reason": reason,
         },
     )
@@ -2588,6 +3691,8 @@ def run_provider_free_campaign(
 
         _check_cancel(cancel_event)
         research_model: ResearchModel | None = None
+        accepted_scientific_iteration = 1
+        rejected_lineage_records: tuple[AggregateRecord, ...] = ()
         if request.config.research.provider == "scripted":
             template_dir = _resolve_directory(
                 root,
@@ -2606,7 +3711,34 @@ def run_provider_free_campaign(
             )
             candidate_id = SCRIPTED_CANDIDATE_ID
         else:
-            selected_provider = select_research_provider(request.config.research)
+
+            def remaining_research_seconds() -> float:
+                _check_cancel(cancel_event)
+                observed = selected_engine.inspect_deadline(run)
+                return max(
+                    0.0,
+                    observed.remaining_seconds - request.config.runner.finalization_reserve_seconds,
+                )
+
+            retry_runtime = RetryRuntime(remaining_research_seconds=remaining_research_seconds)
+            persist_provider_transcript = _provider_transcript_sink(production)
+
+            def build_openai_model(
+                config: OpenAIChatCompletionsConfig,
+                transport: ResponsesTransport | None,
+            ) -> object:
+                return OpenAIChatCompletionsModel(
+                    config,
+                    transport=transport,
+                    retry_runtime=retry_runtime,
+                    model_limit_resolver=ProviderModelLimitResolver(),
+                    transcript_sink=persist_provider_transcript,
+                )
+
+            selected_provider = select_research_provider(
+                request.config.research,
+                openai_model_factory=build_openai_model,
+            )
             if isinstance(selected_provider, ProviderUnavailableDiagnostic):
                 return _provider_unavailable_outcome(
                     diagnostic=selected_provider,
@@ -2629,24 +3761,114 @@ def run_provider_free_campaign(
                 _resolve_directory(root, Path("candidate_seed"), "candidate seed"),
                 candidate_id=SCRIPTED_PARENT_ID,
             )
-            lineage = prepare_or_rehydrate_live_lineage(
+
+            def continue_live_lineage() -> bool:
+                _check_cancel(cancel_event)
+                return not selected_engine.inspect_deadline(run).finalization_reserve_active
+
+            preparation = _prepare_live_lineage_portfolio(
                 campaign_id=request.campaign_id,
-                scientific_iteration=1,
                 parent=parent,
                 generated_root=production / "generated-source",
                 artifact_store=artifacts,
-                safe_context=safe_context,
                 model=research_model,
                 provider=selected_provider.provider,
+                maximum_iterations=request.config.benchmark.max_iterations,
+                safe_context_factory=(
+                    (lambda _records: safe_context)
+                    if retained_lineage is not None
+                    else lambda records: _safe_context(
+                        request=request,
+                        qualification=qualification,
+                        fold_a=fold_a,
+                        fold_b=fold_b,
+                        status=selected_engine.status(run),
+                        campaign_records=records,
+                        evidence=context_evidence,
+                    )
+                ),
+                continue_check=continue_live_lineage,
             )
+            if preparation.status == "provider_unavailable":
+                if not isinstance(
+                    research_model, (OpenAIChatCompletionsModel, OpenAIFailoverModel)
+                ):
+                    raise FullCampaignError(
+                        "non-OpenAI research model returned an OpenAI provider failure"
+                    )
+                if preparation.provider_error is None:
+                    raise FullCampaignError("provider-unavailable preparation lost its error")
+                return _runtime_provider_unavailable_outcome(
+                    error=preparation.provider_error,
+                    model=research_model,
+                    run_dir=run,
+                    request=request,
+                    engine=selected_engine,
+                    campaign_store=campaign_store,
+                    artifacts=artifacts,
+                    progress=progress,
+                    qualification=qualification,
+                    scorer_digest=scorer_digest,
+                    fallback_receipt_digest=fallback_receipt,
+                    rejected_records=preparation.rejected_records,
+                    branches_attempted=preparation.branches_attempted,
+                )
+            if preparation.status != "accepted":
+                reason = (
+                    "repeated_pre_admission_failure"
+                    if preparation.status == "repeated_pre_admission_failure"
+                    else "live_lineage_portfolio_exhausted_or_reserve_active"
+                )
+                return _research_admission_closed_outcome(
+                    reason=reason,
+                    run_dir=run,
+                    request=request,
+                    engine=selected_engine,
+                    campaign_store=campaign_store,
+                    artifacts=artifacts,
+                    progress=progress,
+                    qualification=qualification,
+                    scorer_digest=scorer_digest,
+                    fold_b=fold_b,
+                    fallback_receipt_digest=fallback_receipt,
+                    diagnostic_category="live_lineage_portfolio_closed",
+                    fold_a_status="completed",
+                    diagnostic_details={
+                        "maximum_iterations": request.config.benchmark.max_iterations,
+                        "preparation_status": preparation.status,
+                    },
+                    research_model=research_model,
+                    rejected_records=preparation.rejected_records,
+                    branches_attempted=preparation.branches_attempted,
+                )
+            if (
+                preparation.lineage is None
+                or preparation.safe_context is None
+                or preparation.scientific_iteration is None
+            ):
+                raise FullCampaignError("accepted live-lineage preparation is incomplete")
+            lineage = preparation.lineage
+            safe_context = preparation.safe_context
+            accepted_scientific_iteration = preparation.scientific_iteration
+            rejected_lineage_records = preparation.rejected_records
             candidate_id = lineage.candidate_id
         research_ledger, experiment_id = _ensure_lineage_ledger(
             campaign_store=campaign_store,
             lineage=lineage,
             candidate_id=candidate_id,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
         )
         observed_start = selected_engine.inspect_deadline(run)
+        lineage_stage_counts = _research_stage_counts(
+            model=research_model,
+            branches_attempted=accepted_scientific_iteration,
+            rejected_records=rejected_lineage_records,
+            candidates_admitted=1,
+        )
+        lineage_rejection_evidence = _research_rejection_evidence(
+            rejected_lineage_records,
+            artifacts=artifacts,
+        )
         lineage_stage = _stage(
             progress,
             request_digest=request.digest,
@@ -2658,6 +3880,9 @@ def run_provider_free_campaign(
                 "manual_source_edits": 0,
                 "provider": lineage.provider,
                 "live_provider_used": lineage.live_provider_used,
+                "provider_usage": _provider_usage(research_model),
+                "research_stage_counts": lineage_stage_counts,
+                **lineage_rejection_evidence,
                 "safe_context": safe_context.to_wire(),
                 "safe_context_digest": safe_context.digest,
                 "scientific_start": {
@@ -2703,7 +3928,7 @@ def run_provider_free_campaign(
             lineage=lineage,
             candidate_id=candidate_id,
             candidate_limits=candidate_limits,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
         )
         fold_a_data_digest = _digest(
             b"kuairand-production-fold-A-science-v1",
@@ -2763,7 +3988,7 @@ def run_provider_free_campaign(
             lineage=lineage,
             candidate=candidate,
             experiment_id=experiment_id,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
             config=scientific_config,
             feature_artifacts=feature_artifacts,
             features=features,
@@ -2862,10 +4087,11 @@ def run_provider_free_campaign(
             artifacts=artifacts,
             research_model=research_model,
             candidate_id=candidate_id,
-            scientific_iteration=1,
+            scientific_iteration=accepted_scientific_iteration,
+            fusion_records=runtime.records,
         )
         _check_cancel(cancel_event)
-        iterations_completed = 1
+        iterations_completed = accepted_scientific_iteration
         if isinstance(lineage, LiveResearchLineage):
             if research_model is None:
                 raise FullCampaignError("live lineage lost its research model")
@@ -2891,6 +4117,7 @@ def run_provider_free_campaign(
                     reflection_response,
                     reflection_transcript,
                 ),
+                prior_records=rejected_lineage_records,
             )
             result = followup.result
             selection = followup.selection
@@ -2898,6 +4125,7 @@ def run_provider_free_campaign(
             reflection_response = followup.reflection_response_digest
             reflection_transcript = followup.reflection_transcript
             iterations_completed = followup.iterations_completed
+            rejected_lineage_records = followup.rejected_records
         observed_launches = campaign_store.snapshot().launches_used
         if observed_launches != result.launches_used:
             raise FullCampaignError(
@@ -2906,6 +4134,32 @@ def run_provider_free_campaign(
         result_artifact = artifacts.put_bytes(
             _canonical_json(result.manifest() | {"digest": result.digest}),
             kind=ArtifactKind.MANIFEST,
+        )
+        inner_evaluations_completed = sum(
+            run.metrics is not None
+            for candidate_result in result.candidates
+            for run in candidate_result.runs[:2]
+        )
+        outer_evaluations_completed = sum(
+            run.metrics is not None
+            for candidate_result in result.candidates
+            for run in candidate_result.runs[2:]
+        )
+        final_stage_counts = _research_stage_counts(
+            model=research_model,
+            branches_attempted=iterations_completed,
+            rejected_records=rejected_lineage_records,
+            candidates_admitted=max(0, iterations_completed - len(rejected_lineage_records)),
+            training_started=max(
+                0,
+                result.launches_used - scientific_config.launches_already_used,
+            ),
+            inner_evaluations_completed=inner_evaluations_completed,
+            outer_evaluations_completed=outer_evaluations_completed,
+        )
+        final_rejection_evidence = _research_rejection_evidence(
+            rejected_lineage_records,
+            artifacts=artifacts,
         )
         _check_cancel(cancel_event)
         _stage(
@@ -2925,6 +4179,8 @@ def run_provider_free_campaign(
                 "iterations_completed": iterations_completed,
                 "autonomous_loop_completed": isinstance(lineage, LiveResearchLineage),
                 "provider_usage": _provider_usage(research_model),
+                "research_stage_counts": final_stage_counts,
+                **final_rejection_evidence,
             },
         )
         _check_cancel(cancel_event)
@@ -2944,6 +4200,8 @@ def run_provider_free_campaign(
                 "manual_source_edits": 0,
                 "manual_interventions": 0,
                 "provider_usage": _provider_usage(research_model),
+                "research_stage_counts": final_stage_counts,
+                **final_rejection_evidence,
             },
         )
         _check_cancel(cancel_event)

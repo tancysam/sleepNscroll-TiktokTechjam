@@ -26,9 +26,10 @@ def _create_campaign(path: Path) -> CampaignStore:
         source_digest="6" * 64,
         hard_deadline_utc="2030-01-01T00:00:00Z",
         initial_convergence={
-            "schema_version": 1,
+            "schema_version": 2,
             "best_primary": 0.6016,
             "non_material_streak": 0,
+            "unmeasured_streak": 0,
             "completed_iterations": 0,
             "required_completion_pending": False,
         },

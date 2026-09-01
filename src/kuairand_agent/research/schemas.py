@@ -18,11 +18,20 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final, Self, cast
 
+from kuairand_agent.candidate_api.runtime_contract import CANDIDATE_RUNTIME_CONTRACT
+from kuairand_agent.research.source_policy import (
+    DEFAULT_CANDIDATE_SOURCE_POLICY,
+    CandidateSourcePolicy,
+    CandidateSourcePolicyError,
+    validate_policy_digest,
+)
+
 SCHEMA_VERSION: Final = 1
 MAX_TEXT_CHARS: Final = 16_384
 MAX_DIAGNOSTIC_CHARS: Final = 32_768
 MAX_SOURCE_CHARS: Final = 512 * 1024
 _IDENTIFIER_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_PYTHON_IDENTIFIER_RE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 
 JsonScalar = str | int | float | bool | None
@@ -146,6 +155,34 @@ def _string_tuple(
     if allowed is not None and not set(result) <= allowed:
         raise SchemaValidationError(f"{location} contains an unsupported value")
     return result
+
+
+def _deduplicated(value: object) -> object:
+    """Collapse repeats in an untrusted declaration list, preserving first-seen order.
+
+    ``material_symbols`` declares WHICH definitions changed; naming one twice says nothing
+    different from naming it once.  A live campaign was nonetheless lost to it: the model returned
+    a complete, correct implementation whose symbol list repeated ``train_model`` and nine others,
+    the strict duplicate check rejected the whole response, and with ``max_malformed_retries = 1``
+    the branch died having produced working code.  Repeats are normalized here, on untrusted wire
+    input only; the dataclass invariants stay strict, and materiality itself is still decided by
+    ``require_material_executable_change`` comparing top-level AST nodes.
+
+    Anything that is not a list passes through untouched so the caller's own validation still
+    produces the right error.
+    """
+
+    if not isinstance(value, list):
+        return value
+    seen: set[str] = set()
+    ordered: list[object] = []
+    for item in value:
+        if type(item) is str:
+            if item in seen:
+                continue
+            seen.add(item)
+        ordered.append(item)
+    return ordered
 
 
 def _mapping(value: object, location: str) -> Mapping[str, object]:
@@ -498,6 +535,24 @@ class ParentSnapshot:
             "digest": self.digest,
         }
 
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> Self:
+        _exact_fields(raw, {"schema_version", "candidate_id", "files", "digest"}, "parent")
+        _schema_version(raw["schema_version"], "parent")
+        files_raw = raw["files"]
+        if not isinstance(files_raw, list):
+            raise SchemaValidationError("parent.files must be an array")
+        value = cls(
+            candidate_id=_text(raw["candidate_id"], "parent.candidate_id", identifier=True),
+            files=tuple(
+                ParentSourceFile.from_mapping(_mapping(item, f"parent.files[{index}]"))
+                for index, item in enumerate(files_raw)
+            ),
+        )
+        if raw["digest"] != value.digest:
+            raise SchemaValidationError("parent snapshot digest mismatch")
+        return value
+
 
 @dataclass(frozen=True, slots=True)
 class GeneratedFile:
@@ -556,7 +611,10 @@ class GeneratedPackage:
                 "generated package must declare between 1 and 32 material symbols"
             )
         for index, value in enumerate(self.material_symbols):
-            _text(value, f"generated_package.material_symbols[{index}]", identifier=True)
+            location = f"generated_package.material_symbols[{index}]"
+            symbol = _text(value, location)
+            if _PYTHON_IDENTIFIER_RE.fullmatch(symbol) is None:
+                raise SchemaValidationError(f"{location} must be one bare ASCII Python identifier")
         if len(self.material_symbols) != len(set(self.material_symbols)):
             raise SchemaValidationError("generated package material symbols contain duplicates")
 
@@ -611,11 +669,196 @@ class GeneratedPackage:
                 "generated_package.material_change_summary",
             ),
             material_symbols=_string_tuple(
-                raw["material_symbols"],
+                _deduplicated(raw["material_symbols"]),
                 "generated_package.material_symbols",
                 maximum_items=32,
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedPackageFile:
+    """One inert content-addressed file from a rejected provider package."""
+
+    path: str
+    sha256: str
+    content: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _text(self.path, "rejected_package_file.path")
+        content = _source_text(self.content, f"rejected_package_file[{self.path!r}].content")
+        size = len(content.encode("utf-8"))
+        if size > DEFAULT_CANDIDATE_SOURCE_POLICY.max_generated_file_bytes:
+            raise SchemaValidationError("rejected package file exceeds the byte limit")
+        if type(self.sha256) is not str or _SHA256_RE.fullmatch(self.sha256) is None:
+            raise SchemaValidationError("rejected_package_file.sha256 must be lowercase SHA-256")
+        expected = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if self.sha256 != expected:
+            raise SchemaValidationError(f"rejected package file digest mismatch for {self.path!r}")
+
+    @classmethod
+    def create(cls, path: str, content: str) -> Self:
+        validated = _source_text(content, f"rejected_package_file[{path!r}].content")
+        return cls(
+            path=path,
+            sha256=hashlib.sha256(validated.encode("utf-8")).hexdigest(),
+            content=validated,
+        )
+
+    def to_wire(self) -> dict[str, str]:
+        return {"path": self.path, "sha256": self.sha256, "content": self.content}
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> Self:
+        _exact_fields(raw, {"path", "sha256", "content"}, "rejected_package_file")
+        return cls(
+            path=_text(raw["path"], "rejected_package_file.path"),
+            sha256=_text(raw["sha256"], "rejected_package_file.sha256"),
+            content=_source_text(raw["content"], "rejected_package_file.content"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedPackageSnapshot:
+    """Exact inert snapshot of the provider package that caused a local rejection.
+
+    Paths are intentionally not checked against the candidate path allow/deny policy: preserving
+    the causative forbidden path is the point of this non-executable repair evidence.
+    """
+
+    request_id: str
+    response_id: str
+    files: tuple[RejectedPackageFile, ...]
+    material_change_summary: str
+    material_symbols: tuple[str, ...]
+    package_digest: str
+    digest: str = field(init=False)
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _schema_version(self.schema_version, "rejected_package")
+        _text(self.request_id, "rejected_package.request_id", identifier=True)
+        _text(self.response_id, "rejected_package.response_id", identifier=True)
+        _text(self.material_change_summary, "rejected_package.material_change_summary")
+        policy = DEFAULT_CANDIDATE_SOURCE_POLICY
+        if (
+            type(self.files) is not tuple
+            or not self.files
+            or len(self.files) > policy.max_generated_files
+        ):
+            raise SchemaValidationError("rejected package must contain between 1 and 12 files")
+        if any(not isinstance(value, RejectedPackageFile) for value in self.files):
+            raise SchemaValidationError("rejected package contains an invalid file record")
+        ordered = tuple(sorted(self.files, key=lambda value: value.path))
+        paths = tuple(value.path for value in ordered)
+        if len(paths) != len(set(paths)):
+            raise SchemaValidationError("rejected package contains duplicate paths")
+        if (
+            sum(len(value.content.encode("utf-8")) for value in ordered)
+            > policy.max_generated_total_bytes
+        ):
+            raise SchemaValidationError("rejected package exceeds the total byte limit")
+        object.__setattr__(self, "files", ordered)
+        if (
+            type(self.material_symbols) is not tuple
+            or not self.material_symbols
+            or len(self.material_symbols) > 32
+        ):
+            raise SchemaValidationError(
+                "rejected package must declare between 1 and 32 material symbols"
+            )
+        for index, value in enumerate(self.material_symbols):
+            location = f"rejected_package.material_symbols[{index}]"
+            symbol = _text(value, location)
+            if _PYTHON_IDENTIFIER_RE.fullmatch(symbol) is None:
+                raise SchemaValidationError(f"{location} must be one bare ASCII Python identifier")
+        if len(self.material_symbols) != len(set(self.material_symbols)):
+            raise SchemaValidationError("rejected package material symbols contain duplicates")
+        generated = self.to_generated_package()
+        if type(self.package_digest) is not str or self.package_digest != generated.digest:
+            raise SchemaValidationError("rejected package digest mismatch")
+        object.__setattr__(self, "digest", canonical_digest(self._wire_without_digest()))
+
+    @classmethod
+    def from_generated_package(cls, package: GeneratedPackage) -> Self:
+        if not isinstance(package, GeneratedPackage):
+            raise SchemaValidationError("rejected package snapshot requires GeneratedPackage")
+        return cls(
+            request_id=package.request_id,
+            response_id=package.response_id,
+            files=tuple(
+                RejectedPackageFile.create(value.path, value.content) for value in package.files
+            ),
+            material_change_summary=package.material_change_summary,
+            material_symbols=package.material_symbols,
+            package_digest=package.digest,
+            schema_version=package.schema_version,
+        )
+
+    def to_generated_package(self) -> GeneratedPackage:
+        return GeneratedPackage(
+            request_id=self.request_id,
+            response_id=self.response_id,
+            files=tuple(GeneratedFile(value.path, value.content) for value in self.files),
+            material_change_summary=self.material_change_summary,
+            material_symbols=self.material_symbols,
+            schema_version=self.schema_version,
+        )
+
+    def _wire_without_digest(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "request_id": self.request_id,
+            "response_id": self.response_id,
+            "files": [value.to_wire() for value in self.files],
+            "material_change_summary": self.material_change_summary,
+            "material_symbols": list(self.material_symbols),
+            "package_digest": self.package_digest,
+        }
+
+    def to_wire(self) -> dict[str, object]:
+        return {**self._wire_without_digest(), "digest": self.digest}
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> Self:
+        _exact_fields(
+            raw,
+            {
+                "schema_version",
+                "request_id",
+                "response_id",
+                "files",
+                "material_change_summary",
+                "material_symbols",
+                "package_digest",
+                "digest",
+            },
+            "rejected_package",
+        )
+        files_raw = raw["files"]
+        if not isinstance(files_raw, list):
+            raise SchemaValidationError("rejected_package.files must be an array")
+        value = cls(
+            schema_version=_schema_version(raw["schema_version"], "rejected_package"),
+            request_id=_text(raw["request_id"], "rejected_package.request_id", identifier=True),
+            response_id=_text(raw["response_id"], "rejected_package.response_id", identifier=True),
+            files=tuple(
+                RejectedPackageFile.from_mapping(_mapping(item, f"rejected_package.files[{index}]"))
+                for index, item in enumerate(files_raw)
+            ),
+            material_change_summary=_text(
+                raw["material_change_summary"], "rejected_package.material_change_summary"
+            ),
+            material_symbols=_string_tuple(
+                _deduplicated(raw["material_symbols"]),
+                "rejected_package.material_symbols",
+                maximum_items=32,
+            ),
+            package_digest=_text(raw["package_digest"], "rejected_package.package_digest"),
+        )
+        if raw["digest"] != value.digest:
+            raise SchemaValidationError("rejected package snapshot digest mismatch")
+        return value
 
 
 class ResearchOperation(StrEnum):
@@ -644,6 +887,35 @@ def _safe_context(value: Mapping[str, object]) -> tuple[Mapping[str, object], st
     return MappingProxyType(copied), hashlib.sha256(encoded).hexdigest()
 
 
+def _request_source_policy(policy: object, digest: object, location: str) -> CandidateSourcePolicy:
+    if not isinstance(policy, CandidateSourcePolicy):
+        raise SchemaValidationError(f"{location} requires CandidateSourcePolicy")
+    if policy != DEFAULT_CANDIDATE_SOURCE_POLICY:
+        raise SchemaValidationError(f"{location} source policy is not the frozen default")
+    try:
+        validate_policy_digest(policy, digest)
+    except CandidateSourcePolicyError as exc:
+        raise SchemaValidationError(f"{location} {exc}") from exc
+    return policy
+
+
+def _source_policy_from_wire(value: object, digest: object, location: str) -> CandidateSourcePolicy:
+    try:
+        policy = CandidateSourcePolicy.from_mapping(_mapping(value, f"{location}.source_policy"))
+    except CandidateSourcePolicyError as exc:
+        raise SchemaValidationError(f"{location} source policy is invalid: {exc}") from exc
+    return _request_source_policy(policy, digest, location)
+
+
+def _runtime_contract_from_wire(value: object, digest: object, location: str) -> None:
+    supplied = _mapping(value, f"{location}.runtime_contract")
+    expected = CANDIDATE_RUNTIME_CONTRACT.to_wire()
+    if dict(supplied) != expected:
+        raise SchemaValidationError(f"{location} runtime contract is not the frozen default")
+    if digest != CANDIDATE_RUNTIME_CONTRACT.digest:
+        raise SchemaValidationError(f"{location} runtime contract digest mismatch")
+
+
 @dataclass(frozen=True, slots=True)
 class ProposalRequest:
     request_id: str
@@ -652,6 +924,8 @@ class ProposalRequest:
     parent_candidate_id: str
     safe_context: Mapping[str, object] = field(repr=False)
     safe_context_digest: str
+    source_policy: CandidateSourcePolicy = DEFAULT_CANDIDATE_SOURCE_POLICY
+    source_policy_digest: str = DEFAULT_CANDIDATE_SOURCE_POLICY.digest
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -673,6 +947,7 @@ class ProposalRequest:
         if self.safe_context_digest != digest:
             raise SchemaValidationError("proposal_request safe-context digest mismatch")
         object.__setattr__(self, "safe_context", context)
+        _request_source_policy(self.source_policy, self.source_policy_digest, "proposal_request")
 
     @classmethod
     def create(
@@ -692,6 +967,8 @@ class ProposalRequest:
             parent_candidate_id=parent_candidate_id,
             safe_context=context,
             safe_context_digest=digest,
+            source_policy=DEFAULT_CANDIDATE_SOURCE_POLICY,
+            source_policy_digest=DEFAULT_CANDIDATE_SOURCE_POLICY.digest,
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -703,7 +980,61 @@ class ProposalRequest:
             "parent_candidate_id": self.parent_candidate_id,
             "safe_context": dict(self.safe_context),
             "safe_context_digest": self.safe_context_digest,
+            "source_policy": self.source_policy.to_wire(),
+            "source_policy_digest": self.source_policy_digest,
+            "runtime_contract": CANDIDATE_RUNTIME_CONTRACT.to_wire(),
+            "runtime_contract_digest": CANDIDATE_RUNTIME_CONTRACT.digest,
         }
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> Self:
+        _exact_fields(
+            raw,
+            {
+                "schema_version",
+                "request_id",
+                "campaign_id",
+                "scientific_iteration",
+                "parent_candidate_id",
+                "safe_context",
+                "safe_context_digest",
+                "source_policy",
+                "source_policy_digest",
+                "runtime_contract",
+                "runtime_contract_digest",
+            },
+            "proposal_request",
+        )
+        policy = _source_policy_from_wire(
+            raw["source_policy"], raw["source_policy_digest"], "proposal_request"
+        )
+        _runtime_contract_from_wire(
+            raw["runtime_contract"], raw["runtime_contract_digest"], "proposal_request"
+        )
+        return cls(
+            schema_version=_schema_version(raw["schema_version"], "proposal_request"),
+            request_id=_text(raw["request_id"], "proposal_request.request_id", identifier=True),
+            campaign_id=_text(raw["campaign_id"], "proposal_request.campaign_id", identifier=True),
+            scientific_iteration=_integer(
+                raw["scientific_iteration"],
+                "proposal_request.scientific_iteration",
+                minimum=1,
+                maximum=50,
+            ),
+            parent_candidate_id=_text(
+                raw["parent_candidate_id"],
+                "proposal_request.parent_candidate_id",
+                identifier=True,
+            ),
+            safe_context=_mapping(raw["safe_context"], "proposal_request.safe_context"),
+            safe_context_digest=_text(
+                raw["safe_context_digest"], "proposal_request.safe_context_digest"
+            ),
+            source_policy=policy,
+            source_policy_digest=_text(
+                raw["source_policy_digest"], "proposal_request.source_policy_digest"
+            ),
+        )
 
     @property
     def digest(self) -> str:
@@ -717,9 +1048,8 @@ class ImplementationRequest:
     parent: ParentSnapshot
     safe_context: Mapping[str, object] = field(repr=False)
     safe_context_digest: str
-    max_changed_files: int = 12
-    max_total_utf8_bytes: int = 1024 * 1024
-    allowed_suffixes: tuple[str, ...] = (".json", ".md", ".py")
+    source_policy: CandidateSourcePolicy = DEFAULT_CANDIDATE_SOURCE_POLICY
+    source_policy_digest: str = DEFAULT_CANDIDATE_SOURCE_POLICY.digest
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -729,20 +1059,9 @@ class ImplementationRequest:
             raise SchemaValidationError("implementation request requires typed proposal and parent")
         if self.proposal.parent_candidate_id != self.parent.candidate_id:
             raise SchemaValidationError("proposal parent does not match implementation parent")
-        _integer(
-            self.max_changed_files,
-            "implementation_request.max_changed_files",
-            minimum=1,
-            maximum=12,
+        _request_source_policy(
+            self.source_policy, self.source_policy_digest, "implementation_request"
         )
-        _integer(
-            self.max_total_utf8_bytes,
-            "implementation_request.max_total_utf8_bytes",
-            minimum=1,
-            maximum=1024 * 1024,
-        )
-        if self.allowed_suffixes != (".json", ".md", ".py"):
-            raise SchemaValidationError("implementation request suffix allowlist is frozen")
         context, digest = _safe_context(self.safe_context)
         if self.safe_context_digest != digest:
             raise SchemaValidationError("implementation_request safe-context digest mismatch")
@@ -764,7 +1083,21 @@ class ImplementationRequest:
             parent=parent,
             safe_context=context,
             safe_context_digest=digest,
+            source_policy=DEFAULT_CANDIDATE_SOURCE_POLICY,
+            source_policy_digest=DEFAULT_CANDIDATE_SOURCE_POLICY.digest,
         )
+
+    @property
+    def max_changed_files(self) -> int:
+        return self.source_policy.max_generated_files
+
+    @property
+    def max_total_utf8_bytes(self) -> int:
+        return self.source_policy.max_generated_total_bytes
+
+    @property
+    def allowed_suffixes(self) -> tuple[str, ...]:
+        return self.source_policy.allowed_suffixes
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -774,12 +1107,77 @@ class ImplementationRequest:
             "parent": self.parent.to_wire(),
             "safe_context": dict(self.safe_context),
             "safe_context_digest": self.safe_context_digest,
+            "source_policy": self.source_policy.to_wire(),
+            "source_policy_digest": self.source_policy_digest,
+            "runtime_contract": CANDIDATE_RUNTIME_CONTRACT.to_wire(),
+            "runtime_contract_digest": CANDIDATE_RUNTIME_CONTRACT.digest,
             "limits": {
                 "max_changed_files": self.max_changed_files,
                 "max_total_utf8_bytes": self.max_total_utf8_bytes,
                 "allowed_suffixes": list(self.allowed_suffixes),
             },
         }
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> Self:
+        _exact_fields(
+            raw,
+            {
+                "schema_version",
+                "request_id",
+                "proposal",
+                "parent",
+                "safe_context",
+                "safe_context_digest",
+                "source_policy",
+                "source_policy_digest",
+                "runtime_contract",
+                "runtime_contract_digest",
+                "limits",
+            },
+            "implementation_request",
+        )
+        policy = _source_policy_from_wire(
+            raw["source_policy"], raw["source_policy_digest"], "implementation_request"
+        )
+        _runtime_contract_from_wire(
+            raw["runtime_contract"],
+            raw["runtime_contract_digest"],
+            "implementation_request",
+        )
+        limits = _mapping(raw["limits"], "implementation_request.limits")
+        _exact_fields(
+            limits,
+            {"max_changed_files", "max_total_utf8_bytes", "allowed_suffixes"},
+            "implementation_request.limits",
+        )
+        expected_limits = {
+            "max_changed_files": policy.max_generated_files,
+            "max_total_utf8_bytes": policy.max_generated_total_bytes,
+            "allowed_suffixes": list(policy.allowed_suffixes),
+        }
+        if dict(limits) != expected_limits:
+            raise SchemaValidationError("implementation_request limits do not match source policy")
+        return cls(
+            schema_version=_schema_version(raw["schema_version"], "implementation_request"),
+            request_id=_text(
+                raw["request_id"], "implementation_request.request_id", identifier=True
+            ),
+            proposal=Proposal.from_mapping(
+                _mapping(raw["proposal"], "implementation_request.proposal")
+            ),
+            parent=ParentSnapshot.from_mapping(
+                _mapping(raw["parent"], "implementation_request.parent")
+            ),
+            safe_context=_mapping(raw["safe_context"], "implementation_request.safe_context"),
+            safe_context_digest=_text(
+                raw["safe_context_digest"], "implementation_request.safe_context_digest"
+            ),
+            source_policy=policy,
+            source_policy_digest=_text(
+                raw["source_policy_digest"], "implementation_request.source_policy_digest"
+            ),
+        )
 
     @property
     def digest(self) -> str:
@@ -788,6 +1186,15 @@ class ImplementationRequest:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentResultSummary:
+    """One completed experiment as the model sees it when reflecting.
+
+    ``primary`` is the *blend's* score, never the model's own: every candidate prediction is rank
+    fused with the official FM control on a frozen five-point weight grid.  The four fusion fields
+    carry what that blend actually did, so reflection can tell "was discarded" apart from "matched
+    the baseline".  They default to ``None`` because fixture and scripted paths have no fusion
+    selection to disclose.
+    """
+
     tier: str
     status: str
     gauc: float
@@ -795,6 +1202,11 @@ class ExperimentResultSummary:
     primary: float
     runtime_seconds: float
     peak_memory_mb: float
+    execution_failed: bool = False
+    candidate_standalone_primary: float | None = None
+    fold_b_control_primary: float | None = None
+    fusion_weights_selected: str | None = None
+    fusion_note: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.tier, "experiment_result.tier", identifier=True)
@@ -813,12 +1225,29 @@ class ExperimentResultSummary:
                 raise SchemaValidationError(f"experiment_result.{name} must be in [0, 1]")
         if abs(self.primary - (self.gauc + self.ndcg_at_5) / 2.0) > 1e-12:
             raise SchemaValidationError("experiment_result.primary must be the metric mean")
+        if type(self.execution_failed) is not bool:
+            raise SchemaValidationError("experiment_result.execution_failed must be boolean")
         for name, value in (
             ("runtime_seconds", self.runtime_seconds),
             ("peak_memory_mb", self.peak_memory_mb),
         ):
             if _finite_number(value, f"experiment_result.{name}") < 0:
                 raise SchemaValidationError(f"experiment_result.{name} cannot be negative")
+        for fusion_name, fusion_metric in (
+            ("candidate_standalone_primary", self.candidate_standalone_primary),
+            ("fold_b_control_primary", self.fold_b_control_primary),
+        ):
+            if fusion_metric is None:
+                continue
+            bounded = _finite_number(fusion_metric, f"experiment_result.{fusion_name}")
+            if not 0.0 <= bounded <= 1.0:
+                raise SchemaValidationError(f"experiment_result.{fusion_name} must be in [0, 1]")
+        for text_name, text_value in (
+            ("fusion_weights_selected", self.fusion_weights_selected),
+            ("fusion_note", self.fusion_note),
+        ):
+            if text_value is not None:
+                _text(text_value, f"experiment_result.{text_name}")
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -829,6 +1258,11 @@ class ExperimentResultSummary:
             "primary": self.primary,
             "runtime_seconds": self.runtime_seconds,
             "peak_memory_mb": self.peak_memory_mb,
+            "execution_failed": self.execution_failed,
+            "candidate_standalone_primary": self.candidate_standalone_primary,
+            "fold_b_control_primary": self.fold_b_control_primary,
+            "fusion_weights_selected": self.fusion_weights_selected,
+            "fusion_note": self.fusion_note,
         }
 
 
@@ -912,6 +1346,9 @@ class RepairRequest:
     remaining_repairs: int
     safe_context: Mapping[str, object] = field(repr=False)
     safe_context_digest: str
+    rejected_package: RejectedPackageSnapshot | None = None
+    source_policy: CandidateSourcePolicy = DEFAULT_CANDIDATE_SOURCE_POLICY
+    source_policy_digest: str = DEFAULT_CANDIDATE_SOURCE_POLICY.digest
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -920,6 +1357,12 @@ class RepairRequest:
             _text(getattr(self, name), f"repair_request.{name}", identifier=True)
         if not isinstance(self.failed_child, ParentSnapshot):
             raise SchemaValidationError("repair request requires the exact failed child snapshot")
+        if self.rejected_package is not None and not isinstance(
+            self.rejected_package, RejectedPackageSnapshot
+        ):
+            raise SchemaValidationError(
+                "repair request rejected_package must be an inert snapshot or null"
+            )
         if not isinstance(self.failure_category, FailureCategory):
             raise SchemaValidationError("repair request failure_category is unsupported")
         _text(
@@ -937,6 +1380,7 @@ class RepairRequest:
         if self.safe_context_digest != digest:
             raise SchemaValidationError("repair_request safe-context digest mismatch")
         object.__setattr__(self, "safe_context", context)
+        _request_source_policy(self.source_policy, self.source_policy_digest, "repair_request")
 
     @classmethod
     def create(
@@ -950,6 +1394,7 @@ class RepairRequest:
         diagnostics: str,
         remaining_repairs: int,
         safe_context: Mapping[str, object],
+        rejected_package: RejectedPackageSnapshot | None = None,
     ) -> Self:
         try:
             category = FailureCategory(failure_category)
@@ -966,6 +1411,9 @@ class RepairRequest:
             remaining_repairs=remaining_repairs,
             safe_context=context,
             safe_context_digest=digest,
+            rejected_package=rejected_package,
+            source_policy=DEFAULT_CANDIDATE_SOURCE_POLICY,
+            source_policy_digest=DEFAULT_CANDIDATE_SOURCE_POLICY.digest,
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -980,7 +1428,83 @@ class RepairRequest:
             "remaining_repairs": self.remaining_repairs,
             "safe_context": dict(self.safe_context),
             "safe_context_digest": self.safe_context_digest,
+            "rejected_package": (
+                self.rejected_package.to_wire() if self.rejected_package is not None else None
+            ),
+            "source_policy": self.source_policy.to_wire(),
+            "source_policy_digest": self.source_policy_digest,
+            "runtime_contract": CANDIDATE_RUNTIME_CONTRACT.to_wire(),
+            "runtime_contract_digest": CANDIDATE_RUNTIME_CONTRACT.digest,
         }
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> Self:
+        _exact_fields(
+            raw,
+            {
+                "schema_version",
+                "request_id",
+                "proposal_id",
+                "failed_candidate_id",
+                "failed_child",
+                "failure_category",
+                "diagnostics",
+                "remaining_repairs",
+                "safe_context",
+                "safe_context_digest",
+                "rejected_package",
+                "source_policy",
+                "source_policy_digest",
+                "runtime_contract",
+                "runtime_contract_digest",
+            },
+            "repair_request",
+        )
+        rejected_raw = raw["rejected_package"]
+        if rejected_raw is not None and not isinstance(rejected_raw, Mapping):
+            raise SchemaValidationError("repair_request.rejected_package must be an object or null")
+        policy = _source_policy_from_wire(
+            raw["source_policy"], raw["source_policy_digest"], "repair_request"
+        )
+        _runtime_contract_from_wire(
+            raw["runtime_contract"], raw["runtime_contract_digest"], "repair_request"
+        )
+        return cls(
+            schema_version=_schema_version(raw["schema_version"], "repair_request"),
+            request_id=_text(raw["request_id"], "repair_request.request_id", identifier=True),
+            proposal_id=_text(raw["proposal_id"], "repair_request.proposal_id", identifier=True),
+            failed_candidate_id=_text(
+                raw["failed_candidate_id"],
+                "repair_request.failed_candidate_id",
+                identifier=True,
+            ),
+            failed_child=ParentSnapshot.from_mapping(
+                _mapping(raw["failed_child"], "repair_request.failed_child")
+            ),
+            failure_category=FailureCategory(
+                _text(raw["failure_category"], "repair_request.failure_category")
+            ),
+            diagnostics=_text(raw["diagnostics"], "repair_request.diagnostics"),
+            remaining_repairs=_integer(
+                raw["remaining_repairs"],
+                "repair_request.remaining_repairs",
+                minimum=1,
+                maximum=2,
+            ),
+            safe_context=_mapping(raw["safe_context"], "repair_request.safe_context"),
+            safe_context_digest=_text(
+                raw["safe_context_digest"], "repair_request.safe_context_digest"
+            ),
+            rejected_package=(
+                RejectedPackageSnapshot.from_mapping(cast(Mapping[str, object], rejected_raw))
+                if rejected_raw is not None
+                else None
+            ),
+            source_policy=policy,
+            source_policy_digest=_text(
+                raw["source_policy_digest"], "repair_request.source_policy_digest"
+            ),
+        )
 
     @property
     def digest(self) -> str:
@@ -1070,6 +1594,8 @@ _REQUIRED_FIELD_SCHEMA: Final = _strict_object_schema(
         "purpose": _TEXT_SCHEMA,
     },
 )
+# The Responses Structured Outputs subset rejects ``uniqueItems``.  The typed Proposal and
+# GeneratedPackage constructors below remain the authoritative duplicate-rejection boundary.
 _PROPOSAL_SCHEMA: Final = _strict_object_schema(
     "Proposal",
     {
@@ -1082,7 +1608,6 @@ _PROPOSAL_SCHEMA: Final = _strict_object_schema(
             "items": {"type": "string", "enum": ["GAUC", "nDCG@5"]},
             "minItems": 1,
             "maxItems": 2,
-            "uniqueItems": True,
         },
         "parent_candidate_id": _IDENTIFIER_SCHEMA,
         "principal_change": _TEXT_SCHEMA,
@@ -1091,7 +1616,6 @@ _PROPOSAL_SCHEMA: Final = _strict_object_schema(
             "items": _TEXT_SCHEMA,
             "minItems": 1,
             "maxItems": 12,
-            "uniqueItems": True,
         },
         "required_fields": {
             "type": "array",
@@ -1125,7 +1649,6 @@ _PROPOSAL_SCHEMA: Final = _strict_object_schema(
             "items": _TEXT_SCHEMA,
             "minItems": 1,
             "maxItems": 16,
-            "uniqueItems": True,
         },
     },
 )
@@ -1154,7 +1677,6 @@ _GENERATED_PACKAGE_SCHEMA: Final = _strict_object_schema(
             "items": _IDENTIFIER_SCHEMA,
             "minItems": 1,
             "maxItems": 32,
-            "uniqueItems": True,
         },
     },
 )

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 import kuairand_agent.finalization.production as production
@@ -33,6 +34,7 @@ from kuairand_agent.finalization.production import (
     ProductionFinalizationOutcome,
 )
 from kuairand_agent.finalization.recipe import GeneratedLambdaRankReplayRecipe
+from kuairand_agent.finalization.report import ExperimentNarrative, MetricEvidence
 from kuairand_agent.finalization.submission_bundle import (
     FINAL_BUNDLE_SCHEMA_VERSION,
     REQUIRED_DIRECTORY_PATHS,
@@ -49,14 +51,19 @@ def _metrics(gauc: float, ndcg: float) -> dict[str, float]:
     return {"GAUC": gauc, "nDCG@5": ndcg, "primary": (gauc + ndcg) / 2.0}
 
 
-def _fallback_resource_evidence(bundle_digest: str) -> MappingProxyType[str, object]:
+def _fallback_resource_evidence(
+    bundle_digest: str,
+    *,
+    hard_wall_seconds: int = 21_600,
+    finalization_reserve_seconds: int = 3_600,
+) -> MappingProxyType[str, object]:
     return MappingProxyType(
         {
             "schema_version": 1,
             "clock_basis": "durable_max_of_monotonic_and_utc_elapsed",
             "campaign_elapsed_seconds": 20.0,
-            "hard_wall_seconds": 21_600,
-            "finalization_reserve_seconds": 3_600,
+            "hard_wall_seconds": hard_wall_seconds,
+            "finalization_reserve_seconds": finalization_reserve_seconds,
             "finalization_started_elapsed_seconds": 10.0,
             "finalization_elapsed_seconds": 10.0,
             "coverage": list(production._FINALIZATION_COVERAGE),
@@ -242,6 +249,42 @@ def test_bundle_status_is_independently_derived_from_all_matched_seeds(
     assert production._derive_bundle_status(_generated_manifest(delta)) is expected
 
 
+def test_representative_primary_survives_the_organizer_float32_mean() -> None:
+    """A scorer-reported primary must verify against the float64 recomputation of its own parts.
+
+    The organizer evaluator is float32-sensitive, so ``validation.metrics`` carries the float32
+    mean of GAUC and nDCG@5 while the matched-seed row recomputes that mean in float64.  The two
+    land one float32 ulp apart.  Comparing them for exact equality stranded maki-overnight-15 at
+    FINALIZING with `representative primary differs from reconstructed evidence` after it became
+    the first campaign ever to promote a generated candidate and reach this branch.  Every fixture
+    here builds both sides from the same float64 helper, which is why it was never caught.
+    """
+
+    manifest = _generated_manifest(0.001)
+    validation = cast(dict[str, Any], manifest["validation"])
+    declared = cast(dict[str, float], validation["metrics"])
+    float64_mean = declared["primary"]
+    float32_mean = float(
+        (np.float32(declared["GAUC"]) + np.float32(declared["nDCG@5"])) / np.float32(2)
+    )
+    assert float32_mean != float64_mean, "fixture no longer exercises the dtype gap"
+    assert abs(float32_mean - float64_mean) < 1e-6
+
+    # The fixture aliases validation.metrics to the seed 0 row, so replace the mapping rather than
+    # mutating it; mutating would also move the matched-seed evidence this is checked against.
+    def _declare(primary: float) -> None:
+        validation["metrics"] = dict(declared) | {"primary": primary}
+
+    _declare(float32_mean)
+    assert production._derive_bundle_status(manifest) is FinalStatus.VALIDATION_IMPROVED
+
+    # The tolerance absorbs one dtype artifact and nothing larger: a primary that genuinely
+    # disagrees with the matched-seed evidence must still be refused.
+    _declare(float64_mean + 1e-5)
+    with pytest.raises(ProductionFinalizationError, match="representative primary"):
+        production._derive_bundle_status(manifest)
+
+
 def test_material_status_forgery_and_incomplete_confirmation_are_rejected() -> None:
     forged = _generated_manifest(0.001)
     cast(dict[str, object], forged["selection"])["status"] = "materially_confirmed"
@@ -330,6 +373,7 @@ def test_generated_bundle_rejects_tampered_protected_bootstrap_point() -> None:
 
 def test_generated_resource_provenance_separates_selected_training_from_report_envelope(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     candidate_peaks = (948_830_208, 941_211_648, 948_617_216)
     fm_peaks = (1_843_101_696, 1_700_000_000, 1_650_000_000)
@@ -426,6 +470,7 @@ def test_generated_resource_provenance_separates_selected_training_from_report_e
         environment_digest=environment_digest,
     )
     outcome = SimpleNamespace(
+        run_dir=tmp_path,
         selection=SimpleNamespace(representative_seed=0),
         scientific_result_digest=_digest("a"),
         manual_interventions=0,
@@ -618,6 +663,59 @@ def test_production_outcome_round_trip_is_signed_and_tamper_evident(tmp_path: Pa
     tampered = json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode("ascii")
     with pytest.raises(ProductionFinalizationError, match="digest mismatch"):
         ProductionFinalizationOutcome.from_bytes(tampered)
+
+
+def test_production_outcome_accepts_one_hour_sprint_resource_limits(tmp_path: Path) -> None:
+    outcome = ProductionFinalizationOutcome(
+        run_dir=(tmp_path / "run").absolute(),
+        campaign_id="campaign",
+        research_outcome_digest=_digest("a"),
+        selected_candidate_id="official-fm-fallback-seed-4",
+        selected_status=FinalStatus.BASELINE_REPRODUCED,
+        fallback_count=0,
+        failures=(),
+        training_replay=MappingProxyType({"required": False, "completed": True}),
+        resource_evidence=_fallback_resource_evidence(
+            _digest("b"),
+            hard_wall_seconds=3_600,
+            finalization_reserve_seconds=600,
+        ),
+        bundle_root=(tmp_path / "run" / "final").absolute(),
+        bundle_manifest_sha256=_digest("b"),
+        submission_sha256=_digest("c"),
+        replay_evidence_sha256=_digest("d"),
+        organizer_verification_sha256=_digest("e"),
+        campaign_revision=42,
+    )
+
+    assert outcome.resource_evidence["hard_wall_seconds"] == 3_600
+    assert outcome.resource_evidence["finalization_reserve_seconds"] == 600
+    assert ProductionFinalizationOutcome.from_bytes(outcome.canonical_bytes) == outcome
+
+
+def test_production_outcome_rejects_invalid_dynamic_resource_limits(tmp_path: Path) -> None:
+    with pytest.raises(ProductionFinalizationError, match="finalization reserve is invalid"):
+        ProductionFinalizationOutcome(
+            run_dir=(tmp_path / "run").absolute(),
+            campaign_id="campaign",
+            research_outcome_digest=_digest("a"),
+            selected_candidate_id="official-fm-fallback-seed-4",
+            selected_status=FinalStatus.BASELINE_REPRODUCED,
+            fallback_count=0,
+            failures=(),
+            training_replay=MappingProxyType({"required": False, "completed": True}),
+            resource_evidence=_fallback_resource_evidence(
+                _digest("b"),
+                hard_wall_seconds=3_600,
+                finalization_reserve_seconds=3_600,
+            ),
+            bundle_root=(tmp_path / "run" / "final").absolute(),
+            bundle_manifest_sha256=_digest("b"),
+            submission_sha256=_digest("c"),
+            replay_evidence_sha256=_digest("d"),
+            organizer_verification_sha256=_digest("e"),
+            campaign_revision=42,
+        )
 
 
 def test_final_training_resources_bind_tree_file_not_model_directory_identity(
@@ -1496,6 +1594,7 @@ def test_positive_submaterial_delta_is_explicitly_reported_as_unconfirmed() -> N
         status=FinalStatus.BASELINE_REPRODUCED,
     )
     assert "Immutable official FM seed 4" in baseline_rationale
+    assert "not agent-generated" in baseline_rationale
     assert baseline_limitations == ()
 
 
@@ -1557,6 +1656,62 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
             "portfolio_count": 1,
             "portfolio_cap": 1,
             "portfolio_cap_reason": "bounded_high_value_lambdarank_branch_prioritized",
+            "research_stage_counts": {
+                "branches_attempted": 3,
+                "proposal_responses_accepted": 3,
+                "implementation_responses_accepted": 2,
+                "repair_responses_accepted": 1,
+                "branches_rejected_pre_execution": 2,
+                "candidates_admitted": 1,
+                "training_started": 1,
+                "inner_evaluations_completed": 1,
+                "outer_evaluations_completed": 0,
+            },
+            "research_rejection_summary": {
+                "branches_rejected_pre_execution": 2,
+                "root_counts": [
+                    {
+                        "fingerprint": (_digest("1")),
+                        "stage": "implementation",
+                        "category": "candidate_path_policy",
+                        "code": "forbidden_basename",
+                        "subject": "baseline.py",
+                        "count": 2,
+                    }
+                ],
+                "terminal_counts": [
+                    {
+                        "fingerprint": _digest("2"),
+                        "stage": "repair",
+                        "category": "materiality",
+                        "code": "declared_symbol_unchanged",
+                        "subject": "main",
+                        "count": 2,
+                    }
+                ],
+                "examples": [
+                    {
+                        "scientific_iteration": 2,
+                        "candidate_id": "candidate-02",
+                        "proposal_family": "pairwise:bpr",
+                        "proposal_signature": _digest("e"),
+                        "role": "root",
+                        "fingerprint": (_digest("1")),
+                        "diagnostic": ("reserved candidate filename is forbidden: baseline.py"),
+                    },
+                    {
+                        "scientific_iteration": 2,
+                        "candidate_id": "candidate-02",
+                        "proposal_family": "pairwise:bpr",
+                        "proposal_signature": _digest("e"),
+                        "role": "terminal",
+                        "fingerprint": _digest("2"),
+                        "diagnostic": "declared material symbol did not change: main",
+                    },
+                ],
+                "counts_truncated": False,
+                "examples_truncated": False,
+            },
         },
     )
     reflected = SimpleNamespace(
@@ -1598,6 +1753,22 @@ def test_judge_report_quantifies_scripted_calls_and_manifest_limitations(
     )
     assert "Advanced WP7 branches were not entered" in facts.advanced_branch_disposition
     assert "not an advanced-branch failure" in facts.advanced_branch_disposition
+    assert facts.research_progress == (
+        "Research admission: branches attempted=3; proposal responses accepted=3; "
+        "implementation responses accepted=2; repair responses accepted=1; "
+        "rejected pre-execution=2; candidates admitted=1; training started=1; "
+        "inner evaluations completed=1; outer evaluations completed=0."
+    )
+    assert facts.research_rejections == (
+        "Research rejection roots: implementation/candidate_path_policy/"
+        f"forbidden_basename/baseline.py [{_digest('1')}] x2.",
+        "Research rejection terminals: repair/materiality/declared_symbol_unchanged/"
+        f"main [{_digest('2')}] x2.",
+        f"Research rejection example (root): {_digest('1')}; "
+        "reserved candidate filename is forbidden: baseline.py",
+        f"Research rejection example (terminal): {_digest('2')}; "
+        "declared material symbol did not change: main",
+    )
     limitations = production._bundle_known_limitations(
         generated=True,
         status=FinalStatus.VALIDATION_IMPROVED,
@@ -1662,6 +1833,65 @@ def test_provider_unavailable_report_records_zero_research_and_replay_calls(
     )
     assert facts.portfolio_count == 0
     assert facts.portfolio_cap_reason == "configured_provider_unavailable"
+    assert facts.research_outcome == (
+        "Research did not start because the configured provider was unavailable."
+    )
+
+    checkpoints[1].evidence["provider_usage"] = {
+        "model": "gpt-5.6-sol",
+        "input_tokens": 300,
+        "cached_input_tokens": 0,
+        "output_tokens": 120,
+        "reasoning_tokens": 60,
+        "total_tokens": 420,
+        "estimated_cost_usd": "0.0036",
+        "unaccounted_attempts": 0,
+        "transcript_count": 3,
+        "provider_wall_seconds": 30.0,
+    }
+
+    attempted = production._judge_progress_facts(outcome)
+
+    assert "Research-model attempts=3" in attempted.provider_usage
+    assert "provider=configured_provider_unavailable" in attempted.provider_usage
+    assert "total tokens=420" in attempted.provider_usage
+
+    checkpoints[1].evidence["portfolio_count"] = 0
+    checkpoints[1].evidence["portfolio_cap_reason"] = "runtime_provider_unavailable"
+    checkpoints[2].evidence["portfolio_cap_reason"] = "runtime_provider_unavailable"
+    checkpoints[0].evidence["provider_diagnostic"]["attempts"] = 3
+
+    runtime_failure = production._judge_progress_facts(outcome)
+
+    assert "provider=runtime_provider_failure" in runtime_failure.provider_usage
+    assert runtime_failure.research_outcome == (
+        "Research started, but the provider failed at runtime after durable attempts."
+    )
+
+    checkpoints[0].evidence = {
+        "admission_closed": True,
+        "reason": "repeated_pre_admission_failure",
+    }
+    checkpoints[1].evidence = {
+        "admission_closed": True,
+        "reason": "repeated_pre_admission_failure",
+        "portfolio_count": 0,
+        "portfolio_cap_reason": "repeated_pre_admission_failure",
+    }
+    checkpoints[2].evidence.update(
+        {
+            "admission_closed": True,
+            "reason": "repeated_pre_admission_failure",
+            "portfolio_cap_reason": "repeated_pre_admission_failure",
+        }
+    )
+
+    admission_closed = production._judge_progress_facts(outcome)
+
+    assert admission_closed.research_outcome == (
+        "Research admission closed before a candidate was admitted; controller reason="
+        "repeated_pre_admission_failure."
+    )
 
 
 def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
@@ -1754,6 +1984,300 @@ def test_judge_report_accepts_live_provider_and_quantifies_tokens_and_cost(
     assert "total tokens=1700" in facts.provider_usage
     assert "estimated API cost USD=0.014" in facts.provider_usage
     assert "replay provider calls=0" in facts.provider_usage
+
+    usage.update(
+        {
+            "base_url": "https://fallback.example/v1",
+            "context_limits": {
+                "context_length": 1_050_000,
+                "max_completion_tokens": 128_000,
+                "source": "openrouter-model-metadata",
+            },
+            "active_slot": "fallback",
+            "failover_count": 1,
+            "failover_events": [
+                {
+                    "operation": "implement",
+                    "from_slot": "main",
+                    "to_slot": "fallback",
+                    "failure": {
+                        "slot": "main",
+                        "code": "http",
+                        "operation": "implement",
+                        "attempts": 3,
+                        "status_code": 429,
+                    },
+                }
+            ],
+            "provider_chain": [
+                {
+                    "slot": "main",
+                    "model": "gpt-5.6-sol",
+                    "base_url": "https://main.example/v1",
+                    "credential_env": "INFERENCE_MAIN_API_KEY",
+                    "context_limits": None,
+                    "input_tokens": 1000,
+                    "cached_input_tokens": 100,
+                    "output_tokens": 300,
+                    "reasoning_tokens": 200,
+                    "total_tokens": 1300,
+                    "estimated_cost_usd": "0.010",
+                    "unaccounted_attempts": 0,
+                    "transcript_count": 4,
+                },
+                {
+                    "slot": "fallback",
+                    "model": "fallback-model",
+                    "base_url": "https://fallback.example/v1",
+                    "credential_env": "INFERENCE_FALLBACK_API_KEY",
+                    "context_limits": {
+                        "context_length": 1_050_000,
+                        "max_completion_tokens": 128_000,
+                        "source": "openrouter-model-metadata",
+                    },
+                    "input_tokens": 200,
+                    "cached_input_tokens": 100,
+                    "output_tokens": 200,
+                    "reasoning_tokens": 100,
+                    "total_tokens": 400,
+                    "estimated_cost_usd": "0.004",
+                    "unaccounted_attempts": 0,
+                    "transcript_count": 2,
+                },
+            ],
+        }
+    )
+
+    chained_facts = production._judge_progress_facts(outcome)
+
+    assert "active slot=fallback" in chained_facts.provider_usage
+    assert "failovers=1" in chained_facts.provider_usage
+    assert "active base URL=https://fallback.example/v1" in chained_facts.provider_usage
+
+    usage["retry_wait_seconds"] = 3.5
+    cast(list[dict[str, object]], usage["provider_chain"])[0]["retry_wait_seconds"] = 2.0
+    cast(list[dict[str, object]], usage["provider_chain"])[1]["retry_wait_seconds"] = 1.5
+
+    retry_facts = production._judge_progress_facts(outcome)
+
+    assert "retry wait seconds=3.5" in retry_facts.provider_usage
+
+    usage["context_limits"] = {
+        "context_length": 128_000,
+        "max_completion_tokens": 1_050_000,
+        "source": "invalid",
+    }
+    with pytest.raises(
+        production.ProductionFinalizationError,
+        match="live provider usage evidence is malformed",
+    ):
+        production._judge_progress_facts(outcome)
+
+
+def test_fallback_report_includes_research_admission_and_rejection_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    facts = production._JudgeProgressFacts(
+        provider_usage="Research-model attempts=6; replay provider calls=0.",
+        portfolio_count=0,
+        portfolio_cap=50,
+        portfolio_cap_reason="repeated_pre_admission_failure",
+        advanced_branch_disposition="Advanced branches were not entered.",
+        research_progress=(
+            "Research admission: branches attempted=3; proposal responses accepted=3; "
+            "implementation responses accepted=2; repair responses accepted=2; "
+            "rejected pre-execution=3; candidates admitted=0; training started=0; "
+            "inner evaluations completed=0; outer evaluations completed=0."
+        ),
+        research_outcome=(
+            "Research admission closed before a candidate was admitted; "
+            "controller reason=repeated_pre_admission_failure."
+        ),
+        research_rejections=(
+            "Research rejection roots: candidate_path_policy:forbidden_basename:baseline.py x3.",
+            "Research rejection terminals: materiality:declared_symbol_unchanged:main x2.",
+        ),
+    )
+    monkeypatch.setattr(production, "_judge_progress_facts", lambda _outcome: facts)
+    monkeypatch.setattr(
+        production,
+        "_baseline_mean",
+        lambda _qualification: MetricEvidence(
+            label="official-fm",
+            tier="qualified baseline",
+            gauc=0.6,
+            ndcg_at_5=0.4,
+            primary=0.5,
+            seeds=(0, 1, 2, 3, 4),
+            note="Official fallback.",
+        ),
+    )
+    monkeypatch.setattr(production, "_report_peak_rss_bytes", lambda *_args: 1024)
+
+    context = production._report_context(
+        candidate_id="official-fm-fallback-seed-4",
+        parent_id="official-fm-fallback-seed-4",
+        run_dir=tmp_path,
+        campaign_id="campaign-report-context",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        metrics=_metrics(0.6, 0.4),
+        qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
+        outcome=cast(
+            Any,
+            SimpleNamespace(
+                selection=None,
+                manual_interventions=0,
+                fallback_receipt_digest=_digest("b"),
+            ),
+        ),
+        generated=False,
+        failures=(),
+        confirmation=None,
+        campaign_wall_seconds=10.0,
+        launch_count=0,
+    )
+
+    assert context.failures_and_recoveries[:4] == (
+        facts.research_outcome,
+        facts.research_progress,
+        *facts.research_rejections,
+    )
+    assert "not agent-generated" in context.selection_rationale
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("durable per-iteration research evidence is unreadable"),
+        ValueError("experiment hypothesis must not contain a newline"),
+        OSError("lineage directory disappeared under the reader"),
+    ],
+)
+def test_report_context_degrades_when_the_trajectory_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    """Recovering the trajectory is presentation; failing to recover it must not abort finalization.
+
+    ``collect_iteration_narratives`` can raise three unrelated exception types -- the evidence
+    error, a ``RuntimeError`` from the journal reader, and a ``ValueError`` from the report text
+    validator.  Only the first was caught, and it was re-raised rather than degraded, so a
+    campaign holding a valid bundle could still finish with nothing published.  The campaign store
+    and the immutable lineage files remain the evidence of record either way.
+    """
+
+    def explode(*_args: object, **_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(production, "collect_iteration_narratives", explode)
+    monkeypatch.setattr(production, "_report_peak_rss_bytes", lambda *_args: 1024)
+    monkeypatch.setattr(
+        production,
+        "_judge_progress_facts",
+        lambda _outcome: production._JudgeProgressFacts(
+            provider_usage="Research-model attempts=1; replay provider calls=0.",
+            portfolio_count=0,
+            portfolio_cap=50,
+            portfolio_cap_reason="repeated_pre_admission_failure",
+            advanced_branch_disposition="Advanced branches were not entered.",
+            research_progress="Research admission: branches attempted=1.",
+            research_outcome="Research admission closed before a candidate was admitted.",
+            research_rejections=(),
+        ),
+    )
+    monkeypatch.setattr(
+        production,
+        "_baseline_mean",
+        lambda _qualification: MetricEvidence(
+            label="official-fm",
+            tier="qualified baseline",
+            gauc=0.6,
+            ndcg_at_5=0.4,
+            primary=0.5,
+            seeds=(0, 1, 2, 3, 4),
+            note="Official fallback.",
+        ),
+    )
+
+    context = production._report_context(
+        candidate_id="official-fm-fallback-seed-4",
+        parent_id="official-fm-fallback-seed-4",
+        run_dir=tmp_path,
+        campaign_id="campaign-degraded-trajectory",
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+        metrics=_metrics(0.6, 0.4),
+        qualification=cast(Any, SimpleNamespace(benchmark_digest=_digest("a"))),
+        outcome=cast(
+            Any,
+            SimpleNamespace(
+                selection=None,
+                manual_interventions=0,
+                fallback_receipt_digest=_digest("b"),
+            ),
+        ),
+        generated=False,
+        failures=(),
+        confirmation=None,
+        campaign_wall_seconds=10.0,
+        launch_count=0,
+    )
+
+    assert context.experiments
+
+
+def test_selected_candidate_keeps_its_measured_primary_in_the_trajectory() -> None:
+    """Recovered narratives carry no score, so the promoted row rendered a dash.
+
+    Lineage records hold a proposal and a package but no metric, so replacing the literal
+    narrative with the recovered ones dropped the one number in the table that is actually known.
+    """
+
+    def narrative(iteration: int, experiment_id: str) -> ExperimentNarrative:
+        return ExperimentNarrative(
+            iteration=iteration,
+            experiment_id=experiment_id,
+            parent_id="official-fm-fallback-seed-4",
+            hypothesis="Replace the pointwise objective with a pairwise one.",
+            mechanism="Sample same-user pairs and optimise softplus over the margin.",
+            material_changes=("Changed top-level symbol: fit_scores",),
+            attributions=("Organizer briefing.",),
+            status="promoted",
+        )
+
+    carried = production._with_selected_metric(
+        (narrative(1, "candidate-01"), narrative(2, "candidate-02")),
+        candidate_id="candidate-02",
+        outer_primary=0.6042,
+    )
+
+    assert carried[0].outer_primary is None
+    assert carried[1].outer_primary == 0.6042
+
+
+def test_with_selected_metric_never_overwrites_a_measured_score() -> None:
+    """A score already on the narrative is the measured one and must win."""
+
+    measured = ExperimentNarrative(
+        iteration=1,
+        experiment_id="candidate-01",
+        parent_id="official-fm-fallback-seed-4",
+        hypothesis="Replace the pointwise objective with a pairwise one.",
+        mechanism="Sample same-user pairs and optimise softplus over the margin.",
+        material_changes=("Changed top-level symbol: fit_scores",),
+        attributions=("Organizer briefing.",),
+        status="promoted",
+        outer_primary=0.6001,
+    )
+
+    carried = production._with_selected_metric(
+        (measured,),
+        candidate_id="candidate-01",
+        outer_primary=0.9999,
+    )
+
+    assert carried[0].outer_primary == 0.6001
 
 
 def test_current_runtime_reproof_rejects_source_or_lock_drift_and_is_path_independent(
@@ -2370,3 +2894,57 @@ def test_judge_ledger_exports_exact_lineage_commands_resources_and_portfolio_clo
     assert portfolio["advanced_wp7_branches_entered"] is False
     assert portfolio["advanced_wp7_disposition"].startswith("not_entered")
     assert first_csv.startswith(b"record_type,record_id,candidate_id,parent_id,tier,seed,status")
+
+
+def test_scientific_runs_are_attributed_to_the_candidate_that_produced_them() -> None:
+    """A promoted campaign holds runs from every candidate, not only the winner.
+
+    `maki-overnight-13` promoted a generated candidate for the first time and finalization died
+    with "scientific record source, config, or environment identity changed", because the export
+    required every retained run to carry the selected candidate's own source and config identity.
+    Three candidates produced three distinct source digests, so that check could never pass. The
+    same bug also labelled every exported row with the winner's id, misattributing other
+    candidates' runs in the judge ledger.
+    """
+
+    outcomes = [
+        {"candidate_id": "candidate-01-winner", "run_digests": [_digest("a"), _digest("b")]},
+        {"candidate_id": "candidate-02-other", "run_digests": [_digest("c")]},
+        {"candidate_id": "candidate-03-other", "run_digests": [_digest("d")]},
+    ]
+
+    owners, expected, selected = production._candidate_run_ownership(
+        outcomes, selected_candidate_id="candidate-01-winner"
+    )
+
+    assert expected == {_digest("a"), _digest("b"), _digest("c"), _digest("d")}
+    # Only the winner's own runs may be held to the selection's source and config identity.
+    assert selected == {_digest("a"), _digest("b")}
+    # Every run keeps its real owner, so the ledger cannot misattribute a losing candidate's run.
+    assert owners[_digest("c")] == "candidate-02-other"
+    assert owners[_digest("d")] == "candidate-03-other"
+    assert owners[_digest("a")] == "candidate-01-winner"
+
+
+def test_candidate_run_ownership_rejects_malformed_outcomes() -> None:
+    with pytest.raises(ProductionFinalizationError, match="candidate outcome is malformed"):
+        production._candidate_run_ownership(["not a mapping"], selected_candidate_id="x")
+
+    with pytest.raises(ProductionFinalizationError, match="run digests are malformed"):
+        production._candidate_run_ownership(
+            [{"candidate_id": "x", "run_digests": "not a list"}], selected_candidate_id="x"
+        )
+
+
+def test_candidate_run_ownership_handles_a_fallback_selection_owning_no_runs() -> None:
+    """Every previous campaign selected the fallback, which owns no scientific runs."""
+
+    outcomes = [{"candidate_id": "candidate-01", "run_digests": [_digest("a")]}]
+
+    owners, expected, selected = production._candidate_run_ownership(
+        outcomes, selected_candidate_id="official-fm-fallback-seed-4"
+    )
+
+    assert expected == {_digest("a")}
+    assert selected == set()
+    assert owners[_digest("a")] == "candidate-01"

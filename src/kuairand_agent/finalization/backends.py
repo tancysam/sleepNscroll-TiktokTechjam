@@ -24,7 +24,10 @@ from kuairand_agent.candidate_api.protocol import (
     PredictionExpectation,
     validate_prediction_outputs,
 )
-from kuairand_agent.candidates.fusion import fuse_ranked_predictions
+from kuairand_agent.candidates.fusion import (
+    fuse_ranked_predictions,
+    normalize_within_user_percentiles,
+)
 from kuairand_agent.contract import sha256_file, verify_starter_kit
 from kuairand_agent.data.capabilities import CandidateInputs, DataPhase
 from kuairand_agent.execution.policy import SplitRole
@@ -33,6 +36,7 @@ from kuairand_agent.finalization.recipe import (
     GeneratedLambdaRankReplayRecipe,
     OfficialFMMemberRecipe,
     OfficialFMReplayRecipe,
+    OfficialFMSeedEnsembleReplayRecipe,
     ReplayRecipe,
     ReplayRecipeError,
     load_replay_recipe,
@@ -271,6 +275,119 @@ class OfficialFMReplayBackend:
             config=config,
             expected_starter_manifest_sha256=self.recipe.fm_member.starter_manifest_sha256,
         )
+
+    def replay_validation(
+        self, *, workspace: FrozenCandidateWorkspace, inputs: CandidateInputs
+    ) -> Float64Vector:
+        return self._predict(
+            workspace=workspace,
+            inputs=inputs,
+            phase=DataPhase.OUTER_VALID,
+            expected_inputs_digest=self.recipe.validation_inputs_digest,
+        )
+
+    def predict_final(
+        self, *, workspace: FrozenCandidateWorkspace, inputs: CandidateInputs
+    ) -> Float64Vector:
+        return self._predict(
+            workspace=workspace,
+            inputs=inputs,
+            phase=DataPhase.FINAL,
+            expected_inputs_digest=self.recipe.final_inputs_digest,
+        )
+
+
+def official_fm_ensemble_member_filename(seed: int) -> str:
+    """Bundle member name for one seed's checkpoint. Shared by writer and replay."""
+
+    return f"fm-checkpoint-seed-{seed}.npz"
+
+
+OFFICIAL_FM_ENSEMBLE_ENCODING_FILENAME: Final = "fm-encoding.npz"
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialFMSeedEnsembleReplayBackend:
+    """Equal-weight within-user rank ensemble over several qualified official FM seeds.
+
+    Each member runs through the pinned organizer source exactly as the single-seed fallback does,
+    so no new inference path is introduced.  Members are combined on within-user rank percentiles
+    rather than raw scores: the metric is a within-user ordering and the members do not share a
+    score scale, and rank averaging is worth roughly seven times raw averaging here (measured, see
+    ``ensemble_mode_probe.py``).
+    """
+
+    recipe: OfficialFMSeedEnsembleReplayRecipe
+
+    def _predict(
+        self,
+        *,
+        workspace: FrozenCandidateWorkspace,
+        inputs: CandidateInputs,
+        phase: DataPhase,
+        expected_inputs_digest: str,
+    ) -> Float64Vector:
+        _require_workspace(workspace)
+        _require_recipe_artifact(workspace, self.recipe)
+        _require_common_identity(
+            workspace,
+            inputs,
+            source_artifact_sha256=self.recipe.source_artifact_sha256,
+            feature_artifact_sha256=self.recipe.feature_artifact_sha256,
+            checkpoint_artifact_sha256=self.recipe.checkpoint_artifact_sha256,
+            data_sha256=self.recipe.data_sha256,
+            expected_inputs_digest=expected_inputs_digest,
+            phase=phase,
+        )
+        members = self.recipe.fm_members
+        _exact_regular_inventory(
+            workspace.features_path,
+            {OFFICIAL_FM_ENSEMBLE_ENCODING_FILENAME},
+            "official FM ensemble preprocessing artifact",
+        )
+        _exact_regular_inventory(
+            workspace.checkpoint_path,
+            {official_fm_ensemble_member_filename(member.seed) for member in members},
+            "official FM ensemble model artifact",
+        )
+        encoding_path = workspace.features_path / OFFICIAL_FM_ENSEMBLE_ENCODING_FILENAME
+
+        normalized: list[Float64Vector] = []
+        for member in members:
+            checkpoint_path = workspace.checkpoint_path / official_fm_ensemble_member_filename(
+                member.seed
+            )
+            encoding, checkpoint, config = _load_fm(
+                encoding_path=encoding_path,
+                checkpoint_path=checkpoint_path,
+                member=member,
+            )
+            scores = _fm_predictions(
+                source_dir=workspace.source_dir,
+                inputs=inputs,
+                encoding=encoding,
+                checkpoint=checkpoint,
+                config=config,
+                expected_starter_manifest_sha256=member.starter_manifest_sha256,
+            )
+            try:
+                ranked = normalize_within_user_percentiles(
+                    inputs.column("user_id"),
+                    inputs.column("video_id"),
+                    scores,
+                    phase=phase,
+                )
+            except Exception as exc:
+                raise ReplayError("official FM ensemble rank normalisation failed") from exc
+            normalized.append(ranked.scores)
+
+        combined = np.ascontiguousarray(
+            np.mean(np.stack(normalized, axis=0), axis=0), dtype=np.float64
+        )
+        if combined.shape != (inputs.row_count,) or not np.isfinite(combined).all():
+            raise ReplayError("official FM ensemble produced invalid predictions")
+        combined.setflags(write=False)
+        return combined
 
     def replay_validation(
         self, *, workspace: FrozenCandidateWorkspace, inputs: CandidateInputs
@@ -663,6 +780,8 @@ def build_replay_backend(
         raise ReplayRecipeError("cancel_event must be threading.Event or None")
     if isinstance(recipe, OfficialFMReplayRecipe):
         return OfficialFMReplayBackend(recipe)
+    if isinstance(recipe, OfficialFMSeedEnsembleReplayRecipe):
+        return OfficialFMSeedEnsembleReplayBackend(recipe)
     if isinstance(recipe, GeneratedLambdaRankReplayRecipe):
         selected_interpreter = Path(sys.executable) if interpreter is None else interpreter
         return GeneratedLambdaRankReplayBackend(

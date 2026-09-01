@@ -1,0 +1,79 @@
+# Cheap single-iteration live-provider probe.
+#
+# Purpose: prove the typed research seam survives contact with a real model before spending a
+# full campaign. It is NOT a scored run — `run_kind = "test"` keeps it out of any autonomy or
+# token comparison reported in the submission.
+#
+# Pass criteria, in order:
+#   1. `propose` returns a schema-valid Proposal naming the correct parent.
+#   2. `implement` survives materialization, `validate_candidate_static`, and
+#      `require_material_executable_change`.
+#   3. One candidate reaches the smoke tier and produces a number.
+#   4. The generated-source lineage record exists and is well-formed.
+#
+# A failure at step 2 is a prompt defect, not a code defect: read the CandidateStaticError,
+# add the missing rule to `research/prompts.py`, and re-run into a NEW run directory.
+
+schema_version = 2
+
+[benchmark]
+name = "kuairand-pure"
+data_dir = ".data/KuaiRand-Pure/data"
+starter_dir = "kuairand-starter-kit"
+target = "long_view"
+# One scientific iteration. Convergence cannot fire here and is not the point.
+max_iterations = 1
+# 90 minutes. Must satisfy: default_timeout + finalization_reserve <= wall_clock.
+wall_clock_seconds = 5400
+epsilon = 0.002
+convergence_patience = 3
+
+[validation]
+# One promotion only; the probe is about the seam, not about search breadth.
+outer_promotion_limit = 1
+confirmation_seeds = [0, 1, 2]
+inner_folds = ["20220416:20220418", "20220419:20220421"]
+
+[runner]
+device = "cpu"
+max_processes = 1
+threads = 4
+memory_mb = 16384
+disk_mb = 20480
+# 15 minutes per training launch: enough for a generated candidate over 1.14M rows on CPU,
+# short enough that a runaway candidate fails fast.
+default_timeout_seconds = 900
+# 3600 is the validator's hard floor for the reserve, and wall_clock must leave room for
+# default_timeout + reserve (900 + 3600 = 4500 <= 5400).
+finalization_reserve_seconds = 3600
+
+[research]
+provider = "openai"
+max_repairs_per_experiment = 2
+# Forced to "autonomous": config.py:496-499 pairs the two strictly — a live OpenAI provider
+# requires run_kind = "autonomous", and "test"/"demo" require the scripted provider. There is
+# no legal way to label a live run as a probe.
+#
+# So separate the probe from the scored campaign by RUN DIRECTORY, not by run_kind, and count
+# its tokens honestly: it is real live spend that preceded the converged result, and the
+# Feasibility criterion asks for total tokens consumed to reach that result.
+run_kind = "autonomous"
+allow_scripted_demo = false
+
+[research.openai]
+model = "gpt-5.6-sol"
+base_url = "https://api.openai.com/v1"
+# "medium" rather than "xhigh": this probe is checking contract compliance, not research depth,
+# and a reasoning timeout surfaces as an opaque transport failure.
+reasoning_effort = "medium"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 300.0
+max_response_bytes = 8388608
+max_output_tokens = 65536
+max_malformed_retries = 1
+max_transport_retries = 2
+
+[research.openai.pricing]
+input_usd_per_million = "4.00"
+cached_input_usd_per_million = "0.40"
+output_usd_per_million = "20.00"

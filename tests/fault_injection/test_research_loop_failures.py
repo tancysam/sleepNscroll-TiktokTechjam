@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -37,10 +38,14 @@ from kuairand_agent.research.schemas import (
     ExperimentResultSummary,
     GeneratedFile,
     GeneratedPackage,
+    ImplementationRequest,
     ParentSnapshot,
     ParentSourceFile,
     Proposal,
+    ProposalRequest,
     Reflection,
+    ReflectionRequest,
+    RepairRequest,
     RequiredField,
     ResearchOperation,
 )
@@ -172,6 +177,51 @@ class NeverCalled:
         raise AssertionError(f"failure path unexpectedly called {name}")
 
 
+class CaptureRejectedPackageModel:
+    def __init__(self, proposal: Proposal) -> None:
+        self.proposal = proposal
+        self.implementation: GeneratedPackage | None = None
+        self.repair_request: RepairRequest | None = None
+
+    def propose(self, _request: ProposalRequest) -> Proposal:
+        return self.proposal
+
+    def implement(self, request: ImplementationRequest) -> GeneratedPackage:
+        package = GeneratedPackage(
+            request_id=request.request_id,
+            response_id="forbidden-implementation",
+            files=(
+                GeneratedFile("baseline.py", "def forbidden_helper():\n    return 1.0\n"),
+                GeneratedFile(
+                    "candidate.py",
+                    "def score(rows):\n    return [1.0 for _ in rows]\n",
+                ),
+            ),
+            material_change_summary="Use a generated scoring function.",
+            material_symbols=("score",),
+        )
+        self.implementation = package
+        return package
+
+    def repair(self, request: RepairRequest) -> GeneratedPackage:
+        self.repair_request = request
+        return GeneratedPackage(
+            request_id=request.request_id,
+            response_id="legal-replacement",
+            files=(
+                GeneratedFile(
+                    "candidate.py",
+                    "def score(rows):\n    return [1.0 for _ in rows]\n",
+                ),
+            ),
+            material_change_summary="Preserve the generated score in the legal entrypoint.",
+            material_symbols=("score",),
+        )
+
+    def reflect(self, _request: ReflectionRequest) -> Reflection:
+        raise AssertionError("failed execution must not be reflected")
+
+
 class RejectCandidateMetrics:
     calls = 0
 
@@ -225,25 +275,253 @@ def _provider_response(output_text: str) -> bytes:
     return json.dumps(
         {
             "id": "fault-provider-response",
-            "status": "completed",
-            "error": None,
-            "output": [
+            "object": "chat.completion",
+            "choices": [
                 {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": output_text}],
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": output_text,
+                        "refusal": None,
+                    },
                 }
             ],
             "usage": {
-                "input_tokens": 10,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": 5,
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "prompt_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens": 5,
+                "completion_tokens_details": {"reasoning_tokens": 0},
                 "total_tokens": 15,
             },
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def test_invalid_proposal_manifest_never_reaches_implementation(
+    tmp_path: Path,
+) -> None:
+    invalid = replace(
+        _proposal(repairs=0),
+        files_expected=("candidate.py", "baseline.py", "submission.csv"),
+    )
+    model = ScriptedResearchModel(
+        (
+            ScriptedResponse(ResearchOperation.PROPOSE, invalid),
+            ScriptedResponse(
+                ResearchOperation.IMPLEMENT,
+                GeneratedPackage(
+                    request_id="iteration-01-implement",
+                    response_id="must-not-be-consumed",
+                    files=(GeneratedFile("candidate.py", "def score(rows):\n    return [1.0]\n"),),
+                    material_change_summary="This implementation must remain unreachable.",
+                    material_symbols=("score",),
+                ),
+            ),
+        )
+    )
+    store = _store(tmp_path, "proposal-policy-admission")
+    loop = ResearchCampaignLoop(
+        model=model,
+        safe_context=_context(),
+        ledger=CampaignStoreResearchLedger(store, provider_name="scripted"),
+        artifacts=ArtifactStore(tmp_path / "artifacts"),
+        generated_root=tmp_path / "generated",
+        workspace_materializer=NeverCalled(),
+        runner=NeverCalled(),
+        execution=_execution(tmp_path),
+        evaluator=NeverCalled(),
+        selector=NeverCalled(),
+    )
+
+    result = loop.run(
+        parent=ParentSnapshot(
+            candidate_id="fm-fallback",
+            files=(ParentSourceFile.create("candidate.py", BASE),),
+        ),
+        max_iterations=1,
+    )
+
+    assert result.iterations[0].status == "failed"
+    assert "baseline.py" in (result.iterations[0].diagnostic or "")
+    assert [call.operation for call in model.calls] == [ResearchOperation.PROPOSE]
+    assert model.remaining_responses == 1
+    assert store.snapshot().launches_used == 0
+    assert store.current_incumbent() is not None
+    assert store.current_incumbent().incumbent_id == "fm-fallback"  # type: ignore[union-attr]
+    store.close()
+
+
+def test_pre_materialization_repair_receives_exact_rejected_package(
+    tmp_path: Path,
+) -> None:
+    model = CaptureRejectedPackageModel(_proposal(repairs=1))
+    store = _store(tmp_path, "rejected-package-repair")
+    loop = ResearchCampaignLoop(
+        model=model,
+        safe_context=_context(),
+        ledger=CampaignStoreResearchLedger(store, provider_name="capturing"),
+        artifacts=ArtifactStore(tmp_path / "artifacts"),
+        generated_root=tmp_path / "generated",
+        workspace_materializer=NeverCalled(),
+        runner=NeverCalled(),
+        execution=_execution(tmp_path),
+        evaluator=NeverCalled(),
+        selector=NeverCalled(),
+    )
+
+    result = loop.run(
+        parent=ParentSnapshot(
+            candidate_id="fm-fallback",
+            files=(ParentSourceFile.create("candidate.py", BASE),),
+        ),
+        max_iterations=1,
+    )
+
+    assert model.implementation is not None
+    assert model.repair_request is not None
+    assert model.repair_request.rejected_package is not None
+    assert model.repair_request.rejected_package.package_digest == model.implementation.digest
+    assert model.repair_request.failed_child.candidate_id == "fm-fallback"
+    assert result.iterations[0].candidate_id == "iteration-01-repair-1"
+    assert not (tmp_path / "generated" / "iteration-01-child-0").exists()
+    assert (tmp_path / "generated" / "iteration-01-repair-1").is_dir()
+    assert not (tmp_path / "generated" / "iteration-01-repair-1" / "baseline.py").exists()
+    store.close()
+
+
+def test_semantic_duplicate_with_unchanged_evidence_never_reaches_implementation(
+    tmp_path: Path,
+) -> None:
+    first = _proposal(repairs=0, proposal_id="pairwise-first")
+    duplicate = replace(
+        first,
+        proposal_id="pairwise-paraphrase",
+        hypothesis="Different prose around the same proposed scientific operation.",
+        attributions=("different prose attribution",),
+    )
+    model = ScriptedResearchModel(
+        (
+            ScriptedResponse(ResearchOperation.PROPOSE, first),
+            ScriptedResponse(
+                ResearchOperation.IMPLEMENT,
+                GeneratedPackage(
+                    request_id="iteration-01-implement",
+                    response_id="first-static-failure",
+                    files=(GeneratedFile("candidate.py", "def score(:\n"),),
+                    material_change_summary="A bounded pre-training implementation failure.",
+                    material_symbols=("score",),
+                ),
+            ),
+            ScriptedResponse(ResearchOperation.PROPOSE, duplicate),
+            ScriptedResponse(
+                ResearchOperation.IMPLEMENT,
+                GeneratedPackage(
+                    request_id="iteration-02-implement",
+                    response_id="duplicate-must-not-be-consumed",
+                    files=(GeneratedFile("candidate.py", "def score(:\n"),),
+                    material_change_summary="The duplicate must not reach implementation.",
+                    material_symbols=("score",),
+                ),
+            ),
+        )
+    )
+    store = _store(tmp_path, "proposal-novelty-duplicate")
+    loop = ResearchCampaignLoop(
+        model=model,
+        safe_context=_context(),
+        ledger=CampaignStoreResearchLedger(store, provider_name="scripted"),
+        artifacts=ArtifactStore(tmp_path / "artifacts"),
+        generated_root=tmp_path / "generated",
+        workspace_materializer=NeverCalled(),
+        runner=NeverCalled(),
+        execution=_execution(tmp_path),
+        evaluator=NeverCalled(),
+        selector=NeverCalled(),
+    )
+
+    result = loop.run(
+        parent=ParentSnapshot(
+            candidate_id="fm-fallback",
+            files=(ParentSourceFile.create("candidate.py", BASE),),
+        ),
+        max_iterations=2,
+    )
+
+    assert [item.status for item in result.iterations] == ["failed", "failed"]
+    assert "duplicate" in (result.iterations[1].diagnostic or "")
+    assert [call.operation for call in model.calls] == [
+        ResearchOperation.PROPOSE,
+        ResearchOperation.IMPLEMENT,
+        ResearchOperation.PROPOSE,
+    ]
+    assert model.remaining_responses == 1
+    assert store.snapshot().launches_used == 0
+    store.close()
+
+
+def test_scientific_family_has_at_most_two_implementation_admissions_before_training(
+    tmp_path: Path,
+) -> None:
+    proposals = tuple(
+        replace(
+            _proposal(repairs=0, proposal_id=f"pairwise-{ordinal}"),
+            mechanism=f"Pairwise BPR mechanism variant {ordinal}.",
+            principal_change=f"Change pairwise executable loss variant {ordinal}.",
+        )
+        for ordinal in range(1, 4)
+    )
+    responses: list[ScriptedResponse] = []
+    for ordinal, proposal in enumerate(proposals, start=1):
+        responses.append(ScriptedResponse(ResearchOperation.PROPOSE, proposal))
+        if ordinal < 3:
+            responses.append(
+                ScriptedResponse(
+                    ResearchOperation.IMPLEMENT,
+                    GeneratedPackage(
+                        request_id=f"iteration-{ordinal:02d}-implement",
+                        response_id=f"pairwise-{ordinal}-static-failure",
+                        files=(GeneratedFile("candidate.py", "def score(:\n"),),
+                        material_change_summary="Bounded failure before trusted training.",
+                        material_symbols=("score",),
+                    ),
+                )
+            )
+    model = ScriptedResearchModel(tuple(responses))
+    store = _store(tmp_path, "proposal-family-pretraining-limit")
+    loop = ResearchCampaignLoop(
+        model=model,
+        safe_context=_context(),
+        ledger=CampaignStoreResearchLedger(store, provider_name="scripted"),
+        artifacts=ArtifactStore(tmp_path / "artifacts"),
+        generated_root=tmp_path / "generated",
+        workspace_materializer=NeverCalled(),
+        runner=NeverCalled(),
+        execution=_execution(tmp_path),
+        evaluator=NeverCalled(),
+        selector=NeverCalled(),
+    )
+
+    result = loop.run(
+        parent=ParentSnapshot(
+            candidate_id="fm-fallback",
+            files=(ParentSourceFile.create("candidate.py", BASE),),
+        ),
+        max_iterations=3,
+    )
+
+    assert [call.operation for call in model.calls] == [
+        ResearchOperation.PROPOSE,
+        ResearchOperation.IMPLEMENT,
+        ResearchOperation.PROPOSE,
+        ResearchOperation.IMPLEMENT,
+        ResearchOperation.PROPOSE,
+    ]
+    assert "family_pretraining_limit:pairwise" in (result.iterations[2].diagnostic or "")
+    assert store.snapshot().launches_used == 0
+    store.close()
 
 
 def test_exhausted_syntax_repair_never_launches_or_changes_incumbent(
