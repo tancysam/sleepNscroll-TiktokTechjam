@@ -206,6 +206,13 @@ it is scored on, which our candidates structurally cannot.
 
 We would rather hand a judge four rows with their provenance than one row without it.
 
+**Resource accounting.** **6,284,739 LLM tokens** across 247 provider calls that returned a
+usage block, at an estimated **$60.61**, covering every campaign in the series. **0.00
+GPU-hours**, by construction rather than by approximation. **Zero manual interventions** in
+every campaign.
+The per-run breakdown, including the two accounting caveats that make the table reconcile, is
+in [`docs/RESULTS.md`](RESULTS.md) section 4.
+
 Hidden-test performance is organizer-computed and is neither known nor claimed. Full detail,
 including a section on what is *not* demonstrated, is in [`docs/RESULTS.md`](RESULTS.md).
 

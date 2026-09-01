@@ -558,10 +558,12 @@ result.
 | 22 | `candidates_not_promotable` | 6 | 0.5734960 | −2.41σ | 502,068 |
 | 23 | `candidates_not_promotable` | 7 | 0.5735505 | −2.34σ | 508,183 |
 | 24 | `candidates_not_promotable` | 5 | 0.5628278 | −15.75σ | 493,119 |
-| 25 | running at time of writing | 1 | 0.5743115 | −1.39σ | in progress |
+| 25 | `exact_terminal_condition_reached` | 4 | **0.5746261** | **−1.00σ** | 585,018 |
 
-The Fold B control throughout is **0.5754240304**. **Run 16's 0.5745312 (−1.12σ) was never beaten**,
-by any candidate, in any of these runs.
+The Fold B control throughout is **0.5754240304**. Run 16's 0.5745312 (−1.12σ) stood unbeaten
+through runs 18 to 24 and was **finally exceeded by run 25's fourth iteration at 0.5746261477
+(−1.00σ)**, which is now the best generated candidate in the project's history. It is still below
+the control, and it was still weighted out entirely by fusion.
 
 #### 3.5a Two instrument defects, one of which the agent found itself
 
@@ -730,17 +732,28 @@ gain from one seed to five was real and is fully exhausted.
 #### 3.5g Run 25 — a protocol guard the repair loop cannot reach
 
 Run 25 was launched at 09:06 SGT on 2026-09-01 with a briefing aimed at the large-batch, few-epoch
-regime of 3.5c-bis and forbidding the small-batch regime. It was **still running when this section
-was written**, at three iterations; the figures below are current as of 10:04 SGT and the run's
-token total is therefore not yet final.
+regime of 3.5c-bis and forbidding the small-batch regime. It finished at 10:44:15 SGT after six
+iterations, stopping on `exact_terminal_condition_reached` when its unmeasured streak reached the
+cap of 6, and consumed 585,018 tokens across 20 provider calls.
+
+Its admission record is the cleanest in the series: six branches attempted, six proposals and six
+implementations accepted, **zero rejected pre-execution**, and **zero repairs**. Every candidate the
+model wrote was admitted and trained. Four reached inner evaluation; none reached outer evaluation,
+because all four were weighted out by fusion.
 
 Its first two iterations were lost to our own trust boundary, and the failure is instructive.
 
-| Iteration | Store status | Diagnostic |
-|---|---|---|
-| 1 | `FAILED`, `output_validated: false` | `diagnostics contain a candidate-declared official metric at diagnostics.best_gauc` |
-| 2 | `FAILED`, `output_validated: false` | `diagnostics contain a candidate-declared official metric at diagnostics.inner_proxy_primary` |
-| 3 | scored | model alone **0.5743114650**, −1.39σ |
+| Iteration | Store status | Standalone | vs control |
+|---|---|---:|---:|
+| 1 | `FAILED`, `output_validated: false` — `diagnostics.best_gauc` | — | — |
+| 2 | `FAILED`, `output_validated: false` — `diagnostics.inner_proxy_primary` | — | — |
+| 3 | scored, model discarded by fusion | 0.5743114650 | −1.39σ |
+| **4** | scored, model discarded by fusion | **0.5746261477** | **−1.00σ** |
+| 5 | scored, model discarded by fusion | 0.5740168244 | −1.76σ |
+| 6 | scored, model discarded by fusion | 0.5740851313 | −1.67σ |
+
+Records are mapped to iterations by mtime; `fusion_audit.py` prints them sorted by digest, so its
+print order is not iteration order.
 
 Three things about this are worth reporting.
 
@@ -819,9 +832,10 @@ clip 35, five deterministically seeded members averaged on within-user percentil
 
 This is the **highest standalone figure measured anywhere in the project**, and it exceeds run 16 by
 0.0001557. Two qualifications travel with it. It is a hand-rebuilt parent scaffold, **not an
-agent-generated candidate**, so the claim in 3.5i that no *generated* candidate has exceeded
-0.5745312 stands unaltered. And at −2.33σ it remains below the Fold B control and nowhere near the
-+2.5σ a material result requires. It closes no gap; it confirms the ceiling from a second direction.
+agent-generated candidate**. It is also no longer the only figure above run 16: run 25's fourth
+iteration reached 0.5746261477 while this was being written, so the parallel branch's parent now
+leads the project by 0.0000608 rather than standing alone. And at −2.33σ it remains below the Fold B
+control and nowhere near the +2.5σ a material result requires. It closes no gap; it confirms the ceiling from a second direction.
 
 **Its cross-run memory experiment returned a verified negative**, written up in
 [`agent-memory-experiment.md`](agent-memory-experiment.md). Memory was delivered to the model
@@ -839,9 +853,10 @@ README.
 
 #### 3.5i What these runs establish
 
-Across ten campaigns and roughly thirty-five scored candidates, **no generated candidate has ever
-exceeded 0.5745312 standalone**, and the residual 0.0008928 to the control is close to one
-seed-to-seed sigma. It is also close in size to one advantage the control holds and the candidate
+Across eleven campaigns and roughly thirty-nine scored candidates, **the best generated candidate
+is run 25's 0.5746261477 at −1.00σ**, which displaced run 16's 0.5745312 only at the very end of the
+series and by 0.0000949, about an eighth of one seed-to-seed sigma. The residual 0.0007979 to the
+control is itself within one seed-to-seed sigma. It is also close in size to one advantage the control holds and the candidate
 seam denies: the control keeps the best of 40 epochs *measured on the split it is then scored on*
 (`baselines/starter_fm.py:701-708`), while a candidate gets a single shot. Every route tested is now
 closed by measurement rather than by argument: features (organizers' own ablation), capacity
@@ -897,7 +912,8 @@ each run's `production/provider-attempt-journal/`. Reasoning tokens are billed a
 | `maki-overnight-22` | 18 | 332,969 | 169,099 | 502,068 | $4.71 |
 | `maki-overnight-23` | 18 | 344,178 | 164,005 | 508,183 | $4.66 |
 | `maki-overnight-24` | 18 | 341,756 | 151,363 | 493,119 | $4.39 |
-| **Total, runs 01–24** | **227** | **3,588,403** | **2,111,318** | **5,699,721** | **$55.09** |
+| `maki-overnight-25` | 20 | 386,492 | 198,526 | 585,018 | $5.52 |
+| **Total, runs 01–25** | **247** | **3,974,895** | **2,309,844** | **6,284,739** | **$60.61** |
 
 The second block roughly doubled total consumption and produced **no material improvement**. It is
 reported in full because the Feasibility criterion asks for total consumption to reach the result,
