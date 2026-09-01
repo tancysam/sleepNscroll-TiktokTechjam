@@ -542,9 +542,9 @@ rather than only on the machine that built it; and it establishes the local base
 candidate produced on that machine must be compared against -- see section 6.4, because the two
 platforms do not agree to the last bit.
 
-### 3.5 The saturation campaign — runs 18 to 24
+### 3.5 The saturation campaign — runs 18 to 25
 
-Seven further campaigns were run on 2026-08-31 and 2026-09-01, together with two offline probes.
+Eight further campaigns were run on 2026-08-31 and 2026-09-01, together with two offline probes.
 They did not produce a material improvement. They did produce two instrument defects, a falsified
 hypothesis of our own, and two measurements that close the search, and those are the reportable
 result.
@@ -557,6 +557,8 @@ result.
 | 21 | `candidates_not_promotable` | 0 | — | — | 487,680 |
 | 22 | `candidates_not_promotable` | 6 | 0.5734960 | −2.41σ | 502,068 |
 | 23 | `candidates_not_promotable` | 7 | 0.5735505 | −2.34σ | 508,183 |
+| 24 | `candidates_not_promotable` | 5 | 0.5628278 | −15.75σ | 493,119 |
+| 25 | running at time of writing | 1 | 0.5743115 | −1.39σ | in progress |
 
 The Fold B control throughout is **0.5754240304**. **Run 16's 0.5745312 (−1.12σ) was never beaten**,
 by any candidate, in any of these runs.
@@ -725,7 +727,117 @@ The mechanism is visible in the design: every seed early-stops on validation, so
 peak-picked toward the same optimum and their errors are correlated rather than independent. The
 gain from one seed to five was real and is fully exhausted.
 
-#### 3.5g What these runs establish
+#### 3.5g Run 25 — a protocol guard the repair loop cannot reach
+
+Run 25 was launched at 09:06 SGT on 2026-09-01 with a briefing aimed at the large-batch, few-epoch
+regime of 3.5c-bis and forbidding the small-batch regime. It was **still running when this section
+was written**, at three iterations; the figures below are current as of 10:04 SGT and the run's
+token total is therefore not yet final.
+
+Its first two iterations were lost to our own trust boundary, and the failure is instructive.
+
+| Iteration | Store status | Diagnostic |
+|---|---|---|
+| 1 | `FAILED`, `output_validated: false` | `diagnostics contain a candidate-declared official metric at diagnostics.best_gauc` |
+| 2 | `FAILED`, `output_validated: false` | `diagnostics contain a candidate-declared official metric at diagnostics.inner_proxy_primary` |
+| 3 | scored | model alone **0.5743114650**, −1.39σ |
+
+Three things about this are worth reporting.
+
+**The subprocess reported success.** Both failed executions exited `0` with `outcome: "succeeded"`
+and empty stdout and stderr in `production/candidate-control/*/result.json`. The rejection is
+recorded only in the campaign store, as `output_validated: false`. Reading the run log or the
+process result alone would have given exactly the wrong answer about what happened.
+
+**The hypothesis and the guard were structurally incompatible.** The proposal was deterministic
+user-disjoint early stopping driven by a within-user ranking proxy evaluated each epoch on a 10%
+user holdout. That hypothesis cannot be implemented without computing a ranking score per epoch,
+and `candidate_api/protocol.py:129` rejects any diagnostics key whose components include `gauc`,
+`ndcg` or `primary` — the invariant that the research model never reports a metric. The candidate
+trained correctly and was discarded for *naming a number*. Our briefing aimed the agent at a
+hypothesis our own protocol forbids it from instrumenting.
+
+**Repair cannot fire for this class of failure.** Both iterations record `repair_calls: 0` despite
+`maximum_repairs: 2`. The repair loop at `research/production.py:1218` catches only
+`CandidateMaterializationError` and `CandidateStaticError`, under `FailureCategory.STATIC_POLICY`.
+This is a `CandidateProtocolError` raised at train-output validation, *after* that loop has already
+broken. There is no path by which the model can be asked to fix it, so each collision costs a whole
+iteration — about sixteen minutes — rather than a repair call. This is the **third instrument
+defect** in this series, after the two in 3.5a, and unlike those two it is still open.
+
+**The agent nevertheless corrected itself without a repair channel.** It renamed the offending key
+from `best_gauc` to `inner_proxy_primary` between iterations 1 and 2, and off the banned vocabulary
+entirely by iteration 3, which then scored. Reflection alone recovered from a failure mode the
+repair path structurally could not reach. That is the clearest evidence of autonomous recovery in
+this project's run series.
+
+##### What iteration 3 actually found
+
+Iteration 3's configuration is:
+
+```json
+{"candidate_family": "identity_fm_linear_adam", "rank": 16, "batch_size": 65536, "epochs": 10,
+ "learning_rate": 0.004, "logit_clip": 35.0, "l2_linear": 0.002, "grad_clip": 1.0}
+```
+
+Rank 16, batch 65,536, 10 epochs, lr 0.004, clip 35.0 is **run 16's winning configuration**, the
+best generated candidate in the project's history. Given a briefing that described the winning
+regime but not the winning point, the agent converged back onto that exact point and scored
+**0.5743115** against run 16's **0.5745312** — a difference of 0.0002197, or **0.27σ** at
+σ = 0.0008. That is seed noise.
+
+We read this two ways, and both belong in the record. It is a genuine independent reproduction:
+run 16's result is real, repeatable from a different campaign, and the regime identified in
+3.5c-bis is the right one. It is also a saturation result: told where the optimum region is, the
+agent found the same optimum and could not exceed it.
+
+One correction to 3.5c-bis follows from it. That section reports that `ema_decay` and `grad_clip`
+appear only among low scorers. Iteration 3 carries `grad_clip: 1.0` and is the third-best generated
+candidate measured, so the observation no longer holds for `grad_clip`; it still holds for
+`ema_decay`.
+
+#### 3.5h A parallel branch, measured independently, not merged
+
+A second line of work ran concurrently on the `cross-run-memory-and-finalization-fixes` branch. It
+was **not merged** into the branch that produced the shipped submission, and the code differences
+are unreconciled at the time of writing; what follows is reported as an independent measurement,
+not as a property of this tree.
+
+**It reproduced the best-ever configuration from its recorded recipe alone.** The source of
+campaign `de711dca`'s promoted `deterministic_fm_seed_ensemble` had not survived, and the recipe was
+rebuilt from the ledger record: Adam at 0.02, minibatch 65,536, eight epochs, rank 8, 1e-4 L2, logit
+clip 35, five deterministically seeded members averaged on within-user percentiles.
+
+| | standalone | vs control |
+|---|---:|---:|
+| logistic parent | 0.5698351 | −17.98σ |
+| hand-wired FM, full batch | 0.5700869 | — |
+| recorded recipe, SGD | 0.5724103 | — |
+| `de711dca` Adam, single member | 0.5739816 | — |
+| `de711dca` Adam, five members | **0.5746869** | **−2.33σ** |
+| run 16, the target | 0.5745312 | −1.12σ |
+
+This is the **highest standalone figure measured anywhere in the project**, and it exceeds run 16 by
+0.0001557. Two qualifications travel with it. It is a hand-rebuilt parent scaffold, **not an
+agent-generated candidate**, so the claim in 3.5i that no *generated* candidate has exceeded
+0.5745312 stands unaltered. And at −2.33σ it remains below the Fold B control and nowhere near the
++2.5σ a material result requires. It closes no gap; it confirms the ceiling from a second direction.
+
+**Its cross-run memory experiment returned a verified negative**, written up in
+[`agent-memory-experiment.md`](agent-memory-experiment.md). Memory was delivered to the model
+correctly — confirmed by reading the raw provider-attempt journal for the exact payload sent — and
+did not change proposal behaviour: the `pairwise` family accounted for 17 of 24 admissions across 8
+campaigns and was proposed as `candidate-01` in every one. When a controller-side circuit breaker
+then blocked it, the model proposed the blocked family fourteen more times and its permitted
+alternatives scored bit-identical to the parent. The conclusion drawn there is that the bottleneck
+is hypothesis generation rather than memory, and it is consistent with what runs 18 to 25 show from
+the other side.
+
+A rendered per-iteration run log from that branch is reproduced at
+[`run-logs/`](run-logs/README.md), with its provenance and its limits stated in that directory's
+README.
+
+#### 3.5i What these runs establish
 
 Across ten campaigns and roughly thirty-five scored candidates, **no generated candidate has ever
 exceeded 0.5745312 standalone**, and the residual 0.0008928 to the control is close to one
