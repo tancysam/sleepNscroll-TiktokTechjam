@@ -141,13 +141,42 @@ twelve. Start from that structure. Two further measurements from the same run: p
 loss produced those 0.5745 results, and switching the identical scorer to a pairwise objective
 collapsed it to 0.5630, so do not replace the loss.
 
-READ THE LEDGER BELOW BEFORE PROPOSING. Ten campaigns and about thirty-five generated candidates
-have now been scored against the 0.5754240304 Fold B control. The choice of direction is YOURS this
-campaign, but it must not be one of the directions already measured, and the list is long.
+THE TRAINING REGIME IS THE LEVER, AND IT HAS BEEN MEASURED ACROSS THIRTY-NINE SCORED CANDIDATES.
+Every candidate this project has run was extracted with its configuration and its standalone Fold B
+primary and sorted. The pattern is not visible inside any single campaign and it is the most
+important thing in this briefing.
 
-The best result this project has ever produced is 0.5745 standalone, from an identity-code FM
-interaction plus the causal aggregate columns as additive first-order terms, under pointwise
-logistic loss. Nothing has ever exceeded it. Treat that structure as the working scaffold.
+  regime                          batch          epochs   learning rate   standalone range
+  large batch, few epochs         32768 to 65536  4 to 10  0.004 to 0.08   0.5736 to 0.5745
+  full batch                      all rows        10 to 64 0.01 to 0.15    0.5628 to 0.5720
+  small batch, many epochs        8192            40       0.001           0.5507 to 0.5736
+
+The four best candidates ever produced, against the 0.5754240304 control:
+
+  0.5745312   batch 65536   10 epochs   lr 0.004   rank 16   logit clip 35
+  0.5745072   batch 32768    4 epochs   lr 0.01    rank  8   logit clip 40
+  0.5740230   batch 65536    4 epochs   lr 0.01    rank  8   logit clip 35
+  0.5736019   batch 32768    4 epochs   lr 0.08    rank 16   logit clip 40
+
+All four are large batch, few epochs, at a learning rate four to eighty times the control's. Every
+one of the TEN WORST results used batch 8192 with lr 0.001 over 40 epochs, scoring 0.5507 to 0.5628.
+That setting is also unstable: near identical configurations produced both 0.5735 and 0.5507.
+
+SO: propose inside the winning regime. Batch 32768 to 65536, four to ten epochs, learning rate 0.004
+to 0.01, rank 8 or 16, logit clip 35 to 40. Rank 8 scores as well as rank 16, so do not spend an
+iteration raising capacity. DO NOT propose batch 8192 with learning rate 0.001 over 40 epochs; three
+consecutive campaigns were spent there and it produced the worst results in the project.
+
+Also keep the single best result's three separate L2 groups rather than one coefficient: l2_bias
+2e-5, l2_factor 2e-5, l2_linear 0.002. That split belongs to the 0.5745312 configuration and has
+never been isolated.
+
+Move ONE variable per iteration and stay inside the regime above. The bar to beat is 0.5745312.
+
+The scaffold itself is settled: an identity-code FM interaction over the five trailing code columns,
+the causal aggregate columns as additive first-order terms, under pointwise logistic loss. Do not
+change it. Removing the aggregates scored 0.5535, twenty-seven sigma below the control, so they are
+load bearing rather than diluting. Replacing the loss with a pairwise objective scored 0.5630.
 
 MEASURED AND CLOSED. Do not re-propose any of these; each number is a real standalone measurement:
 - Seed ensembling inside one candidate: 0.5740 against 0.5745 for the single copy. It is also
@@ -161,9 +190,9 @@ MEASURED AND CLOSED. Do not re-propose any of these; each number is a real stand
 - DROPPING the causal aggregates and keeping identities only: 0.5535, twenty-seven sigma below the
   control. The aggregates are LOAD BEARING. They are not diluting the identity signal, they are
   carrying a large part of the score. Do not remove them.
-- Optimiser budget: about twenty full-batch fixed-step updates scored 0.5745, and about 5,570
-  mini-batch Adam updates matching the control exactly scored 0.5735. More optimisation is NOT the
-  lever. Either loop is acceptable; neither dominates.
+- Optimiser budget: the 0.5745 result used mini-batch Adam at batch 65536 over 10 epochs, roughly
+  174 updates, while about 5,570 updates at the control's batch 8192 and lr 0.001 scored 0.5735 and
+  0.5628. MORE optimisation is not the lever; the regime table above is.
 - Adding all thirteen static feature domains, measured by the organizers: 0.5940 against 0.5950.
   Feature breadth is not the bottleneck.
 - Embedding dimension 8, 16 and 32, measured by the organizers: 0.5895, 0.5902, 0.5887. Capacity is
@@ -181,17 +210,11 @@ failure, and it is better than spending an iteration on a variation of something
 If you do propose a direction, prefer one the records show has never been measured, change ONE
 thing at a time, and keep the crash guards in the mechanics section below.
 
-THE REMAINING GAP IS OPTIMISATION, NOT MODELLING, AND IT IS THE FIRST THING TO FIX. The control
-trains with MINI-BATCH ADAM: batch size 8192, up to 40 epochs, the row order reshuffled every epoch
-from a seeded generator, Adam moments with bias correction, and early stopping with patience 4. On
-1,141,112 training rows that is about 140 batches per epoch, so roughly 5,570 parameter updates.
-The worked example in these instructions demonstrates deterministic FULL-BATCH gradient descent
-with a fixed step: about 20 updates in total, no momentum, no adaptive step. Every candidate this
-project has generated copied that loop. So the 0.5745 result above, and every earlier one, came
-from a model that took roughly 20 optimisation steps against a control that took roughly 5,570.
-That is a factor of about 278, and it is the most likely reason a one sigma deficit survived every
-change to features, capacity and loss. The organizers separately measured that neither features nor
-capacity is the bottleneck, which is consistent.
+The control's own constants are recorded here for reference only, and they are NOT the target: it
+trains with mini-batch Adam at batch 8192, lr 0.001, up to 40 epochs with patience 4, reshuffling
+each epoch from a seeded generator. Copying that setting is exactly what the regime table above
+says not to do. Your target regime is the large-batch, few-epoch one that produced every good
+result.
 
 The control's exact constants are known, so do not derive them from a scaling rule. It uses rank
 k = 16, learning rate 0.001, L2 1e-6, batch 8192, at most 40 epochs, and early-stopping patience 4,
@@ -375,8 +398,8 @@ The parent `model_impl.py` contains, among other definitions:
 ```python
 def train_model(features, targets, user_groups, config, seed):
     # WARNING: this parent loop is UNDER-TRAINED and is shown for its interface, not as a
-    # pattern to copy. It takes about 20 full-batch fixed-step updates; the official control
-    # takes about 5,570 mini-batch Adam updates. Replace this loop.
+    # pattern to copy. It takes about 20 full-batch fixed-step updates. Replace it with
+    # mini-batch Adam in the regime the briefing names: batch 32768 to 65536, 4 to 10 epochs.
     normalized = (features - mean) / scale
     weights = np.zeros(features.shape[1], dtype=np.float64)
     for _ in range(epochs):

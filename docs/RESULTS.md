@@ -542,6 +542,204 @@ rather than only on the machine that built it; and it establishes the local base
 candidate produced on that machine must be compared against -- see section 6.4, because the two
 platforms do not agree to the last bit.
 
+### 3.5 The saturation campaign — runs 18 to 24
+
+Seven further campaigns were run on 2026-08-31 and 2026-09-01, together with two offline probes.
+They did not produce a material improvement. They did produce two instrument defects, a falsified
+hypothesis of our own, and two measurements that close the search, and those are the reportable
+result.
+
+| Run | Stop reason | Scored | Best standalone | vs control | Tokens |
+|---|---|---:|---:|---:|---:|
+| 18 | `candidates_not_promotable` | 5 | 0.5683315 | −8.87σ | 562,520 |
+| 19 | aborted, operator `__pycache__` | 0 | — | — | 53,853 |
+| 20 | provider unavailable (402, then malformed) | 0 | — | — | 95,424 |
+| 21 | `candidates_not_promotable` | 0 | — | — | 487,680 |
+| 22 | `candidates_not_promotable` | 6 | 0.5734960 | −2.41σ | 502,068 |
+| 23 | `candidates_not_promotable` | 7 | 0.5735505 | −2.34σ | 508,183 |
+
+The Fold B control throughout is **0.5754240304**. **Run 16's 0.5745312 (−1.12σ) was never beaten**,
+by any candidate, in any of these runs.
+
+#### 3.5a Two instrument defects, one of which the agent found itself
+
+Both have the same shape: the controller held information the model needed and dropped it.
+
+**The reflect path never received the fusion disclosure.** Commit `8124607` had exposed
+`candidate_standalone_primary` on the *propose* path; `_reflect` still built its
+`ExperimentResultSummary` from tier, status, GAUC, nDCG@5, primary, runtime and memory alone, and
+never called `_fusion_disclosure`. The agent detected this **unprompted in six reflections out of
+six** across runs 16 and 17:
+
+> "The request does not provide candidate_standalone_primary or the frozen model/control fusion
+> weight. Therefore, this result cannot establish that the candidate itself beat the official FM
+> control; the small scored advantage may belong to a selected blend."
+
+It then reconstructed the missing value by exact-matching against `official_fm_fold_{A,B}`. This is
+the one capability gap in this project that the agent identified rather than being told; the three
+framings that shaped runs 16 and 17 were all supplied in the briefing, which the run-16 versus
+run-17 system-prompt diff makes checkable. Fixed in `4de2a38`; run 18 then read its own standalone
+score correctly in all six reflections.
+
+**The repair path never received the exception message.** `_invoke_runner` in `campaign/scientific.py`
+caught the failure and returned `type(exc).__name__`, discarding `str(exc)` — while the executor had
+already built a bounded 4096-character diagnostic and stored the child's stderr as an artifact. A
+model asked to repair a crash was told `callback_failed:CandidateExecutionError` and nothing else.
+**Run 21 spent all six of its iterations on this**, proposing the right direction every time and
+crashing every time, guessing at "ragged final batches" because that phrase was in the briefing
+rather than because it had seen any evidence. Fixed in `c7aede7`; run 22 then produced six scored
+candidates instead of zero.
+
+#### 3.5b Convergence was being declared on three rejections
+
+`ConvergenceState.update_after_iteration` accepted `None` for an iteration that produced no eligible
+outer primary and still incremented `non_material_streak`. With patience 3, **three consecutive
+rejections reported `stop_reason = "converged"`**. Runs 09 to 17 all stopped at exactly three
+iterations; runs 16 and 17 did so having spent about 4% of a six-hour budget with **no candidate
+reaching outer validation at all**.
+
+`BENCHMARK_CONTRACT.convergence` states the rule as *"eligible outer primary delta strictly greater
+than epsilon"*, and a rejection has no eligible outer primary to take a delta from. Corrected in
+`4de2a38`: rejections accumulate in a separate `unmeasured_streak` and stop the campaign under a new
+and truthful reason, `candidates_not_promotable`. `epsilon`, `patience` and `benchmark_digest` are
+unchanged, and `converged` is now strictly a claim about measured results, which it previously was
+not. Measured effect: the autonomous followup driver went from **3 iterations to 7** on an identical
+fixture.
+
+#### 3.5c A hypothesis of ours, falsified twice — and a correction
+
+We observed that the worked example in `research/prompts.py` demonstrates about **20 full-batch
+fixed-step updates** while the control uses mini-batch Adam at `bs=8192` over 40 epochs — about
+**5,570 updates** — and inferred that a 278-fold optimisation deficit explained the residual gap.
+
+Run 22 implemented the control's optimiser exactly, with its published constants (`k=16`,
+`lr=0.001`, `l2=1e-6`, betas 0.9/0.999, eps 1e-8). Its best standalone was **0.5734960**, *worse*
+than run 16's 0.5745312. Runs 23 and 24 repeated the same settings and scored 0.5735505 and
+0.5628278. **More optimisation was not the lever.**
+
+**The premise was also wrong, and the correction matters more than the hypothesis.** Run 16's
+winning candidate did not use a full-batch loop at all. Its recorded configuration is
+
+```json
+{"batch_size": 65536, "epochs": 10, "learning_rate": 0.004,
+ "adam_beta1": 0.9, "adam_beta2": 0.999, "adam_epsilon": 1e-8,
+ "l2_bias": 0.00002, "l2_factor": 0.00002, "l2_linear": 0.002,
+ "logit_clip": 35.0, "rank": 16, "rarity_cap": 25.0}
+```
+
+— mini-batch Adam at roughly **174 updates**, in neither of the two regimes we were comparing. The
+278-fold figure described the worked example, not the result it was used to explain. Runs 22 to 24
+were therefore directed *away* from the best known configuration on the strength of a
+mischaracterisation, which is the single most expensive analytical error in this project.
+
+#### 3.5c-bis The training regime, measured across all 39 scored candidates
+
+Extracting every scored candidate's configuration alongside its standalone Fold B primary and
+sorting by score reveals a pattern that is invisible inside any single campaign:
+
+| regime | batch | epochs | learning rate | standalone range |
+|---|---:|---:|---:|---|
+| **large batch, few epochs** | 32,768–65,536 | 4–10 | 0.004–0.08 | **0.5736 – 0.5745** |
+| full batch | all rows | 10–64 | 0.01–0.15 | 0.5628 – 0.5720 |
+| **small batch, many epochs** | 8,192 | 40 | 0.001 | **0.5507 – 0.5736** |
+
+The four best candidates the project has produced:
+
+| standalone | run | batch | epochs | lr | rank | logit clip |
+|---|---|---:|---:|---:|---:|---:|
+| **0.5745312** | 16 | 65,536 | 10 | 0.004 | 16 | 35.0 |
+| 0.5745072 | 16 | 32,768 | 4 | 0.01 | **8** | 40.0 |
+| 0.5740230 | 17 | 65,536 | 4 | 0.01 | **8** | 35.0 |
+| 0.5736019 | 17 | 32,768 | 4 | 0.08 | 16 | 40.0 |
+
+Every one is large-batch and few-epoch at a learning rate four to eighty times the control's, and
+every one of the **ten worst** results used batch 8,192 with lr 0.001 over 40 epochs. That setting is
+also unstable: near-identical configurations produced both 0.5735 and 0.5507.
+
+Two secondary findings fall out of the same table. **Rank 8 scores as well as rank 16** — two of the
+top three used it — independently reproducing the organizers' capacity ablation from our own runs.
+And `ema_decay` and `grad_clip` appear **only** among low scorers.
+
+#### 3.5d The enhancement ledger — every addition cost score
+
+Read chronologically, run 22 and its predecessors give one direction:
+
+| configuration | standalone |
+|---|---:|
+| identity-code FM + additive aggregates, full-batch, plain (run 16) | **0.5745312** |
+| the same under mini-batch Adam (run 22) | 0.5734960 |
+| + seed ensembling inside the candidate | 0.5740230 |
+| + frequency-aware identity regularisation | 0.5680654 |
+| + a pairwise objective on the identical scorer | 0.5629801 |
+| + metric-matched per-row weighting by user positive count | 0.5574875 |
+| + an exponential moving average used for inference | 0.5554938 |
+| official FM control | 0.5754240304 |
+
+Seven independent additions, seven regressions. The two best results in the project are its two
+simplest configurations.
+
+#### 3.5e The positive control, which inverted its own hypothesis
+
+Run 23 asked whether the 33 causal aggregate columns were diluting the identity signal, by building
+the control's field set and nothing else. Reproduce with `fusion_audit.py maki-overnight-23`:
+
+| model | standalone |
+|---|---:|
+| control, identity fields only | 0.5754240304 |
+| **candidate seam, identity codes only** | **0.5535416 (−27.35σ)** |
+| candidate seam, identity codes **+ aggregates** (run 16) | 0.5745312 (−1.12σ) |
+
+**The aggregates are load-bearing, not diluting.** Removing them costs 26σ. The dilution hypothesis
+is falsified, and with it the planned follow-up that would have added the columns back in groups.
+The predictions were checked for degeneracy and are not degenerate — 59,500 of 61,315 values
+distinct — so these are trained models that are simply worse.
+
+#### 3.5f Seed ensembling saturates at five members
+
+The shipped submission is a five-seed within-user rank ensemble at 0.6026034355. `StarterFMConfig`
+freezes `k`, `lr`, `l2` and `batch_size` but leaves `seed` settable, so the pool was extended to 35
+members by training additional seeds **through the hash-pinned organizer source itself**
+(`seed_pool_probe.py`, which reproduces seed 0 **bit-identically** against the qualified vector
+before training anything). Measured with `ensemble_search_probe.py`:
+
+| N | validation primary | vs the shipped five |
+|---:|---:|---:|
+| 5 | 0.6026034355 | — |
+| 10 | 0.6027070284 | +0.0001036 |
+| 16 | 0.6030003428 | +0.0003969 |
+| 20 | 0.6028070450 | +0.0002036 |
+| **35** | **0.6026725769** | **+0.0000691** |
+
+Seven times the pool is worth **+0.00007**: noise. The whole curve lies between 0.6025 and 0.6030
+with no trend, against a materiality threshold of 0.6036.
+
+Two things must be said about this number. First, an earlier fit of the standard variance-reduction
+form gain(N) = G(1 − 1/√N) to the single five-seed point predicted ~0.6030 at N=20 and an asymptote
+near 0.60344; **the measured curve does not climb at all, so that fit was wrong** and is retracted.
+Second, N=16 is the curve maximum and **is not claimed**: selecting it after reading the validation
+column would be exactly the best-of-N selection effect this document criticises in §3.2 and in the
+seed-4 fallback. The probe fixes N a priori at the largest available pool and prints the curve
+rather than a menu.
+
+The mechanism is visible in the design: every seed early-stops on validation, so all of them are
+peak-picked toward the same optimum and their errors are correlated rather than independent. The
+gain from one seed to five was real and is fully exhausted.
+
+#### 3.5g What these runs establish
+
+Across ten campaigns and roughly thirty-five scored candidates, **no generated candidate has ever
+exceeded 0.5745312 standalone**, and the residual 0.0008928 to the control is close to one
+seed-to-seed sigma. It is also close in size to one advantage the control holds and the candidate
+seam denies: the control keeps the best of 40 epochs *measured on the split it is then scored on*
+(`baselines/starter_fm.py:701-708`), while a candidate gets a single shot. Every route tested is now
+closed by measurement rather than by argument: features (organizers' own ablation), capacity
+(organizers' own ablation), loss, optimiser budget, regularisation, weighting, parameter averaging,
+candidate-side ensembling, controller-side ensembling, the tree-plus-FM blend, and the removal of
+the aggregates.
+
+We report this as a saturation result, not as a list of failures. The negative space is mapped, each
+boundary carries a number, and every one is reproducible from artifacts in this repository.
+
 ## 4. Resource consumption
 
 ### GPU time: **0.00 GPU-hours**
